@@ -1,0 +1,161 @@
+@database :memory:
+
+# One-argument json_valid() accepts only canonical RFC 8259 text.
+# JSON5-only syntax parses fine in the other JSON functions but must
+# return 0 here, matching SQLite.
+
+test json_valid_accepts_strict_document {
+    SELECT json_valid('{"a":5,"b":6}');
+}
+expect {
+    1
+}
+
+test json_valid_rejects_unquoted_object_keys {
+    SELECT json_valid('{a:5,b:6}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_object_trailing_comma {
+    SELECT json_valid('{"a":5, "b":6, }');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_array_trailing_comma {
+    SELECT json_valid('[5, 6,]');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_single_quoted_strings {
+    SELECT json_valid('{"a": ''abcd''}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_escaped_newline_in_string {
+    SELECT json_valid('{"a": "abc' || char(0x5c, 0x0a) || 'xyz"}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_raw_control_character_in_string {
+    SELECT json_valid('"abc' || char(1) || 'xyz"');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_plus_signed_number {
+    SELECT json_valid('{"x":+5}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_hex_number {
+    SELECT json_valid('{"x":0x35}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_trailing_dot_number {
+    SELECT json_valid('{"x":4.}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_infinity_literal {
+    SELECT json_valid('{"x":Infinity}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_nan_literal {
+    SELECT json_valid('{"x":NaN}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_comments {
+    SELECT json_valid('{"a":1} /*c*/'), json_valid('/*c*/ 1'), json_valid('// c
+1');
+}
+expect {
+    0|0|0
+}
+
+test json_valid_accepts_standard_escapes_and_whitespace {
+    SELECT json_valid('"aA\n\/b"'), json_valid(char(9,10,13,32)||'1');
+}
+expect {
+    1|1
+}
+
+test json_valid_number_arguments_are_valid {
+    SELECT json_valid(123), json_valid(4.5);
+}
+expect {
+    1|1
+}
+
+test json_valid_infinite_float_argument_is_invalid {
+    SELECT json_valid(9e999), json_valid(-9e999);
+}
+expect {
+    0|0
+}
+
+test json_valid_jsonb_blob_is_invalid_for_one_arg_form {
+    SELECT json_valid(jsonb('{"a":1}'));
+}
+expect {
+    0
+}
+
+test json_valid_non_jsonb_blob_validates_as_text {
+    SELECT json_valid(x'7B7D'), json_valid(x'ABCD');
+}
+expect {
+    1|0
+}
+
+# x'2033343535' is the text " 3455". The raw blob decides whether it is
+# JSONB; the leading space says it is not, so it validates as text even
+# though the bytes after the space happen to form a JSONB integer.
+test json_valid_blob_is_classified_before_whitespace {
+    SELECT json_valid(x'2033343535');
+}
+expect {
+    1
+}
+
+# x'5B6E756C6C5D' is the text "[null]", whose first byte also parses as
+# a JSONB array header claiming the whole blob. Text can only
+# masquerade like that with a '{', '[' or digit first byte and a small
+# payload, and there full validation decides: this one fails it and is
+# read as text.
+test json_valid_ambiguous_small_blob_falls_back_to_text {
+    SELECT json_valid(x'5B6E756C6C5D');
+}
+expect {
+    1
+}
+
+test json_valid_error_position_still_json5_lenient {
+    SELECT json_valid('{"x":+0}'), NOT json_error_position('{"x":+0}');
+}
+expect {
+    0|1
+}
