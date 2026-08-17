@@ -884,9 +884,14 @@ impl Statement {
         // publish new btree roots without bumping the schema cookie, so
         // same-version reprepare still refreshes it.
         conn.refresh_schema_from_shared_for_reprepare();
-        let new_program = {
-            let (cmd, _) = conn.parse_sql(&self.program.sql)?;
-            let cmd = cmd.expect("Same SQL string should be able to be parsed");
+        // The parse is of the statement's own stored text, so the marker
+        // offsets need no rebasing before they go on the new program below.
+        let parsed = conn.parse_sql(&self.program.sql)?;
+        let variable_occurrences = parsed.variable_occurrences;
+        let mut new_program = {
+            let cmd = parsed
+                .cmd
+                .expect("Same SQL string should be able to be parsed");
 
             let syms = conn.syms.read();
             let mode = self.query_mode;
@@ -907,6 +912,7 @@ impl Statement {
                 &prepare_options,
             )?
         };
+        new_program.set_variable_occurrences(variable_occurrences);
 
         // Save parameters before they are reset
         let parameters = std::mem::take(&mut self.state.parameters);
@@ -1283,46 +1289,37 @@ impl Statement {
 
     /// Returns the SQL text with every parameter marker replaced by the
     /// literal of its currently bound value (NULL when unbound), following
-    /// SQLite's sqlite3_expanded_sql rendering. The text is re-tokenized
-    /// with the lexer — whose token stream partitions the input, emitting
-    /// whitespace and comments as TK_NONE tokens carrying their bytes — so
-    /// string literals, quoted identifiers and comments are never mistaken
-    /// for markers. Each TK_VARIABLE token resolves to its bind index from
-    /// its own text: `?N` carries the number, named markers are looked up
-    /// in the parameter table (the same marker can occur several times),
-    /// and a bare `?` takes one more than the largest number assigned so
-    /// far, which is SQLite's numbering rule.
+    /// SQLite's sqlite3_expanded_sql rendering. The marker positions and
+    /// bind indices come from the dialect parse that prepared the statement
+    /// (see `crate::dialect::ParsedStatement`), so parameter-looking text in
+    /// quoted names, strings and comments stays untouched. A statement whose
+    /// dialect reported no marker positions is returned unexpanded.
     pub fn expanded_sql(&self) -> String {
         let sql = self.get_sql();
-        let params = &self.program.parameters;
+        let Some(occurrences) = &self.program.variable_occurrences else {
+            return sql.to_string();
+        };
+
         let mut out = String::with_capacity(sql.len());
-        let mut max_index = 0usize;
-        for token in turso_parser::lexer::Lexer::new(sql.as_bytes()) {
-            let Ok(token) = token else {
-                // The statement already parsed once, so re-lexing its text
-                // cannot fail; return the unexpanded SQL if it somehow does.
+        let mut copied_through = 0;
+        for occurrence in occurrences {
+            let Some(prefix) = sql.get(copied_through..occurrence.offset) else {
                 return sql.to_string();
             };
-            if token.token_type == turso_parser::token::TokenType::TK_VARIABLE {
-                let text = String::from_utf8_lossy(token.value);
-                let index = if let Some(digits) = text.strip_prefix('?') {
-                    if digits.is_empty() {
-                        max_index + 1
-                    } else {
-                        digits.parse().unwrap_or(0)
-                    }
-                } else {
-                    params.index(text.as_ref()).map_or(0, |i| i.get())
-                };
-                max_index = max_index.max(index);
-                let value = NonZero::new(index)
-                    .map(|i| self.state.get_parameter(i))
-                    .unwrap_or(Value::Null);
-                append_expanded_literal(&mut out, &value);
-            } else {
-                out.push_str(&String::from_utf8_lossy(token.value));
-            }
+            out.push_str(prefix);
+            let index = usize::try_from(occurrence.index.get())
+                .ok()
+                .and_then(NonZero::new);
+            let value = index
+                .map(|index| self.state.get_parameter(index))
+                .unwrap_or(Value::Null);
+            append_expanded_literal(&mut out, &value);
+            copied_through = occurrence.offset + occurrence.len;
         }
+        let Some(tail) = sql.get(copied_through..) else {
+            return sql.to_string();
+        };
+        out.push_str(tail);
         out
     }
 
@@ -1681,6 +1678,51 @@ mod tests {
         stmt.bind_at(4.try_into().unwrap(), Value::from_i64(9))
             .unwrap();
         assert_eq!(stmt.expanded_sql(), "SELECT 7, 'x', 7, 9");
+    }
+
+    #[test]
+    fn test_expanded_sql_leaves_bracket_quoted_names_untouched() {
+        // A bracket-quoted alias follows an operand, so token lookbehind
+        // alone cannot tell it from other bracket constructs; only the
+        // parse knows its bytes are a name. The parameter-looking text
+        // inside it must not be replaced.
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE t(a)").unwrap();
+        let mut stmt = conn.prepare("SELECT * FROM t [$v] WHERE a=$v").unwrap();
+        let v = stmt.parameter_index("$v").unwrap();
+        stmt.bind_at(v, Value::from_i64(5)).unwrap();
+        assert_eq!(stmt.expanded_sql(), "SELECT * FROM t [$v] WHERE a=5");
+    }
+
+    #[test]
+    fn test_expanded_sql_offsets_follow_the_statement_in_a_batch() {
+        // The parse records marker offsets relative to the whole input
+        // buffer, but a statement carved out of a batch stores only its own
+        // trimmed text. The offsets must be rebased to that text, or every
+        // substitution after the first statement lands on the wrong bytes.
+        let conn = open_test_connection().unwrap();
+        let sql = "SELECT 1;   SELECT ?1, 2";
+        let (_first, consumed) = conn.consume_stmt(sql).unwrap().unwrap();
+        let (mut stmt, _) = conn.consume_stmt(&sql[consumed..]).unwrap().unwrap();
+        assert_eq!(stmt.get_sql(), "SELECT ?1, 2");
+        stmt.bind_at(1.try_into().unwrap(), Value::from_i64(7))
+            .unwrap();
+        assert_eq!(stmt.expanded_sql(), "SELECT 7, 2");
+    }
+
+    #[test]
+    fn test_expanded_sql_survives_prepared_program_cache_rebind() {
+        // Statement caches (sdk-kit's prepare_cached) keep the
+        // Arc<PreparedProgram> and rebind it into a fresh Program on a
+        // cache hit. The marker mapping lives on the shared prepared
+        // program, so the rebound statement still expands.
+        let conn = open_test_connection().unwrap();
+        let stmt = conn.prepare("SELECT $a").unwrap();
+        let program = crate::vdbe::Program::from_prepared(stmt.program.prepared().clone(), conn);
+        let mut rebound = Statement::new(program, stmt.pager.clone(), stmt.query_mode, 0);
+        let a = rebound.parameter_index("$a").unwrap();
+        rebound.bind_at(a, Value::from_i64(9)).unwrap();
+        assert_eq!(rebound.expanded_sql(), "SELECT 9");
     }
 
     #[test]

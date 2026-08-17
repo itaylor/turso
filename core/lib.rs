@@ -125,7 +125,7 @@ pub use database::{
 };
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
-pub use dialect::{Dialect, SqliteDialect};
+pub use dialect::{Dialect, ParsedStatement, SqliteDialect};
 pub use error::{io_error, CompletionError, LimboError};
 pub use function::ContextCollationFunction;
 #[cfg(feature = "io_memory_yield")]
@@ -399,12 +399,19 @@ impl Iterator for QueryRunner<'_> {
 
         let remaining = &self.statements[self.last_offset..];
         match self.conn.parse_sql(remaining) {
-            Ok((Some(cmd), byte_offset_end)) => {
-                let input = remaining[..byte_offset_end].trim();
-                self.last_offset += byte_offset_end;
-                Some(self.conn.run_cmd(cmd, input))
-            }
-            Ok((None, _)) => None,
+            Ok(parsed) => match parsed.cmd {
+                Some(cmd) => {
+                    let input = remaining[..parsed.bytes_consumed].trim();
+                    self.last_offset += parsed.bytes_consumed;
+                    let occurrences = Connection::rebase_variable_occurrences(
+                        parsed.variable_occurrences,
+                        remaining,
+                        input,
+                    );
+                    Some(self.conn.run_cmd(cmd, input, occurrences))
+                }
+                None => None,
+            },
             Err(err) => {
                 self.last_offset = self.statements.len();
                 Some(Err(err))

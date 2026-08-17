@@ -1537,6 +1537,13 @@ pub struct PreparedProgram {
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
     pub sql: String,
+    /// The parameter markers of this statement — the byte range of each in
+    /// `sql` and its bind index — recorded by the dialect parse that
+    /// prepared it (see `crate::dialect::ParsedStatement`). None when the
+    /// program was not compiled from text whose dialect reported markers
+    /// (translated-AST preparation, subprograms, dialects that report
+    /// nothing); expanded SQL then returns the text unexpanded.
+    pub variable_occurrences: Option<Vec<turso_parser::parser::VariableOccurrence>>,
     /// Whether the statement needs to be wrapped in a statement subtransaction
     /// when run as part of an interactive (non-autocommit) transaction.
     /// See [crate::vdbe::builder::ProgramBuilder::is_multi_write] and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.
@@ -1626,6 +1633,20 @@ impl Program {
             prepared,
             connection,
         }
+    }
+
+    /// Attach the parameter marker mapping recorded by the dialect parse
+    /// that produced this program. The mapping lives on the shared
+    /// `PreparedProgram`, next to the `sql` it describes, so a statement
+    /// rebound from a cached program keeps it. Callers run right after
+    /// compilation, while this `Program` holds the only reference.
+    pub(crate) fn set_variable_occurrences(
+        &mut self,
+        variable_occurrences: Option<Vec<turso_parser::parser::VariableOccurrence>>,
+    ) {
+        Arc::get_mut(&mut self.prepared)
+            .expect("marker mapping is attached before the prepared program is shared")
+            .variable_occurrences = variable_occurrences;
     }
 
     #[inline]

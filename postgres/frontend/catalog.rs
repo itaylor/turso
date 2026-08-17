@@ -23,16 +23,23 @@ impl Dialect for PostgresDialect {
         "postgres"
     }
 
-    fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
+    fn parse(&self, sql: &str) -> Result<turso_core::ParsedStatement> {
         // Engine-generated helper statements and pragmas are canonical SQLite
         // text that pg_query rejects, so anything the PostgreSQL parser cannot
-        // handle falls back to SQLite parsing.
+        // handle falls back to SQLite parsing. The fallback also reports the
+        // parameter marker positions the SQLite parse found; the PostgreSQL
+        // paths report none, so expanded SQL leaves their text alone instead
+        // of substituting at positions this translator does not track.
         let Ok(parse_result) = turso_pg_parser::parse(sql) else {
             return turso_core::dialect::sqlite::parse(sql);
         };
         let stmts = &parse_result.protobuf.stmts;
         if stmts.is_empty() {
-            return Ok((None, sql.len()));
+            return Ok(turso_core::ParsedStatement {
+                cmd: None,
+                bytes_consumed: sql.len(),
+                variable_occurrences: None,
+            });
         }
         // The translator consumes the first statement only; report how many
         // input bytes it covers so multi-statement iteration can resume after
@@ -44,7 +51,11 @@ impl Dialect for PostgresDialect {
         };
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         match translator.translate(&parse_result) {
-            Ok(stmt) => Ok((Some(turso_parser::ast::Cmd::Stmt(stmt)), consumed)),
+            Ok(stmt) => Ok(turso_core::ParsedStatement {
+                cmd: Some(turso_parser::ast::Cmd::Stmt(stmt)),
+                bytes_consumed: consumed,
+                variable_occurrences: None,
+            }),
             Err(_) => turso_core::dialect::sqlite::parse(sql),
         }
     }

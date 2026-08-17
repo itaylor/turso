@@ -21,6 +21,21 @@ pub use sqlite::SqliteDialect;
 /// SQLite-compatible callers pass [`SqliteDialect`]. Initial statement
 /// preparation, re-preparation, and every schema load go through this
 /// interface.
+/// One statement parsed by [`Dialect::parse`].
+pub struct ParsedStatement {
+    /// The parsed command, if the text held one.
+    pub cmd: Option<turso_parser::ast::Cmd>,
+    /// Input bytes the statement covered, including its terminator, so
+    /// multi-statement iteration can resume after it.
+    pub bytes_consumed: usize,
+    /// The byte range of each parameter marker in the parsed text and the
+    /// bind index it resolved to, in text order. None when the dialect does
+    /// not report marker positions; expanded SQL then returns the statement
+    /// text unexpanded rather than substitute at positions another parser
+    /// would find.
+    pub variable_occurrences: Option<Vec<turso_parser::parser::VariableOccurrence>>,
+}
+
 pub trait Dialect: Send + Sync + 'static {
     /// Stable identifier for this dialect (e.g. "sqlite", "postgres").
     ///
@@ -31,13 +46,12 @@ pub trait Dialect: Send + Sync + 'static {
 
     /// Parse the first statement in `sql` into the engine AST.
     ///
-    /// Returns the parsed command, if any, and the number of input bytes
-    /// consumed. The engine uses the same method for initial preparation and
+    /// The engine uses the same method for initial preparation and
     /// re-preparation, so dialect-specific SQL remains valid after schema or
     /// connection compilation state changes. Implementations must accept the
     /// canonical SQLite text produced by the engine AST formatter because
     /// engine-generated and AST-only statements use that representation.
-    fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)>;
+    fn parse(&self, sql: &str) -> crate::Result<ParsedStatement>;
 
     /// Parse a `sqlite_schema` `type='table'` row's SQL into a table
     /// definition.
@@ -183,11 +197,19 @@ mod tests {
             "test"
         }
 
-        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        fn parse(&self, sql: &str) -> crate::Result<ParsedStatement> {
             self.statement_parse_calls.fetch_add(1, Ordering::SeqCst);
             if let Some(sql) = sql.strip_prefix("test: ") {
-                let (cmd, offset) = sqlite::parse(sql)?;
-                Ok((cmd, "test: ".len() + offset))
+                let mut parsed = sqlite::parse(sql)?;
+                // The statement text keeps its prefix, so the consumed
+                // count and the marker offsets shift by its length.
+                parsed.bytes_consumed += "test: ".len();
+                if let Some(occurrences) = &mut parsed.variable_occurrences {
+                    for occurrence in occurrences {
+                        occurrence.offset += "test: ".len();
+                    }
+                }
+                Ok(parsed)
             } else {
                 sqlite::parse(sql)
             }
@@ -280,8 +302,12 @@ mod tests {
             "strict-test"
         }
 
-        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
-            sqlite::parse(sql)
+        fn parse(&self, sql: &str) -> crate::Result<ParsedStatement> {
+            // This dialect reports no marker positions, keeping the
+            // unexpanded-fallback path of expanded SQL covered by tests.
+            let mut parsed = sqlite::parse(sql)?;
+            parsed.variable_occurrences = None;
+            Ok(parsed)
         }
 
         fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
@@ -463,6 +489,39 @@ mod tests {
             1
         );
         assert_eq!(dialect.statement_parse_calls.load(Ordering::SeqCst), 2);
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn expanded_sql_uses_the_statement_dialect() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-expanded.db", Arc::new(TestDialect::default())).unwrap();
+        let conn = db.connect().unwrap();
+
+        // `test: SELECT :x` parses only through the dialect. The dialect
+        // also reports where the markers sit, so expansion works on text
+        // the SQLite parser rejects.
+        let mut stmt = conn.prepare("test: SELECT :x").unwrap();
+        let x = stmt.parameter_index(":x").unwrap();
+        stmt.bind_at(x, crate::Value::from_i64(7)).unwrap();
+        assert_eq!(stmt.expanded_sql(), "test: SELECT 7");
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn expanded_sql_stays_unexpanded_when_dialect_reports_no_markers() {
+        // StrictTestDialect keeps the default variable_occurrences, which
+        // reports nothing. Substituting at positions a SQLite re-parse
+        // finds could pick wrong offsets or bind indices in a frontend
+        // dialect's text, so the text must come back unexpanded instead.
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-unexpanded.db", Arc::new(StrictTestDialect)).unwrap();
+        let conn = db.connect().unwrap();
+
+        let mut stmt = conn.prepare("SELECT :x").unwrap();
+        let x = stmt.parameter_index(":x").unwrap();
+        stmt.bind_at(x, crate::Value::from_i64(7)).unwrap();
+        assert_eq!(stmt.expanded_sql(), "SELECT :x");
         conn.close().unwrap();
     }
 
@@ -678,7 +737,7 @@ mod tests {
             "nofuncs"
         }
 
-        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        fn parse(&self, sql: &str) -> crate::Result<ParsedStatement> {
             sqlite::parse(sql)
         }
 

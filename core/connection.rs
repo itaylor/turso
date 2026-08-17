@@ -931,8 +931,7 @@ impl Connection {
                 drop(syms);
                 let cmd = {
                     crate::stack::trace_stack!("schema_retry_parse");
-                    let (cmd, _) = self.parse_sql(input)?;
-                    let Some(cmd) = cmd else {
+                    let Some(cmd) = self.parse_sql(input)?.cmd else {
                         return Err(err);
                     };
                     cmd
@@ -1001,11 +1000,12 @@ impl Connection {
             let sql = sql.as_ref();
             tracing::debug!("Preparing: {}", sql);
 
-            let (cmd, byte_offset_end) = {
+            let parsed = {
                 crate::stack::trace_stack!("parse");
                 self.parse_sql(sql)?
             };
-            let cmd = match cmd {
+            let byte_offset_end = parsed.bytes_consumed;
+            let cmd = match parsed.cmd {
                 Some(cmd) => cmd,
                 None => {
                     return Err(LimboError::InvalidArgument(
@@ -1017,7 +1017,13 @@ impl Connection {
                 .unwrap()
                 .trim();
             let prepare_options = PrepareOptions::default();
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options)?;
+            let (mut program, pager, mode) =
+                self.compile_cmd(cmd, input, origin, &prepare_options)?;
+            program.set_variable_occurrences(Self::rebase_variable_occurrences(
+                parsed.variable_occurrences,
+                sql,
+                input,
+            ));
 
             Ok(Statement::new_with_origin(
                 program,
@@ -1682,7 +1688,12 @@ impl Connection {
 
         let mut remaining = sql;
         let prepare_options = PrepareOptions::default();
-        while let (Some(cmd), byte_offset_end) = self.parse_sql(remaining)? {
+        loop {
+            let parsed = self.parse_sql(remaining)?;
+            let byte_offset_end = parsed.bytes_consumed;
+            let Some(cmd) = parsed.cmd else {
+                break;
+            };
             let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
@@ -1702,28 +1713,38 @@ impl Connection {
         let sql = sql.as_ref();
         tracing::trace!("Querying: {}", sql);
 
-        let (cmd, byte_offset_end) = self.parse_sql(sql)?;
-        let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+        let parsed = self.parse_sql(sql)?;
+        let input = str::from_utf8(&sql.as_bytes()[..parsed.bytes_consumed])
             .unwrap()
             .trim();
-        match cmd {
-            Some(cmd) => self.run_cmd(cmd, input),
+        match parsed.cmd {
+            Some(cmd) => self.run_cmd(
+                cmd,
+                input,
+                Self::rebase_variable_occurrences(parsed.variable_occurrences, sql, input),
+            ),
             None => Ok(None),
         }
     }
 
+    /// Compile and start one parsed statement. `variable_occurrences` is
+    /// the statement's marker mapping with offsets already relative to
+    /// `input` (see `rebase_variable_occurrences`); None when the caller's
+    /// dialect reported none.
     #[instrument(skip_all, level = Level::DEBUG)]
     pub(crate) fn run_cmd(
         self: &Arc<Connection>,
         cmd: Cmd,
         input: &str,
+        variable_occurrences: Option<Vec<turso_parser::parser::VariableOccurrence>>,
     ) -> Result<Option<Statement>> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let prepare_options = PrepareOptions::default();
-        let (program, pager, mode) =
+        let (mut program, pager, mode) =
             self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
+        program.set_variable_occurrences(variable_occurrences);
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some(stmt))
     }
@@ -1743,7 +1764,12 @@ impl Connection {
         let sql = sql.as_ref();
         let mut remaining = sql;
         let prepare_options = PrepareOptions::default();
-        while let (Some(cmd), byte_offset_end) = self.parse_sql(remaining)? {
+        loop {
+            let parsed = self.parse_sql(remaining)?;
+            let byte_offset_end = parsed.bytes_consumed;
+            let Some(cmd) = parsed.cmd else {
+                break;
+            };
             let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
@@ -1763,22 +1789,51 @@ impl Connection {
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
     ) -> Result<Option<(Statement, usize)>> {
-        let (cmd, byte_offset_end) = self.parse_sql(sql.as_ref())?;
-        let Some(cmd) = cmd else {
+        let parsed = self.parse_sql(sql.as_ref())?;
+        let byte_offset_end = parsed.bytes_consumed;
+        let Some(cmd) = parsed.cmd else {
             return Ok(None);
         };
         let input = str::from_utf8(&sql.as_ref().as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
         let prepare_options = PrepareOptions::default();
-        let (program, pager, mode) =
+        let (mut program, pager, mode) =
             self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
+        program.set_variable_occurrences(Self::rebase_variable_occurrences(
+            parsed.variable_occurrences,
+            sql.as_ref(),
+            input,
+        ));
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some((stmt, byte_offset_end)))
     }
 
-    pub(crate) fn parse_sql(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+    pub(crate) fn parse_sql(&self, sql: &str) -> Result<crate::dialect::ParsedStatement> {
         self.db.dialect().parse(sql)
+    }
+
+    /// Rebase parameter marker offsets from the buffer a dialect parsed to
+    /// the statement's own stored text. `input` is the trimmed slice of
+    /// `sql` covering the parsed statement, which is what
+    /// `Statement::get_sql` returns and what expanded SQL splices bound
+    /// values into; markers of a statement always sit inside it.
+    pub(crate) fn rebase_variable_occurrences(
+        occurrences: Option<Vec<turso_parser::parser::VariableOccurrence>>,
+        sql: &str,
+        input: &str,
+    ) -> Option<Vec<turso_parser::parser::VariableOccurrence>> {
+        let start = input.as_ptr() as usize - sql.as_ptr() as usize;
+        occurrences.map(|mut occurrences| {
+            for occurrence in &mut occurrences {
+                debug_assert!(
+                    occurrence.offset >= start
+                        && occurrence.offset + occurrence.len <= start + input.len()
+                );
+                occurrence.offset -= start;
+            }
+            occurrences
+        })
     }
 
     #[cfg(feature = "fs")]

@@ -173,6 +173,7 @@ pub struct Parser<'a> {
     /// Parser tracks that in order to properly auto-assign variable ids in correct order for anonymous parameters '?'
     last_variable_id: u32,
     named_variables: HashMap<&'a [u8], NonZeroU32>,
+    variable_occurrences: Vec<VariableOccurrence>,
     /// Tracks STRUCT/UNION nesting depth to prevent stack overflow from deeply nested types
     type_nesting_depth: u32,
     /// Current expression recursion depth of the parser, bounded by [`MAX_EXPR_DEPTH`]
@@ -180,6 +181,15 @@ pub struct Parser<'a> {
     /// Height of the most recently parsed expression (`1 + max(child heights)`,
     /// like SQLite's `Expr.nHeight`), bounded by [`MAX_EXPR_DEPTH`]
     last_expr_height: usize,
+}
+
+/// One parameter marker in the original SQL text, resolved to the bind index
+/// assigned by the parser.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VariableOccurrence {
+    pub offset: usize,
+    pub len: usize,
+    pub index: NonZeroU32,
 }
 
 /// Maximum query expression depth, our equivalent of SQLite's
@@ -210,6 +220,7 @@ impl<'a> Parser<'a> {
             current_token: Token::new(&input[..0], TokenType::TK_NONE),
             last_variable_id: 0,
             named_variables: HashMap::new(),
+            variable_occurrences: Vec::new(),
             type_nesting_depth: 0,
             expr_nesting_depth: 0,
             last_expr_height: 0,
@@ -218,11 +229,11 @@ impl<'a> Parser<'a> {
 
     fn create_variable(&mut self, token: &'a [u8]) -> Result<Expr> {
         debug_assert!(!token.is_empty());
-        if token == b"?" {
+        let variable = if token == b"?" {
             // Rewrite anonymous variables in encounter order
             self.last_variable_id += 1;
             let index = NonZeroU32::new(self.last_variable_id).unwrap();
-            Ok(Expr::Variable(Variable::indexed(index)))
+            Variable::indexed(index)
         } else if token[0] == b'?' {
             let variable_str = std::str::from_utf8(&token[1..])
                 .map_err(|e| Error::Custom(format!("non-utf8 positional variable id: {e}")))?;
@@ -245,7 +256,7 @@ impl<'a> Parser<'a> {
             // spelling is its name (sqlite3_bind_parameter_name returns it,
             // bind_parameter_index resolves it), derived from the index on
             // demand rather than allocated per marker.
-            Ok(Expr::Variable(Variable::numbered(index)))
+            Variable::numbered(index)
         } else {
             debug_assert!(matches!(token[0], b':' | b'@' | b'$'));
             let index = if let Some(index) = self.named_variables.get(token).copied() {
@@ -256,11 +267,22 @@ impl<'a> Parser<'a> {
                 self.named_variables.insert(token, index);
                 index
             };
-            Ok(Expr::Variable(Variable::named(
-                from_bytes_as_str(token),
-                index,
-            )))
-        }
+            Variable::named(from_bytes_as_str(token), index)
+        };
+
+        let offset = token.as_ptr() as usize - self.lexer.input.as_ptr() as usize;
+        debug_assert!(offset + token.len() <= self.lexer.input.len());
+        self.variable_occurrences.push(VariableOccurrence {
+            offset,
+            len: token.len(),
+            index: variable.index,
+        });
+        Ok(Expr::Variable(variable))
+    }
+
+    /// Parameter markers consumed while parsing the current statement.
+    pub fn variable_occurrences(&self) -> &[VariableOccurrence] {
+        &self.variable_occurrences
     }
 
     #[inline(always)]
@@ -278,6 +300,7 @@ impl<'a> Parser<'a> {
     pub fn next_cmd(&mut self) -> Result<Option<Cmd>> {
         self.last_variable_id = 0;
         self.named_variables.clear();
+        self.variable_occurrences.clear();
 
         // consumes prefix SEMI
         while let Some(token) = self.peek()? {
@@ -618,11 +641,14 @@ impl<'a> Parser<'a> {
         let old_peekable = self.peekable;
         let old_current_token = self.current_token.clone();
         let start_offset = self.lexer.offset;
+        let start_variable_occurrences = self.variable_occurrences.len();
         let result = exc(self);
         if result.is_err() {
             self.peekable = old_peekable;
             self.current_token = old_current_token;
             self.lexer.offset = start_offset;
+            self.variable_occurrences
+                .truncate(start_variable_occurrences);
         }
         result
     }

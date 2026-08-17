@@ -35,7 +35,7 @@ impl super::Dialect for SqliteDialect {
         "sqlite"
     }
 
-    fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+    fn parse(&self, sql: &str) -> crate::Result<super::ParsedStatement> {
         parse(sql)
     }
 
@@ -82,16 +82,20 @@ impl super::Dialect for SqliteDialect {
     }
 }
 
-/// Parse the first SQLite statement in `sql` and return its consumed byte count.
-pub fn parse(sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+/// Parse the first SQLite statement in `sql`.
+pub fn parse(sql: &str) -> crate::Result<super::ParsedStatement> {
     let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
     let cmd = parser.next_cmd()?;
-    Ok((cmd, parser.offset()))
+    Ok(super::ParsedStatement {
+        bytes_consumed: parser.offset(),
+        variable_occurrences: Some(parser.variable_occurrences().to_vec()),
+        cmd,
+    })
 }
 
 /// Parse persisted SQLite table SQL into a `CREATE TABLE` statement.
 pub fn parse_table_sql_ast(sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
-    let (cmd, _) = parse(sql)?;
+    let cmd = parse(sql)?.cmd;
     match cmd {
         Some(turso_parser::ast::Cmd::Stmt(stmt @ turso_parser::ast::Stmt::CreateTable { .. })) => {
             Ok(stmt)

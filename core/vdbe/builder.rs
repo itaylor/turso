@@ -2197,6 +2197,7 @@ impl ProgramBuilder {
             result_columns: self.result_columns,
             table_references: self.table_references,
             sql: sql.to_string(),
+            variable_occurrences: None,
             needs_stmt_subtransactions: crate::Arc::new(crate::AtomicBool::new(
                 needs_stmt_subtransactions,
             )),
