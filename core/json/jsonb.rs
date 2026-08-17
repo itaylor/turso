@@ -3686,6 +3686,25 @@ pub struct ParseInfo {
     pub has_json5: bool,
 }
 
+/// Length of the JSON5-only whitespace sequence at the start of
+/// `input`, or 0 if it does not start with one. Covers VT, FF and the
+/// UTF-8 encodings of the Unicode space characters SQLite's JSON5
+/// parser skips: U+00A0, U+1680, U+2000..U+200A, U+2028, U+2029,
+/// U+202F, U+205F, U+3000 and the U+FEFF byte order mark.
+fn json5_whitespace_len(input: &[u8]) -> usize {
+    match input {
+        [0x0b | 0x0c, ..] => 1,
+        [0xc2, 0xa0, ..] => 2,
+        [0xe1, 0x9a, 0x80, ..] => 3,
+        [0xe2, 0x80, 0x80..=0x8a, ..] => 3,
+        [0xe2, 0x80, 0xa8 | 0xa9 | 0xaf, ..] => 3,
+        [0xe2, 0x81, 0x9f, ..] => 3,
+        [0xe3, 0x80, 0x80, ..] => 3,
+        [0xef, 0xbb, 0xbf, ..] => 3,
+        _ => 0,
+    }
+}
+
 pub fn skip_whitespace_tracking(input: &[u8], mut pos: usize, info: &mut ParseInfo) -> usize {
     let len = input.len();
     if pos >= len {
@@ -3693,7 +3712,10 @@ pub fn skip_whitespace_tracking(input: &[u8], mut pos: usize, info: &mut ParseIn
     }
 
     // Fast path for non-whitespace, non-comment
-    if (WS_TABLE[input[pos] as usize] & 1) == 0 && input[pos] != b'/' {
+    if (WS_TABLE[input[pos] as usize] & 1) == 0
+        && input[pos] != b'/'
+        && json5_whitespace_len(&input[pos..]) == 0
+    {
         return pos;
     }
 
@@ -3703,6 +3725,9 @@ pub fn skip_whitespace_tracking(input: &[u8], mut pos: usize, info: &mut ParseIn
         if (WS_TABLE[ch as usize] & 1) != 0 {
             // Skip whitespace
             pos += 1;
+        } else if let n @ 1.. = json5_whitespace_len(&input[pos..]) {
+            info.has_json5 = true;
+            pos += n;
         } else if ch == b'/' && pos + 1 < len {
             // Handle JSON5 comments
             match input[pos + 1] {
