@@ -12,7 +12,7 @@ pub use crate::json::ops::{
     jsonb_replace,
 };
 use crate::json::path::{json_path, JsonPath, PathElement};
-use crate::numeric::Numeric;
+use crate::numeric::{str_to_i64, Numeric};
 use crate::types::{AsValueRef, Text, TextSubtype, Value, ValueType};
 use crate::{bail_constraint_error, bail_parse_error, LimboError, ValueRef};
 pub use cache::JsonCacheCell;
@@ -915,6 +915,80 @@ fn strict_text_check(slice: &[u8]) -> Result<Value, TryReserveError> {
         Err(LimboError::OutOfMemory) => Err(TryReserveError),
         Err(_) => Ok(Value::from_i64(0)),
     }
+}
+
+/// Implements the two-argument json_valid(X, Y). Y is a bitmask picking
+/// which representations count as valid, and X is valid if any selected
+/// check passes:
+///   0x01  X is text that is strict RFC 8259 JSON
+///   0x02  X is text that is JSON5
+///   0x04  X is a blob that superficially looks like JSONB
+///   0x08  X is a blob that is valid JSONB
+/// Like SQLite, the flags are validated before X is looked at, so an
+/// out-of-range Y errors even when X is NULL, and a blob that looks
+/// like JSONB is never re-checked as text.
+pub fn is_json_valid_flags(
+    json_value: impl AsValueRef,
+    flags_value: impl AsValueRef,
+) -> crate::Result<Value> {
+    const FLAG_TEXT_STRICT: i64 = 0x01;
+    const FLAG_TEXT_JSON5: i64 = 0x02;
+    const FLAG_BLOB_PROBABLE: i64 = 0x04;
+    const FLAG_BLOB_STRICT: i64 = 0x08;
+
+    // SQLite reads Y with sqlite3_value_int(): text and blobs contribute
+    // their leading integer prefix ('1e1' is 1, not 10), reals truncate.
+    let flags = match flags_value.as_value_ref() {
+        ValueRef::Numeric(Numeric::Integer(int)) => int,
+        ValueRef::Numeric(Numeric::Float(float)) => f64::from(float) as i64,
+        ValueRef::Text(text) => str_to_i64(text.as_str()).unwrap_or(0),
+        ValueRef::Blob(blob) => str_to_i64(String::from_utf8_lossy(blob)).unwrap_or(0),
+        ValueRef::Null => 0,
+    };
+    if !(1..=15).contains(&flags) {
+        crate::bail_constraint_error!("FLAGS parameter to json_valid() must be between 1 and 15");
+    }
+
+    let text_checks = |slice: &[u8]| -> crate::Result<bool> {
+        match parse_as_json_text_tracking(slice) {
+            Ok((_, info)) => Ok(if info.has_json5 {
+                flags & FLAG_TEXT_JSON5 != 0
+            } else {
+                flags & (FLAG_TEXT_STRICT | FLAG_TEXT_JSON5) != 0
+            }),
+            Err(LimboError::OutOfMemory) => Err(LimboError::OutOfMemory),
+            Err(_) => Ok(false),
+        }
+    };
+
+    let json_value = json_value.as_value_ref();
+    let valid = match json_value {
+        ValueRef::Null => return Ok(Value::Null),
+        ValueRef::Blob(blob) => {
+            // SQLite classifies the raw blob. The probable check is the
+            // shallow one: a valid outer wrapper with malformed contents
+            // passes flag 0x04 but fails flag 0x08.
+            if looks_like_jsonb_blob(blob) {
+                flags & FLAG_BLOB_PROBABLE != 0
+                    || (flags & FLAG_BLOB_STRICT != 0 && validate_jsonb(blob))
+            } else {
+                text_checks(blob)?
+            }
+        }
+        ValueRef::Text(text) => text_checks(text.as_str().as_bytes())?,
+        // A number renders as JSON text: any finite number is strict
+        // JSON, the infinities render as 9e999 which is JSON5 only.
+        ValueRef::Numeric(Numeric::Float(float)) => {
+            let float: f64 = float.into();
+            if float.is_infinite() {
+                flags & FLAG_TEXT_JSON5 != 0
+            } else {
+                flags & (FLAG_TEXT_STRICT | FLAG_TEXT_JSON5) != 0
+            }
+        }
+        ValueRef::Numeric(_) => flags & (FLAG_TEXT_STRICT | FLAG_TEXT_JSON5) != 0,
+    };
+    Ok(Value::from_i64(i64::from(valid)))
 }
 
 pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {

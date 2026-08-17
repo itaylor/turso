@@ -149,13 +149,13 @@ use crate::vdbe::vacuum::{
 #[cfg(feature = "json")]
 use crate::{
     function::JsonFunc, json, json::convert_dbtype_to_raw_jsonb, json::get_json,
-    json::is_json_valid, json::json_array, json::json_array_length, json::json_arrow_extract,
-    json::json_arrow_shift_extract, json::json_error_position, json::json_extract,
-    json::json_from_raw_bytes_agg, json::json_insert, json::json_object, json::json_patch,
-    json::json_quote, json::json_remove, json::json_replace, json::json_set, json::json_type,
-    json::jsonb, json::jsonb_array, json::jsonb_extract, json::jsonb_insert, json::jsonb_object,
-    json::jsonb_patch, json::jsonb_remove, json::jsonb_replace, json::jsonb_set,
-    json::raw_jsonb_element_len, json::Conv,
+    json::is_json_valid, json::is_json_valid_flags, json::json_array, json::json_array_length,
+    json::json_arrow_extract, json::json_arrow_shift_extract, json::json_error_position,
+    json::json_extract, json::json_from_raw_bytes_agg, json::json_insert, json::json_object,
+    json::json_patch, json::json_quote, json::json_remove, json::json_replace, json::json_set,
+    json::json_type, json::jsonb, json::jsonb_array, json::jsonb_extract, json::jsonb_insert,
+    json::jsonb_object, json::jsonb_patch, json::jsonb_remove, json::jsonb_replace,
+    json::jsonb_set, json::raw_jsonb_element_len, json::Conv,
 };
 
 use super::{Program, ProgramState, Register};
@@ -8965,7 +8965,13 @@ pub fn op_function(
             }
             JsonFunc::JsonValid => {
                 let json_value = &state.registers[*start_reg];
-                state.registers[*dest].set_value(is_json_valid(json_value.get_value())?);
+                let result = if arg_count > 1 {
+                    let flags_value = &state.registers[*start_reg + 1];
+                    is_json_valid_flags(json_value.get_value(), flags_value.get_value())?
+                } else {
+                    is_json_valid(json_value.get_value())?
+                };
+                state.registers[*dest].set_value(result);
             }
             JsonFunc::JsonPatch => {
                 assert_eq!(arg_count, 2);

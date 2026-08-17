@@ -159,3 +159,121 @@ test json_valid_error_position_still_json5_lenient {
 expect {
     0|1
 }
+
+# Two-argument json_valid(X, Y): Y is a bitmask picking which
+# representations count as valid (1 = strict RFC 8259 text, 2 = JSON5
+# text, 4 = blob that superficially looks like JSONB, 8 = blob that is
+# valid JSONB).
+
+test json_valid_flag2_accepts_json5_text {
+    SELECT json_valid('{a:1}', 1), json_valid('{a:1}', 2), json_valid('{"a":1}', 1);
+}
+expect {
+    0|1|1
+}
+
+test json_valid_blob_flags_match_jsonb_blobs_only {
+    SELECT json_valid(jsonb('{"a":1}'), 2), json_valid(jsonb('{"a":1}'), 4),
+           json_valid(jsonb('{"a":1}'), 8), json_valid(x'ABCD', 4), json_valid(x'ABCD', 8);
+}
+expect {
+    0|1|1|0|0
+}
+
+# x'3B133132' has a valid outer JSONB wrapper (ARRAY of 3 payload
+# bytes) around malformed contents: flag 4 only looks at the wrapper,
+# flag 8 validates all the way down.
+test json_valid_flag4_is_shallow_flag8_is_deep {
+    SELECT json_valid(x'3B133132', 4), json_valid(x'3B133132', 8);
+}
+expect {
+    1|0
+}
+
+# x'2033343535' is the text " 3455". The raw blob decides whether it is
+# JSONB, so the leading space makes this text, not a JSONB integer.
+test json_valid_flags_classify_blob_before_whitespace {
+    SELECT json_valid(x'2033343535', 1), json_valid(x'2033343535', 2),
+           json_valid(x'2033343535', 4), json_valid(x'2033343535', 8);
+}
+expect {
+    1|1|0|0
+}
+
+# x'5B6E756C6C5D' is the text "[null]": its first byte looks like a
+# JSONB array header, but small '{'/'['/digit-prefixed blobs are fully
+# validated before counting as JSONB, so this one is text under every
+# flag.
+test json_valid_flags_ambiguous_small_blob_is_text {
+    SELECT json_valid(x'5B6E756C6C5D', 1), json_valid(x'5B6E756C6C5D', 2),
+           json_valid(x'5B6E756C6C5D', 4), json_valid(x'5B6E756C6C5D', 8);
+}
+expect {
+    1|1|0|0
+}
+
+test json_valid_text_never_matches_blob_flags {
+    SELECT json_valid('[1]', 4), json_valid('[1]', 8), json_valid('[1,2,3]', 6);
+}
+expect {
+    0|0|1
+}
+
+test json_valid_flags_combine_as_bitmask {
+    SELECT json_valid('{a:1}', 3), json_valid('{a:1}', 15), json_valid(jsonb('{"a":1}'), 12);
+}
+expect {
+    1|1|1
+}
+
+test json_valid_two_arg_numbers_render_as_text {
+    SELECT json_valid(123, 1), json_valid(123, 2), json_valid(123, 4),
+           json_valid(9e999, 1), json_valid(9e999, 2);
+}
+expect {
+    1|1|0|0|1
+}
+
+test json_valid_two_arg_null_x_is_null {
+    SELECT json_valid(NULL, 1) IS NULL;
+}
+expect {
+    1
+}
+
+test json_valid_flags_coerce_numerically {
+    SELECT json_valid('{}', '2'), json_valid('{}', 2.5);
+}
+expect {
+    1|1
+}
+
+# TEXT flags take their leading integer prefix, like sqlite3_value_int:
+# '1e1' means flag 1, not 10, so a JSONB blob fails it.
+test json_valid_text_flags_use_integer_prefix {
+    SELECT json_valid(x'2B1331', '1e1'), json_valid('{}', '1e1');
+}
+expect {
+    0|1
+}
+
+test json_valid_flags_zero_is_an_error {
+    SELECT json_valid('{}', 0);
+}
+expect error {
+    ^FLAGS parameter to json_valid\(\) must be between 1 and 15$
+}
+
+test json_valid_flags_sixteen_is_an_error {
+    SELECT json_valid('{}', 16);
+}
+expect error {
+    ^FLAGS parameter to json_valid\(\) must be between 1 and 15$
+}
+
+test json_valid_flags_null_is_an_error_even_for_null_x {
+    SELECT json_valid(NULL, NULL);
+}
+expect error {
+    ^FLAGS parameter to json_valid\(\) must be between 1 and 15$
+}
