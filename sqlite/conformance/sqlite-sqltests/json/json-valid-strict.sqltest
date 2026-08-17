@@ -561,3 +561,20 @@ expect {
     [null,"X"]|1
 }
 
+# Malformed paths report SQLite's message format, with the path quoted.
+
+test json_bad_path_error_message_format {
+    SELECT json_extract('{"b":[1]}', '$.b[#-]');
+}
+expect error {
+    ^(Parse error: )?bad JSON path: '\$\.b\[#-\]'$
+}
+
+# Apostrophes in the path are doubled in the message, like SQLite's %Q.
+test json_bad_path_message_doubles_apostrophes {
+    SELECT json_extract('{}', 'x''y''z');
+}
+expect error {
+    ^(Parse error: )?bad JSON path: 'x''y''z'$
+}
+
