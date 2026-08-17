@@ -2,7 +2,7 @@ use crate::{
     function::MathFunc,
     numeric::{format_float, format_float_for_quote, NullableInteger, Numeric},
     translate::collate::CollationSeq,
-    types::{compare_immutable_single, AsValueRef, SeekOp},
+    types::{compare_immutable_single, AsValueRef, SeekOp, TextSubtype},
     vdbe::affinity::{real_to_i64, Affinity},
     LimboError, Result, Value,
 };
@@ -604,6 +604,13 @@ impl Value {
                 Value::from_i64(char_pos as i64)
             }
             None => Value::from_i64(0),
+        }
+    }
+
+    pub fn exec_subtype(&self) -> Value {
+        match self {
+            Value::Text(t) if t.subtype == TextSubtype::Json => Value::from_i64(74),
+            _ => Value::from_i64(0),
         }
     }
 
