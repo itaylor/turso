@@ -1681,6 +1681,90 @@ mod tests {
     }
 
     #[test]
+    fn test_expanded_sql_splits_slice_bounds_like_the_parser() {
+        // `[$lo::hi]` holds two parameters: the "::" is the slice colon
+        // followed by the `:hi` marker. Expansion re-tokenizes the SQL, so
+        // the lexer must make the same split there as it did when parsing,
+        // or the bound values are not found.
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new().with_custom_types(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+
+        let mut stmt = conn.prepare("SELECT (ARRAY[1,2,3,4])[$lo::hi]").unwrap();
+        let lo = stmt.parameter_index("$lo").unwrap();
+        let hi = stmt.parameter_index(":hi").unwrap();
+        stmt.bind_at(lo, Value::from_i64(2)).unwrap();
+        stmt.bind_at(hi, Value::from_i64(3)).unwrap();
+        assert_eq!(stmt.expanded_sql(), "SELECT (ARRAY[1,2,3,4])[2:3]");
+
+        // Inside parentheses within the brackets, "::" is part of the name,
+        // when parsing and when expanding alike.
+        let mut stmt = conn
+            .prepare("SELECT (ARRAY[1,2,3,4])[coalesce($ns::idx, 1)]")
+            .unwrap();
+        let idx = stmt.parameter_index("$ns::idx").unwrap();
+        stmt.bind_at(idx, Value::from_i64(4)).unwrap();
+        assert_eq!(
+            stmt.expanded_sql(),
+            "SELECT (ARRAY[1,2,3,4])[coalesce(4, 1)]"
+        );
+
+        // The upper bound sits after the slice colon, so its name is whole.
+        let mut stmt = conn.prepare("SELECT (ARRAY[1,2,3,4])[1:$ns::hi]").unwrap();
+        let hi = stmt.parameter_index("$ns::hi").unwrap();
+        stmt.bind_at(hi, Value::from_i64(3)).unwrap();
+        assert_eq!(stmt.expanded_sql(), "SELECT (ARRAY[1,2,3,4])[1:3]");
+
+        // Four adjacent colons are the slice separator followed by a
+        // global `:::name` parameter in the upper bound.
+        let mut stmt = conn.prepare("SELECT (ARRAY[1,2,3,4])[1::::hi]").unwrap();
+        let hi = stmt.parameter_index(":::hi").unwrap();
+        stmt.bind_at(hi, Value::from_i64(3)).unwrap();
+        assert_eq!(stmt.expanded_sql(), "SELECT (ARRAY[1,2,3,4])[1:3]");
+
+        // A bracket-quoted column is subscriptable. The parser skips the
+        // quoted name's "]" as raw bytes while expansion re-tokenizes it,
+        // and both must read the next bracket as a subscript that splits
+        // the bounds.
+        conn.execute("CREATE TABLE t(a)").unwrap();
+        let mut stmt = conn.prepare("SELECT [a][$lo::hi] FROM t").unwrap();
+        let lo = stmt.parameter_index("$lo").unwrap();
+        let hi = stmt.parameter_index(":hi").unwrap();
+        stmt.bind_at(lo, Value::from_i64(1)).unwrap();
+        stmt.bind_at(hi, Value::from_i64(2)).unwrap();
+        assert_eq!(stmt.expanded_sql(), "SELECT [a][1:2] FROM t");
+
+        // A quoted name may contain "[": `[c[]` names the column "c[".
+        // Expansion's re-tokenizing must treat those bytes as raw name
+        // text; were the inner "[" lexed as a bracket, its frame would
+        // stay open past the "]" and split $ns::v, expanding it as two
+        // unbound markers instead of the bound value.
+        conn.execute("CREATE TABLE q([c[])").unwrap();
+        let mut stmt = conn.prepare("SELECT [c[] + $ns::v FROM q").unwrap();
+        let v = stmt.parameter_index("$ns::v").unwrap();
+        stmt.bind_at(v, Value::from_i64(5)).unwrap();
+        assert_eq!(stmt.expanded_sql(), "SELECT [c[] + 5 FROM q");
+
+        // A bracket-quoted alias follows an operand too, so token
+        // lookbehind alone cannot distinguish it from a subscript. The
+        // parameter-looking bytes in the alias must stay untouched.
+        let mut stmt = conn
+            .prepare("SELECT * FROM t [$ns::v] WHERE a=$ns::v")
+            .unwrap();
+        let v = stmt.parameter_index("$ns::v").unwrap();
+        stmt.bind_at(v, Value::from_i64(5)).unwrap();
+        assert_eq!(stmt.expanded_sql(), "SELECT * FROM t [$ns::v] WHERE a=5");
+    }
+
+    #[test]
     fn test_expanded_sql_leaves_bracket_quoted_names_untouched() {
         // A bracket-quoted alias follows an operand, so token lookbehind
         // alone cannot tell it from other bracket constructs; only the

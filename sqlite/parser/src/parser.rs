@@ -301,6 +301,9 @@ impl<'a> Parser<'a> {
         self.last_variable_id = 0;
         self.named_variables.clear();
         self.variable_occurrences.clear();
+        // A parse error can abort a statement mid-subscript; do not let the
+        // stale bracket state affect the next statement.
+        self.lexer.clear_context();
 
         // consumes prefix SEMI
         while let Some(token) = self.peek()? {
@@ -641,12 +644,14 @@ impl<'a> Parser<'a> {
         let old_peekable = self.peekable;
         let old_current_token = self.current_token.clone();
         let start_offset = self.lexer.offset;
+        let start_context = self.lexer.save_context();
         let start_variable_occurrences = self.variable_occurrences.len();
         let result = exc(self);
         if result.is_err() {
             self.peekable = old_peekable;
             self.current_token = old_current_token;
             self.lexer.offset = start_offset;
+            self.lexer.restore_context(start_context);
             self.variable_occurrences
                 .truncate(start_variable_occurrences);
         }
@@ -660,9 +665,11 @@ impl<'a> Parser<'a> {
     {
         debug_assert!(!self.peekable);
         let start_offset = self.lexer.offset;
+        let start_context = self.lexer.save_context();
         let result = exc(self);
         self.peekable = false;
         self.lexer.offset = start_offset;
+        self.lexer.restore_context(start_context);
         result
     }
 
@@ -788,8 +795,10 @@ impl<'a> Parser<'a> {
             .ok_or(Error::ParseUnexpectedEOF)?;
         let raw = &self.lexer.input[start..start + end_pos];
         let name = String::from_utf8_lossy(raw).into_owned();
-        // Advance lexer past the closing `]`
+        // Advance lexer past the closing `]`, and tell the lexer about the
+        // skipped `]` so its bracket state stays balanced.
         self.lexer.offset = start + end_pos + 1;
+        self.lexer.close_bracket();
         Ok(Name::bracketed(name))
     }
 
@@ -2492,6 +2501,10 @@ impl<'a> Parser<'a> {
                 }
                 TK_COLLATE => Box::new(Expr::Collate(result, self.parse_collate()?.unwrap())),
                 TK_LBRACKET => {
+                    // The lexer itself splits parameter names at "::" at the
+                    // top level of the brackets (see
+                    // Lexer::splits_param_names), so unspaced slice bounds
+                    // like `arr[$lo::hi]` arrive here as `$lo`, `:`, `:hi`.
                     eat_assert!(self, TK_LBRACKET);
                     let first = self.parse_expr(0)?;
                     let first_height = self.last_expr_height;
@@ -4460,6 +4473,10 @@ impl<'a> Parser<'a> {
                 // Desugar SET col[n] = val → SET col = array_set_element(col, n, val)
                 if self.peek()?.is_some_and(|t| t.token_type == TK_LBRACKET) {
                     eat_assert!(self, TK_LBRACKET);
+                    // This subscript takes a single index and no slice, so a
+                    // parameter name inside it keeps its "::" ($ns::idx is
+                    // one name, not the bounds $ns and :idx).
+                    self.lexer.subscript_takes_no_slice();
                     let idx_expr = self.parse_expr(0)?;
                     eat_expect!(self, TK_RBRACKET);
                     eat_expect!(self, TK_EQ);
@@ -13016,6 +13033,194 @@ mod tests {
                 assert_eq!(result_str, expected_str[i], "Input: {rstring:?}");
             }
         }
+    }
+
+    #[test]
+    fn test_subscript_splits_parameter_names_at_double_colon() {
+        // Inside `expr[...]`, unspaced parameter bounds stay a slice; the
+        // same text outside a subscript is one namespace-qualified name.
+        let cases = [
+            ("SELECT a[$lo::hi]", "SELECT array_slice (a, $lo, :hi);"),
+            ("SELECT a[:lo::hi]", "SELECT array_slice (a, :lo, :hi);"),
+            ("SELECT a[@lo::hi]", "SELECT array_slice (a, @lo, :hi);"),
+            ("SELECT a[$::idx]", "SELECT array_element (a, $::idx);"),
+            ("SELECT $lo::hi", "SELECT $lo::hi;"),
+            ("SELECT :lo::hi", "SELECT :lo::hi;"),
+            ("SELECT :::global", "SELECT :::global;"),
+            // The depth must drop back to zero after the subscript.
+            (
+                "SELECT a[$lo::hi] + $ns::var",
+                "SELECT array_slice (a, $lo, :hi) + $ns::var;",
+            ),
+            // Parentheses inside the subscript keep the name whole: there
+            // a "::" cannot be a slice separator.
+            (
+                "SELECT a[coalesce($ns::idx, 0)]",
+                "SELECT array_element (a, coalesce ($ns::idx, 0));",
+            ),
+            (
+                "SELECT a[($ns::idx)]",
+                "SELECT array_element (a, ($ns::idx));",
+            ),
+            // An ARRAY[...] literal is not a subscript, and a slice's upper
+            // bound sits after the slice colon; the names stay whole in both.
+            ("SELECT ARRAY[$ns::idx]", "SELECT array ($ns::idx);"),
+            (
+                "SELECT ARRAY[1,2,3][1:$ns::hi]",
+                "SELECT array_slice (array (1, 2, 3), 1, $ns::hi);",
+            ),
+            ("SELECT a[1::::hi]", "SELECT array_slice (a, 1, :::hi);"),
+            // Every completed operand is subscriptable, no matter which
+            // token ends it: a literal, CASE ... END, a keyword used as a
+            // column name, or a bracket-quoted column.
+            (
+                "SELECT null[$lo::hi]",
+                "SELECT array_slice (NULL, $lo, :hi);",
+            ),
+            (
+                "SELECT CASE WHEN 1 THEN a END[$lo::hi]",
+                "SELECT array_slice (CASE WHEN 1 THEN a END, $lo, :hi);",
+            ),
+            (
+                "SELECT current_timestamp[$lo::hi]",
+                "SELECT array_slice (CURRENT_TIMESTAMP, $lo, :hi);",
+            ),
+            (
+                "SELECT DEFAULT[$lo::hi]",
+                "SELECT array_slice (DEFAULT, $lo, :hi);",
+            ),
+            (
+                "SELECT window[$lo::hi]",
+                "SELECT array_slice (\"window\", $lo, :hi);",
+            ),
+            ("SELECT [a][$lo::hi]", "SELECT array_slice ([a], $lo, :hi);"),
+            // Only the bare unqualified identifier `array` heads an
+            // ARRAY[...] literal; a qualified or bracket-quoted column
+            // named array is subscripted like any other column.
+            (
+                "SELECT t.array[$lo::hi]",
+                "SELECT array_slice (t.array, $lo, :hi);",
+            ),
+            (
+                "SELECT [array][$lo::hi]",
+                "SELECT array_slice ([array], $lo, :hi);",
+            ),
+            (
+                "SELECT 'array'[$lo::hi]",
+                "SELECT array_slice ('array', $lo, :hi);",
+            ),
+            // A bare array[...] target in UPDATE ... SET is the one bracket
+            // after `array` that subscripts a column, and it supports no
+            // slice, so its parameter names stay greedy.
+            (
+                "UPDATE t SET array[$x::y] = 1",
+                "UPDATE t SET array = array_set_element (array, $x::y, 1);",
+            ),
+            // The same holds for any UPDATE ... SET target column: its
+            // subscript takes a single index and no slice.
+            (
+                "UPDATE t SET col[$ns::idx] = 1",
+                "UPDATE t SET col = array_set_element (col, $ns::idx, 1);",
+            ),
+            // Inside CASE ... END within a subscript, a "::" cannot be the
+            // slice colon until the CASE closes, so names stay whole
+            // there; a colon after the END is the slice colon again.
+            (
+                "SELECT a[CASE WHEN 1 THEN $ns::idx ELSE 0 END]",
+                "SELECT array_element (a, CASE WHEN 1 THEN $ns::idx ELSE 0 END);",
+            ),
+            (
+                "SELECT a[CASE WHEN $ns::idx THEN 1 ELSE 0 END]",
+                "SELECT array_element (a, CASE WHEN $ns::idx THEN 1 ELSE 0 END);",
+            ),
+            (
+                "SELECT a[CASE WHEN 1 THEN 2 END:$lo::hi]",
+                "SELECT array_slice (a, CASE WHEN 1 THEN 2 END, $lo::hi);",
+            ),
+            // A column named `end` inside the CASE does not close it: only
+            // an END after a complete expression does. The name after ELSE
+            // stays whole because the CASE is still open there.
+            (
+                "SELECT a[CASE WHEN 1 THEN end ELSE $ns::idx END]",
+                "SELECT array_element (a, CASE WHEN 1 THEN \"end\" ELSE $ns::idx END);",
+            ),
+            // ... and the END that does follow an expression still closes
+            // the CASE, so the name after it splits into slice bounds again.
+            (
+                "SELECT a[CASE WHEN 1 THEN end END + $lo::hi]",
+                "SELECT array_slice (a, CASE WHEN 1 THEN \"end\" END + $lo, :hi);",
+            ),
+            // An explicit top-level slice colon later in the bracket is the
+            // separator, so a "::" inside a bound's name stays part of the
+            // name — spaced or not, and however far ahead the colon sits.
+            (
+                "SELECT a[$ns::lo : $hi]",
+                "SELECT array_slice (a, $ns::lo, $hi);",
+            ),
+            (
+                "SELECT a[$ns::lo:$hi]",
+                "SELECT array_slice (a, $ns::lo, $hi);",
+            ),
+            (
+                "SELECT a[$ns::lo + 1 : $hi]",
+                "SELECT array_slice (a, $ns::lo + 1, $hi);",
+            ),
+            (
+                "SELECT a[$a::b : $c::d]",
+                "SELECT array_slice (a, $a::b, $c::d);",
+            ),
+            // Without an explicit colon anywhere ahead, the first "::" is
+            // still the separator.
+            (
+                "SELECT a[$a::b + $c::d]",
+                "SELECT array_slice (a, $a, :b + $c::d);",
+            ),
+            // A colon inside a nested subscript separates that subscript's
+            // bounds, not the outer one's.
+            (
+                "SELECT a[b[$x::y] : $z]",
+                "SELECT array_slice (a, array_slice (b, $x, :y), $z);",
+            ),
+        ];
+        for (sql, expected) in cases {
+            let cmd = Parser::new(sql.as_bytes()).next().unwrap().unwrap();
+            assert_eq!(cmd.to_string(), expected, "input {sql:?}");
+        }
+    }
+
+    #[test]
+    fn test_quoted_name_bytes_stay_raw_when_relexing() {
+        // `[a[]` quotes the name "a[". The parser skips those bytes
+        // itself; standalone lexing, as expanded_sql does, must treat
+        // them as raw text too — were the inner "[" lexed as a bracket,
+        // its frame would stay open past the "]" and split the $ns::v
+        // that follows, which the parse kept whole.
+        let cmd = Parser::new(b"SELECT [a[] + $ns::v FROM t")
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(cmd.to_string(), "SELECT [a[] + $ns::v FROM t;");
+
+        use crate::token::TokenType::*;
+        let tokens: Vec<(crate::token::TokenType, &[u8])> =
+            crate::lexer::Lexer::new(b"SELECT [a[] + $ns::v FROM t")
+                .map(|t| t.unwrap())
+                .filter(|t| t.token_type != TK_NONE)
+                .map(|t| (t.token_type, t.value))
+                .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                (TK_SELECT, b"SELECT".as_slice()),
+                (TK_LBRACKET, b"["),
+                (TK_ID, b"a["),
+                (TK_RBRACKET, b"]"),
+                (TK_PLUS, b"+"),
+                (TK_VARIABLE, b"$ns::v"),
+                (TK_FROM, b"FROM"),
+                (TK_ID, b"t"),
+            ]
+        );
     }
 
     #[test]

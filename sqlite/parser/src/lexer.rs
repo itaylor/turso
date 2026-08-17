@@ -209,9 +209,127 @@ impl<'a> Token<'a> {
     }
 }
 
+/// What one open `[` means for the text inside it (see `Lexer::brackets`).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum BracketKind {
+    /// `a[...]`: subscripts the value before it, and so may contain a
+    /// top-level slice colon.
+    Subscript,
+    /// `ARRAY[...]`: an array literal. Its expressions are lexed normally
+    /// but no slice colon can appear at its top level.
+    ArrayLiteral,
+    /// `[name]`: a quoted identifier. Its bytes are a name, not tokens:
+    /// the parser skips them itself (see `Parser::parse_bracket_quoted_name`),
+    /// and standalone lexing emits them as one raw token, so name text
+    /// like `[` or `$x::y` cannot disturb the bracket state when the same
+    /// SQL is re-tokenized for expanded SQL.
+    QuotedName,
+}
+
+/// State for one open `[` (see `Lexer::brackets`).
+#[derive(Clone, Copy)]
+pub(crate) struct BracketFrame {
+    kind: BracketKind,
+    /// `(` groups currently open inside the bracket.
+    parens: u32,
+    /// `CASE ... END` constructs currently open inside the bracket.
+    cases: u32,
+    /// No slice colon can appear at the bracket's top level anymore:
+    /// either the slice colon was already emitted (what follows is the
+    /// upper bound), or the parser said this subscript takes a single
+    /// index and no slice (an UPDATE ... SET assignment target).
+    no_slice_colon_ahead: bool,
+    /// Whether an explicit top-level slice colon sits somewhere ahead in
+    /// this bracket. Filled by the lookahead in
+    /// `Lexer::explicit_separator_ahead` the first time a "::" inside a
+    /// parameter name forces the choice between splitting the name there
+    /// and keeping it whole; None until then.
+    explicit_colon_ahead: Option<bool>,
+}
+
 pub struct Lexer<'a> {
     pub(crate) offset: usize,
     pub(crate) input: &'a [u8],
+    /// One entry per open `[`. A parameter name stops at "::" only where
+    /// a slice colon could follow it: at the top level of a subscript,
+    /// before that subscript's slice colon. So `arr[$lo::hi]` keeps its
+    /// slice colon, while `arr[f($ns::var)]`, `ARRAY[$ns::idx]`,
+    /// `arr[CASE WHEN b THEN $ns::idx END]` and `arr[1:$ns::hi]` keep
+    /// their names whole. The state depends only on the token stream, so
+    /// re-lexing the same text (for example for expanded SQL) reproduces
+    /// the exact same tokens as parsing did.
+    brackets: Vec<BracketFrame>,
+    /// The last significant token can end an expression operand, so a `[`
+    /// next subscripts that operand. Any other `[` can only start a
+    /// quoted name (or an array literal, below): no grammar rule puts a
+    /// subscript there.
+    prev_can_end_operand: bool,
+    /// The last significant token was the plain identifier `array` with
+    /// no dot before it, so a `[` next starts an `ARRAY[...]` literal.
+    prev_is_bare_array: bool,
+    /// The last significant token was `.`. After a dot, `array` names a
+    /// column (`t.array[...]` subscripts it), never an array literal.
+    prev_was_dot: bool,
+    /// True only in the throwaway lexer `explicit_separator_ahead` scans
+    /// ahead with. The scan asks what the text means when parameter names
+    /// stay greedy, so name splitting is off wholesale — which also keeps
+    /// a scan from starting scans of its own.
+    scanning_ahead: bool,
+}
+
+/// The lexer state the parser saves and restores when it rewinds the
+/// input, and clears between statements (see `Parser::mark`,
+/// `Parser::try_parse` and `Parser::next_cmd`).
+#[derive(Clone)]
+pub(crate) struct LexerContext {
+    brackets: Vec<BracketFrame>,
+    prev_can_end_operand: bool,
+    prev_is_bare_array: bool,
+    prev_was_dot: bool,
+}
+
+/// True for tokens that can end an expression operand, so that a `[`
+/// directly after them subscripts the operand: literals, closing
+/// delimiters, NULL, the postfix NULL tests, DEFAULT (an operand of its
+/// own, `Expr::Default`), and every keyword the parser can read as an
+/// identifier — the explicit rewrites in the parser's `next_token`
+/// (`get_token`) plus `TokenType::fallback_id_if_ok`, which also covers
+/// CASE's END and CURRENT_TIMESTAMP. Keep this in step with the parser:
+/// a token it can end an operand with but that is missing here would
+/// make a following `[` lex its contents as a raw quoted name. The
+/// reverse mismatch is harmless: a quoted name directly after one of
+/// these tokens (`DEFAULT [a]` in a column definition) still parses,
+/// because the parser skips a quoted name's bytes itself without ever
+/// lexing inside the misclassified bracket.
+fn can_end_operand(token_type: TokenType) -> bool {
+    use TokenType::*;
+    matches!(
+        token_type,
+        TK_ID
+            | TK_STRING
+            | TK_BLOB
+            | TK_INTEGER
+            | TK_FLOAT
+            | TK_VARIABLE
+            | TK_RP
+            | TK_RBRACKET
+            | TK_NULL
+            | TK_ISNULL
+            | TK_NOTNULL
+            | TK_DEFAULT
+            | TK_INDEXED
+            | TK_JOIN_KW
+            | TK_UNION
+            | TK_EXCEPT
+            | TK_INTERSECT
+            | TK_GENERATED
+            | TK_WITHOUT
+            | TK_COLUMNKW
+            | TK_WINDOW
+            | TK_FILTER
+            | TK_OVER
+            | TK_WITHIN
+    ) || matches!(token_type.fallback_id_if_ok(), TK_ID)
 }
 
 impl<'a> Iterator for Lexer<'a> {
@@ -219,6 +337,42 @@ impl<'a> Iterator for Lexer<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
+        let item = self.next_token();
+        if let Some(Ok(token)) = &item {
+            self.update_bracket_context(token);
+        }
+        item
+    }
+}
+
+impl<'a> Lexer<'a> {
+    #[inline]
+    fn next_token(&mut self) -> Option<Result<Token<'a>>> {
+        // Inside a quoted name, everything up to the closing `]` is raw
+        // name bytes: emit them as a single token instead of tokenizing
+        // them. The parser never lexes here (it skips the name itself);
+        // this keeps standalone re-lexing, as done for expanded SQL, in
+        // step with the parser when the name holds text like `[` or `$x`.
+        if self
+            .brackets
+            .last()
+            .is_some_and(|frame| frame.kind == BracketKind::QuotedName)
+        {
+            match self.peek() {
+                None => return None,
+                Some(b']') => {}
+                Some(_) => {
+                    let start = self.offset;
+                    while !matches!(self.peek(), None | Some(b']')) {
+                        self.eat();
+                    }
+                    return Some(Ok(Token::new(
+                        &self.input[start..self.offset],
+                        TokenType::TK_ID,
+                    )));
+                }
+            }
+        }
         match self.peek() {
             None => None, // End of file
             Some(b) if b.is_ascii_whitespace() => Some(Ok(self.eat_white_space())),
@@ -264,10 +418,25 @@ impl<'a> Iterator for Lexer<'a> {
                     )))
                 }
                 b':' => {
-                    // `:name` is a named parameter, but `:` followed by a digit
-                    // or non-identifier char is a standalone colon (used in slice syntax).
-                    match self.input.get(self.offset + 1) {
-                        Some(&b) if is_identifier_start(b) => Some(self.mark(|l| l.eat_var())),
+                    // `:name` is a named parameter, and so is `:::name` — the
+                    // name may start with "::" sequences, as in SQLite. A `:`
+                    // followed by anything else is a standalone colon (used in
+                    // slice syntax); in particular `::` stays two colons so a
+                    // slice like `arr[:lo::hi]` keeps its meaning.
+                    if self.splits_param_names()
+                        && self.input.get(self.offset + 1..self.offset + 4) == Some(b":::")
+                    {
+                        // In `a[1::::hi]`, the first colon is the slice
+                        // separator and the remaining `:::hi` is the upper
+                        // bound's global parameter.
+                        return Some(Ok(self.eat_one_token(TokenType::TK_COLON)));
+                    }
+                    match (
+                        self.input.get(self.offset + 1),
+                        self.input.get(self.offset + 2),
+                    ) {
+                        (Some(&b), _) if is_identifier_start(b) => Some(self.mark(|l| l.eat_var())),
+                        (Some(&b':'), Some(&b':')) => Some(self.mark(|l| l.eat_var())),
                         _ => Some(Ok(self.eat_one_token(TokenType::TK_COLON))),
                     }
                 }
@@ -284,12 +453,213 @@ const fn cold() {}
 impl<'a> Lexer<'a> {
     #[inline(always)]
     pub const fn new(input: &'a [u8]) -> Self {
-        Lexer { input, offset: 0 }
+        Lexer {
+            input,
+            offset: 0,
+            brackets: Vec::new(),
+            prev_can_end_operand: false,
+            prev_is_bare_array: false,
+            prev_was_dot: false,
+            scanning_ahead: false,
+        }
     }
 
     #[inline(always)]
     pub fn remaining(&self) -> &'a [u8] {
         self.input.get(self.offset..).unwrap_or(&[])
+    }
+
+    /// The parser calls this when it skips a `]` by advancing `offset`
+    /// directly (bracket-quoted identifiers are scanned as raw bytes), so
+    /// `brackets` stays balanced with the input. The skipped bytes and
+    /// the `]` complete a quoted name, which is an operand — `[a][1:2]`
+    /// slices the column a — so the lookbehind is set as if a `]` token
+    /// had been lexed, which is also the state re-lexing the same text
+    /// reaches after the name and its TK_RBRACKET.
+    pub(crate) fn close_bracket(&mut self) {
+        self.brackets.pop();
+        self.prev_can_end_operand = true;
+        self.prev_is_bare_array = false;
+        self.prev_was_dot = false;
+    }
+
+    /// The parser calls this right after eating the `[` that opens an
+    /// UPDATE `SET col[index] = ...` assignment target. That subscript
+    /// holds a single index expression and never a slice, so no slice
+    /// colon can follow a parameter name inside it and the name keeps
+    /// its "::" (see `splits_param_names`).
+    pub(crate) fn subscript_takes_no_slice(&mut self) {
+        if let Some(frame) = self.brackets.last_mut() {
+            frame.no_slice_colon_ahead = true;
+        }
+    }
+
+    /// Snapshot the state that `update_bracket_context` maintains, so the
+    /// parser can rewind the input and lex the same text again.
+    pub(crate) fn save_context(&self) -> LexerContext {
+        LexerContext {
+            brackets: self.brackets.clone(),
+            prev_can_end_operand: self.prev_can_end_operand,
+            prev_is_bare_array: self.prev_is_bare_array,
+            prev_was_dot: self.prev_was_dot,
+        }
+    }
+
+    /// Restore a snapshot taken by `save_context`.
+    pub(crate) fn restore_context(&mut self, saved: LexerContext) {
+        self.brackets = saved.brackets;
+        self.prev_can_end_operand = saved.prev_can_end_operand;
+        self.prev_is_bare_array = saved.prev_is_bare_array;
+        self.prev_was_dot = saved.prev_was_dot;
+    }
+
+    /// Reset the state that `update_bracket_context` maintains to what a
+    /// fresh lexer starts with.
+    pub(crate) fn clear_context(&mut self) {
+        self.brackets.clear();
+        self.prev_can_end_operand = false;
+        self.prev_is_bare_array = false;
+        self.prev_was_dot = false;
+    }
+
+    /// Keep `brackets` and the operand/`array` lookbehind in step with the
+    /// token stream; called for every token `next` produces.
+    fn update_bracket_context(&mut self, token: &Token<'a>) {
+        match token.token_type {
+            // Whitespace and comments separate nothing.
+            TokenType::TK_NONE => return,
+            TokenType::TK_LBRACKET => {
+                let kind = if self.prev_is_bare_array {
+                    BracketKind::ArrayLiteral
+                } else if self.prev_can_end_operand {
+                    BracketKind::Subscript
+                } else {
+                    BracketKind::QuotedName
+                };
+                self.brackets.push(BracketFrame {
+                    kind,
+                    parens: 0,
+                    cases: 0,
+                    no_slice_colon_ahead: false,
+                    explicit_colon_ahead: None,
+                });
+            }
+            TokenType::TK_RBRACKET => {
+                self.brackets.pop();
+            }
+            TokenType::TK_LP => {
+                if let Some(frame) = self.brackets.last_mut() {
+                    frame.parens += 1;
+                }
+            }
+            TokenType::TK_RP => {
+                if let Some(frame) = self.brackets.last_mut() {
+                    frame.parens = frame.parens.saturating_sub(1);
+                }
+            }
+            TokenType::TK_CASE => {
+                if let Some(frame) = self.brackets.last_mut() {
+                    frame.cases += 1;
+                }
+            }
+            TokenType::TK_END => {
+                // END closes a CASE only after a complete branch expression.
+                // In operand position — after THEN, ELSE, an operator — the
+                // token is a column named `end` (TK_END can fall back to an
+                // identifier), and the CASE stays open.
+                if self.prev_can_end_operand {
+                    if let Some(frame) = self.brackets.last_mut() {
+                        frame.cases = frame.cases.saturating_sub(1);
+                    }
+                }
+            }
+            TokenType::TK_COLON => {
+                if let Some(frame) = self.brackets.last_mut() {
+                    if frame.kind == BracketKind::Subscript && frame.parens == 0 && frame.cases == 0
+                    {
+                        frame.no_slice_colon_ahead = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.prev_can_end_operand = can_end_operand(token.token_type);
+        // The parser reads a `[` after the plain identifier `array` as an
+        // ARRAY[...] literal and every other `[` after an operand as a
+        // subscript; this raw-byte comparison is the same one the parser
+        // makes. After a dot, `array` names a column (`t.array[1:2]` is a
+        // slice). Quoted spellings ('array', `array`) keep their quotes in
+        // the token value and never match, and a bracket-quoted [array]
+        // never sits directly before a `[` because its own `]` comes
+        // between.
+        self.prev_is_bare_array = token.token_type == TokenType::TK_ID
+            && !self.prev_was_dot
+            && token.value.eq_ignore_ascii_case(b"array");
+        self.prev_was_dot = token.token_type == TokenType::TK_DOT;
+    }
+
+    /// True where a parameter name must stop at "::" because a slice colon
+    /// can follow it: at the top level of a subscript — outside any
+    /// parentheses or CASE ... END opened inside it — before that
+    /// subscript's slice colon.
+    fn splits_param_names(&self) -> bool {
+        !self.scanning_ahead
+            && self.brackets.last().is_some_and(|frame| {
+                frame.kind == BracketKind::Subscript
+                    && frame.parens == 0
+                    && frame.cases == 0
+                    && !frame.no_slice_colon_ahead
+            })
+    }
+
+    /// True when an explicit top-level slice colon sits ahead in the
+    /// current subscript. This decides what a "::" inside a parameter
+    /// name means: in `a[$lo::hi]` nothing else can separate the slice
+    /// bounds, so the name splits there; in `a[$ns::lo : $hi]` the
+    /// explicit colon is the separator, so the name keeps its "::" and
+    /// stays whole. The scan lexes the rest of the bracket from the
+    /// name's start with splitting off and looks for a colon token at
+    /// this bracket's top level, outside parentheses and CASE ... END.
+    /// The answer is cached in the bracket's frame: it cannot change
+    /// while the top level still sits before its slice colon, and after
+    /// the colon no name asks (`splits_param_names` is already false).
+    fn explicit_separator_ahead(&mut self, name_start: usize) -> bool {
+        let Some(frame) = self.brackets.last() else {
+            return false;
+        };
+        if let Some(found) = frame.explicit_colon_ahead {
+            return found;
+        }
+        let depth = self.brackets.len();
+        let mut scratch = Lexer::new(self.input);
+        scratch.offset = name_start;
+        scratch.brackets.clone_from(&self.brackets);
+        scratch.scanning_ahead = true;
+        let mut found = false;
+        while let Some(token) = scratch.next() {
+            let Ok(token) = token else {
+                // The bracket's text does not even lex; split as if the
+                // scan had found nothing and let parsing surface the
+                // error.
+                break;
+            };
+            if scratch.brackets.len() < depth {
+                // The subscript closed without a top-level colon.
+                break;
+            }
+            if token.token_type == TokenType::TK_COLON && scratch.brackets.len() == depth {
+                let frame = scratch.brackets.last().expect("length checked above");
+                if frame.parens == 0 && frame.cases == 0 {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        self.brackets
+            .last_mut()
+            .expect("checked non-empty above")
+            .explicit_colon_ahead = Some(found);
+        found
     }
 
     #[inline]
@@ -845,11 +1215,80 @@ impl<'a> Lexer<'a> {
                 ))
             }
             _ => {
-                let start_id = self.offset;
-                self.eat_while(is_identifier_continue);
+                // Match SQLite's tokenizer: a named parameter is identifier
+                // characters, plus two extras used by the TCL binding —
+                // "::" sequences for namespace-qualified names ($::var,
+                // $a::b) and one trailing "(...)" suffix for array elements
+                // ($var(elem)). The suffix may not contain whitespace and
+                // must be closed. At least one identifier character is
+                // required overall.
+                //
+                // Exception: where a slice colon could follow the name (see
+                // `splits_param_names`), a "::" after the name has begun
+                // ends the token instead of continuing it, so a slice with
+                // unspaced parameter bounds like `arr[$lo::hi]` still lexes
+                // as `$lo`, `:`, `:hi` — unless an explicit top-level slice
+                // colon sits ahead in the bracket (see
+                // `explicit_separator_ahead`), as in `a[$ns::lo : $hi]`:
+                // there that colon is the separator and the name stays
+                // whole. Everywhere else — in parentheses within the
+                // brackets, in ARRAY[...] literals, after the slice colon —
+                // the name stays greedy, and a leading "::" is consumed
+                // everywhere (`:::global`). SQLite has no subscript syntax
+                // — its `[` starts a quoted identifier — so the non-greedy
+                // context costs no compatibility.
+                let mut n_id = 0usize;
+                loop {
+                    match self.peek() {
+                        Some(b) if is_identifier_continue(b) => {
+                            n_id += 1;
+                            self.eat();
+                        }
+                        Some(b'(') if n_id > 0 => {
+                            self.eat();
+                            loop {
+                                match self.peek() {
+                                    Some(b')') => {
+                                        self.eat();
+                                        break;
+                                    }
+                                    Some(b) if !b.is_ascii_whitespace() => {
+                                        self.eat();
+                                    }
+                                    _ => {
+                                        // unclosed suffix, or whitespace
+                                        // inside it
+                                        let token_text = String::from_utf8_lossy(
+                                            &self.input[start..self.offset],
+                                        )
+                                        .to_string();
+                                        return Err(Error::BadVariableName {
+                                            span: (start, self.offset - start).into(),
+                                            token_text,
+                                            offset: start,
+                                        });
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                        Some(b':') if self.input.get(self.offset + 1) == Some(&b':') => {
+                            if n_id > 0
+                                && self.splits_param_names()
+                                && !self.explicit_separator_ahead(start)
+                            {
+                                // The "::" is the slice separator followed
+                                // by the upper bound; the name ends here.
+                                break;
+                            }
+                            self.eat();
+                            self.eat();
+                        }
+                        _ => break,
+                    }
+                }
 
-                // empty variable name
-                if start_id == self.offset {
+                if n_id == 0 {
                     let token_text =
                         String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
                     return Err(Error::BadVariableName {
@@ -1064,6 +1503,38 @@ mod tests {
                 Token::new(b":named_param", TokenType::TK_VARIABLE),
             ),
             (
+                b"$::global_var".as_slice(),
+                Token::new(b"$::global_var", TokenType::TK_VARIABLE),
+            ),
+            (
+                b"$ns::var".as_slice(),
+                Token::new(b"$ns::var", TokenType::TK_VARIABLE),
+            ),
+            (
+                b"@a::b::c".as_slice(),
+                Token::new(b"@a::b::c", TokenType::TK_VARIABLE),
+            ),
+            (
+                b":a::b::c".as_slice(),
+                Token::new(b":a::b::c", TokenType::TK_VARIABLE),
+            ),
+            (
+                b"@::global_var".as_slice(),
+                Token::new(b"@::global_var", TokenType::TK_VARIABLE),
+            ),
+            (
+                b":::global_var".as_slice(),
+                Token::new(b":::global_var", TokenType::TK_VARIABLE),
+            ),
+            (
+                b"$arr(elem)".as_slice(),
+                Token::new(b"$arr(elem)", TokenType::TK_VARIABLE),
+            ),
+            (
+                b"$arr(12x)".as_slice(),
+                Token::new(b"$arr(12x)", TokenType::TK_VARIABLE),
+            ),
+            (
                 b"x'1234567890abcdef'".as_slice(),
                 Token::new(b"x'1234567890abcdef'", TokenType::TK_BLOB),
             ),
@@ -1100,6 +1571,194 @@ mod tests {
             println!("Input: {input:?}, Expected: {expect_value:?}, Got: {got_value:?}");
             assert_eq!(got_value, expect_value);
             assert_eq!(token.token_type, expected.token_type);
+        }
+    }
+
+    #[test]
+    fn test_lexer_variables_inside_subscript() {
+        // In a subscript's lower bound — the only place a slice colon can
+        // follow — a "::" after a parameter name has begun ends the
+        // parameter, so unspaced slice bounds keep their slice colon.
+        // Everywhere else (parentheses inside the brackets, ARRAY[...]
+        // literals, after the slice colon) the name is greedy, and a
+        // leading "::" always belongs to the name.
+        let cases: Vec<(&[u8], Vec<Token>)> = vec![
+            (
+                b"a[$lo::hi]".as_slice(),
+                vec![
+                    Token::new(b"a", TokenType::TK_ID),
+                    Token::new(b"[", TokenType::TK_LBRACKET),
+                    Token::new(b"$lo", TokenType::TK_VARIABLE),
+                    Token::new(b":", TokenType::TK_COLON),
+                    Token::new(b":hi", TokenType::TK_VARIABLE),
+                    Token::new(b"]", TokenType::TK_RBRACKET),
+                ],
+            ),
+            (
+                b"a[:lo::hi]".as_slice(),
+                vec![
+                    Token::new(b"a", TokenType::TK_ID),
+                    Token::new(b"[", TokenType::TK_LBRACKET),
+                    Token::new(b":lo", TokenType::TK_VARIABLE),
+                    Token::new(b":", TokenType::TK_COLON),
+                    Token::new(b":hi", TokenType::TK_VARIABLE),
+                    Token::new(b"]", TokenType::TK_RBRACKET),
+                ],
+            ),
+            (
+                b"a[@lo::hi]".as_slice(),
+                vec![
+                    Token::new(b"a", TokenType::TK_ID),
+                    Token::new(b"[", TokenType::TK_LBRACKET),
+                    Token::new(b"@lo", TokenType::TK_VARIABLE),
+                    Token::new(b":", TokenType::TK_COLON),
+                    Token::new(b":hi", TokenType::TK_VARIABLE),
+                    Token::new(b"]", TokenType::TK_RBRACKET),
+                ],
+            ),
+            // Parentheses inside the brackets suspend the splitting.
+            (
+                b"a[f($ns::var,0)]".as_slice(),
+                vec![
+                    Token::new(b"a", TokenType::TK_ID),
+                    Token::new(b"[", TokenType::TK_LBRACKET),
+                    Token::new(b"f", TokenType::TK_ID),
+                    Token::new(b"(", TokenType::TK_LP),
+                    Token::new(b"$ns::var", TokenType::TK_VARIABLE),
+                    Token::new(b",", TokenType::TK_COMMA),
+                    Token::new(b"0", TokenType::TK_INTEGER),
+                    Token::new(b")", TokenType::TK_RP),
+                    Token::new(b"]", TokenType::TK_RBRACKET),
+                ],
+            ),
+            // A nested subscript inside those parentheses splits again, and
+            // closing it restores the paren context.
+            (
+                b"a[f(b[$x::y],$p::q)]".as_slice(),
+                vec![
+                    Token::new(b"a", TokenType::TK_ID),
+                    Token::new(b"[", TokenType::TK_LBRACKET),
+                    Token::new(b"f", TokenType::TK_ID),
+                    Token::new(b"(", TokenType::TK_LP),
+                    Token::new(b"b", TokenType::TK_ID),
+                    Token::new(b"[", TokenType::TK_LBRACKET),
+                    Token::new(b"$x", TokenType::TK_VARIABLE),
+                    Token::new(b":", TokenType::TK_COLON),
+                    Token::new(b":y", TokenType::TK_VARIABLE),
+                    Token::new(b"]", TokenType::TK_RBRACKET),
+                    Token::new(b",", TokenType::TK_COMMA),
+                    Token::new(b"$p::q", TokenType::TK_VARIABLE),
+                    Token::new(b")", TokenType::TK_RP),
+                    Token::new(b"]", TokenType::TK_RBRACKET),
+                ],
+            ),
+            // An ARRAY[...] literal is not a subscript: no slice colon can
+            // occur, so the name stays whole.
+            (
+                b"ARRAY[$ns::idx]".as_slice(),
+                vec![
+                    Token::new(b"ARRAY", TokenType::TK_ID),
+                    Token::new(b"[", TokenType::TK_LBRACKET),
+                    Token::new(b"$ns::idx", TokenType::TK_VARIABLE),
+                    Token::new(b"]", TokenType::TK_RBRACKET),
+                ],
+            ),
+            // After the slice colon, the upper bound cannot hold another
+            // slice colon, so the name stays whole there too.
+            (
+                b"a[1:$ns::hi]".as_slice(),
+                vec![
+                    Token::new(b"a", TokenType::TK_ID),
+                    Token::new(b"[", TokenType::TK_LBRACKET),
+                    Token::new(b"1", TokenType::TK_INTEGER),
+                    Token::new(b":", TokenType::TK_COLON),
+                    Token::new(b"$ns::hi", TokenType::TK_VARIABLE),
+                    Token::new(b"]", TokenType::TK_RBRACKET),
+                ],
+            ),
+            (
+                b"a[1::::hi]".as_slice(),
+                vec![
+                    Token::new(b"a", TokenType::TK_ID),
+                    Token::new(b"[", TokenType::TK_LBRACKET),
+                    Token::new(b"1", TokenType::TK_INTEGER),
+                    Token::new(b":", TokenType::TK_COLON),
+                    Token::new(b":::hi", TokenType::TK_VARIABLE),
+                    Token::new(b"]", TokenType::TK_RBRACKET),
+                ],
+            ),
+            // A subscript right after an ARRAY literal splits again.
+            (
+                b"ARRAY[1][$lo::hi]".as_slice(),
+                vec![
+                    Token::new(b"ARRAY", TokenType::TK_ID),
+                    Token::new(b"[", TokenType::TK_LBRACKET),
+                    Token::new(b"1", TokenType::TK_INTEGER),
+                    Token::new(b"]", TokenType::TK_RBRACKET),
+                    Token::new(b"[", TokenType::TK_LBRACKET),
+                    Token::new(b"$lo", TokenType::TK_VARIABLE),
+                    Token::new(b":", TokenType::TK_COLON),
+                    Token::new(b":hi", TokenType::TK_VARIABLE),
+                    Token::new(b"]", TokenType::TK_RBRACKET),
+                ],
+            ),
+            // Leading "::" belongs to the name even in a lower bound.
+            (
+                b"a[$::g]".as_slice(),
+                vec![
+                    Token::new(b"a", TokenType::TK_ID),
+                    Token::new(b"[", TokenType::TK_LBRACKET),
+                    Token::new(b"$::g", TokenType::TK_VARIABLE),
+                    Token::new(b"]", TokenType::TK_RBRACKET),
+                ],
+            ),
+            // After the bracket closes, names are greedy again.
+            (
+                b"a[$lo::hi]+$ns::var".as_slice(),
+                vec![
+                    Token::new(b"a", TokenType::TK_ID),
+                    Token::new(b"[", TokenType::TK_LBRACKET),
+                    Token::new(b"$lo", TokenType::TK_VARIABLE),
+                    Token::new(b":", TokenType::TK_COLON),
+                    Token::new(b":hi", TokenType::TK_VARIABLE),
+                    Token::new(b"]", TokenType::TK_RBRACKET),
+                    Token::new(b"+", TokenType::TK_PLUS),
+                    Token::new(b"$ns::var", TokenType::TK_VARIABLE),
+                ],
+            ),
+        ];
+        for (input, expected) in cases {
+            let tokens: Vec<_> = Lexer::new(input).map(|t| t.unwrap()).collect();
+            assert_eq!(
+                tokens,
+                expected,
+                "input {:?}",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    #[test]
+    fn test_lexer_bad_variable_names() {
+        // A parameter needs at least one identifier character, and a "(...)"
+        // suffix must be closed with no whitespace inside — same rules as
+        // SQLite's tokenizer.
+        let bad_inputs: Vec<&[u8]> = vec![
+            b"$",
+            b"$(",
+            b"$(elem)",
+            b"$a(unclosed",
+            b"$a(x y)",
+            b"::::a",
+        ];
+        for input in bad_inputs {
+            let mut lexer = Lexer::new(input);
+            let result = lexer.next().unwrap();
+            assert!(
+                matches!(result, Err(Error::BadVariableName { .. })),
+                "expected BadVariableName for {:?}, got {result:?}",
+                String::from_utf8_lossy(input)
+            );
         }
     }
 
@@ -1317,6 +1976,15 @@ mod tests {
                     Token::new(b"u", TokenType::TK_ID),
                     Token::new(b".", TokenType::TK_DOT),
                     Token::new(b"email", TokenType::TK_ID),
+                ],
+            ),
+            // A bare "::" stays two colons; only ":::name" is a variable.
+            (
+                b"a::b".as_slice(),
+                vec![
+                    Token::new(b"a", TokenType::TK_ID),
+                    Token::new(b":", TokenType::TK_COLON),
+                    Token::new(b":b", TokenType::TK_VARIABLE),
                 ],
             ),
         ];
