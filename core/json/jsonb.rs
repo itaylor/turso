@@ -2655,7 +2655,8 @@ impl Jsonb {
                                 count += 1;
                             }
 
-                            if mode.allows_insert() && arr_pos == end_pos {
+                            if mode.allows_insert() && arr_pos == end_pos && count == *idx as usize
+                            {
                                 let placeholder =
                                     JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
                                 let placeholder_bytes = placeholder.as_bytes();
@@ -2695,6 +2696,9 @@ impl Jsonb {
 
                             let real_idx = element_idx + idx;
 
+                            if !mode.allows_replace() {
+                                bail_parse_error!("Not found!");
+                            }
                             if let Some(index) = idx_map.get(&real_idx) {
                                 return Ok(JsonTraversalResult::with_array_index(
                                     pos,
@@ -2888,6 +2892,9 @@ impl Jsonb {
 
                             let real_idx = element_idx + idx;
 
+                            if !mode.allows_replace() {
+                                bail_parse_error!("Not found!");
+                            }
                             if let Some(index) = idx_map.get(&real_idx) {
                                 return Ok(JsonTraversalResult::with_array_index(
                                     pos,
@@ -3001,7 +3008,7 @@ impl Jsonb {
                     ));
                 }
 
-                if current_pos != end_pos && mode.allows_replace() {
+                if current_pos != end_pos {
                     let key_idx = current_pos;
 
                     current_pos = self.skip_element(current_pos)?;
@@ -3034,17 +3041,23 @@ impl Jsonb {
 
                                 self.data
                                     .splice(arr_pos..arr_pos, placeholder_bytes.iter().copied());
-                                self.write_element_header(
+                                // Growing the payload can also grow the array
+                                // header itself (at a size-format boundary such
+                                // as 11 bytes), which shifts the contents right;
+                                // the placeholder position and the parent delta
+                                // must include that shift.
+                                let new_header_size = self.write_element_header(
                                     value_idx,
                                     ElementType::ARRAY,
                                     value_size + placeholder_bytes.len(),
                                     true,
                                 )?;
+                                let header_growth = new_header_size - value_header_size;
                                 return Ok(JsonTraversalResult::with_array_index(
                                     value_idx,
                                     JsonLocationKind::ObjectProperty(key_idx),
-                                    placeholder_bytes.len() as isize,
-                                    arr_pos,
+                                    (placeholder_bytes.len() + header_growth) as isize,
+                                    arr_pos + header_growth,
                                 ));
                             }
 
@@ -3072,6 +3085,9 @@ impl Jsonb {
 
                             let real_idx = element_idx + idx;
 
+                            if !mode.allows_replace() {
+                                bail_parse_error!("Not found!");
+                            }
                             if let Some(index) = idx_map.get(&real_idx) {
                                 return Ok(JsonTraversalResult::with_array_index(
                                     value_idx,
@@ -3094,14 +3110,28 @@ impl Jsonb {
                                 let placeholder_bytes = placeholder.as_bytes();
                                 let insertion_point = value_idx + value_size + value_header_size;
 
-                                self.data.insert(insertion_point, placeholder_bytes[0]);
-                                let insertion_point = value_idx + value_size + value_header_size;
+                                self.data.splice(
+                                    insertion_point..insertion_point,
+                                    placeholder_bytes.iter().copied(),
+                                );
+                                // Growing the payload can also grow the array
+                                // header itself (at a size-format boundary such
+                                // as 11 bytes), which shifts the contents right;
+                                // the placeholder position and the parent delta
+                                // must include that shift.
+                                let new_header_size = self.write_element_header(
+                                    value_idx,
+                                    ElementType::ARRAY,
+                                    value_size + placeholder_bytes.len(),
+                                    true,
+                                )?;
+                                let header_growth = new_header_size - value_header_size;
 
                                 return Ok(JsonTraversalResult::with_array_index(
                                     value_idx,
                                     JsonLocationKind::ObjectProperty(key_idx),
-                                    placeholder_bytes.len() as isize,
-                                    insertion_point,
+                                    (placeholder_bytes.len() + header_growth) as isize,
+                                    insertion_point + header_growth,
                                 ));
                             } else {
                                 bail_parse_error!("Cant insert")
