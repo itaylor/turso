@@ -198,9 +198,44 @@ Supported common connection string keywords include:
 | `Sync Interval` | Reserved for embedded replicas. Automatic sync is not enabled yet. |
 | `Tls` | Optional override for `libsql://` development URLs. Conflicting values with explicit `http://` or `https://` schemes fail early. |
 
+## User-defined functions
+
+`Turso.Data.Sqlite.SqliteConnection` supports scalar, aggregate, and window user-defined functions:
+
+```C#
+using var connection = new SqliteConnection("Data Source=:memory:");
+connection.Open();
+
+// Scalar
+connection.CreateFunction("double_it", (long x) => x * 2);
+
+// Aggregate
+connection.CreateAggregate("my_sum", 0L, (long accumulator, long x) => accumulator + x);
+
+// Window: xStep/xInverse fold or unfold a row into the accumulator, xValue reads the
+// running result without consuming it (used for OVER (... ROWS ...) frames), and the
+// last delegate produces the final answer when the function is used as a plain aggregate.
+connection.CreateWindowFunction<long, long>(
+    "running_sum",
+    seed: 0L,
+    step: (accumulator, x) => accumulator + x,
+    inverse: (accumulator, x) => accumulator - x,
+    value: accumulator => accumulator,
+    result: accumulator => accumulator);
+
+connection.ExecuteNonQuery("CREATE TABLE t(x INTEGER);");
+connection.ExecuteNonQuery("INSERT INTO t VALUES (1), (2), (3);");
+using var reader = connection.ExecuteReader(
+    "SELECT running_sum(x) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;");
+```
+
+Pass `isDeterministic: true` to any `CreateFunction`/`CreateAggregate`/`CreateWindowFunction` overload to mark
+the function as deterministic (SQLite's `SQLITE_DETERMINISTIC`), and pass `null` for the function delegate to
+remove a previously registered function.
+
 ## SQLite-compatible facade coverage
 
-- `Turso.Data.Sqlite` is the migration-oriented facade. It includes SQLite-style connection strings, commands, readers, schema metadata, transactions and savepoints, backup, SQL-backed blob streams, scalar and aggregate UDFs, custom collations, and disabled-by-default extension loading.
+- `Turso.Data.Sqlite` is the migration-oriented facade. It includes SQLite-style connection strings, commands, readers, schema metadata, transactions and savepoints, backup, SQL-backed blob streams, scalar, aggregate and window UDFs, custom collations, and disabled-by-default extension loading.
 - Raw SQLitePCL `sqlite3*` handle interop is intentionally unsupported. `SqliteConnection.Handle` returns `null` rather than exposing a fake SQLite handle.
 - `PRAGMA read_uncommitted` is tracked as connection-local state for API compatibility, but Turso does not currently implement SQLite shared-cache dirty reads.
 - `SqliteBlob` preserves fixed-length blob stream behavior through SQL reads and writes. It is not yet backed by a native incremental-blob storage handle.

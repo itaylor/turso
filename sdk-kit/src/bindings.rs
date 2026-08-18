@@ -229,6 +229,64 @@ pub type turso_aggregate_step_function_t = ::std::option::Option<
 pub type turso_aggregate_final_function_t = ::std::option::Option<
     unsafe extern "C" fn(context: usize, aggregate_context: *mut turso_agg_ctx_t) -> turso_value_t,
 >;
+#[doc = " Window aggregate value callback (xValue). Reads the running total without destroying the accumulator."]
+pub type turso_aggregate_value_function_t = ::std::option::Option<
+    unsafe extern "C" fn(context: usize, aggregate_context: *mut turso_agg_ctx_t) -> turso_value_t,
+>;
+#[doc = " Window aggregate inverse callback (xInverse). Undoes an earlier step for a row that left the window frame. argv points to argc immutable turso_value_t entries valid only for the call; a non-error return is discarded."]
+pub type turso_aggregate_inverse_function_t = ::std::option::Option<
+    unsafe extern "C" fn(
+        context: usize,
+        aggregate_context: *mut turso_agg_ctx_t,
+        argc: i32,
+        argv: *const turso_value_t,
+    ) -> turso_value_t,
+>;
+#[doc = " Scalar callback that writes its result through an out-parameter, for FFIs that cannot return a struct by value. *result arrives pre-set to NULL; ownership follows turso_scalar_function_t."]
+pub type turso_scalar_function_ptr_t = ::std::option::Option<
+    unsafe extern "C" fn(
+        context: usize,
+        argc: i32,
+        argv: *const turso_value_t,
+        result: *mut turso_value_t,
+    ),
+>;
+#[doc = " Aggregate step callback with an out-parameter result. Leave *result at the NULL it arrives as to keep stepping, or set an Error value to fail the statement."]
+pub type turso_aggregate_step_function_ptr_t = ::std::option::Option<
+    unsafe extern "C" fn(
+        context: usize,
+        aggregate_context: *mut turso_agg_ctx_t,
+        argc: i32,
+        argv: *const turso_value_t,
+        result: *mut turso_value_t,
+    ),
+>;
+#[doc = " Aggregate final callback with an out-parameter result. Ownership follows turso_scalar_function_ptr_t."]
+pub type turso_aggregate_final_function_ptr_t = ::std::option::Option<
+    unsafe extern "C" fn(
+        context: usize,
+        aggregate_context: *mut turso_agg_ctx_t,
+        result: *mut turso_value_t,
+    ),
+>;
+#[doc = " Window aggregate value callback (xValue) with an out-parameter result. Ownership follows turso_scalar_function_ptr_t."]
+pub type turso_aggregate_value_function_ptr_t = ::std::option::Option<
+    unsafe extern "C" fn(
+        context: usize,
+        aggregate_context: *mut turso_agg_ctx_t,
+        result: *mut turso_value_t,
+    ),
+>;
+#[doc = " Window aggregate inverse callback (xInverse) with an out-parameter result. Set *result to an Error value to fail the statement."]
+pub type turso_aggregate_inverse_function_ptr_t = ::std::option::Option<
+    unsafe extern "C" fn(
+        context: usize,
+        aggregate_context: *mut turso_agg_ctx_t,
+        argc: i32,
+        argv: *const turso_value_t,
+        result: *mut turso_value_t,
+    ),
+>;
 #[doc = " Collation callback. Byte ranges are UTF-8 text valid only for the call. Return follows strcmp ordering."]
 pub type turso_collation_function_t = ::std::option::Option<
     unsafe extern "C" fn(
@@ -452,11 +510,12 @@ unsafe extern "C" {
     ) -> turso_status_code_t;
 }
 unsafe extern "C" {
-    #[doc = " Register or replace a per-connection managed aggregate function."]
+    #[doc = " Register or replace a per-connection managed aggregate function. flags uses SQLite bit values (e.g. 0x800 for DETERMINISTIC)."]
     pub fn turso_connection_register_aggregate_function(
         self_: *const turso_connection_t,
         name: *const ::std::os::raw::c_char,
         argc: i32,
+        flags: u32,
         context: usize,
         init: turso_aggregate_init_function_t,
         step: turso_aggregate_step_function_t,
@@ -468,10 +527,154 @@ unsafe extern "C" {
     ) -> turso_status_code_t;
 }
 unsafe extern "C" {
+    #[doc = " Register or replace a per-connection managed window-capable aggregate function. flags uses SQLite bit values (e.g. 0x800 for DETERMINISTIC)."]
+    pub fn turso_connection_register_window_function(
+        self_: *const turso_connection_t,
+        name: *const ::std::os::raw::c_char,
+        argc: i32,
+        flags: u32,
+        context: usize,
+        init: turso_aggregate_init_function_t,
+        step: turso_aggregate_step_function_t,
+        finalize: turso_aggregate_final_function_t,
+        value: turso_aggregate_value_function_t,
+        inverse: turso_aggregate_inverse_function_t,
+        context_destructor: turso_context_destructor_t,
+        aggregate_destructor: turso_context_destructor_t,
+        value_destructor: turso_value_destructor_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Out-parameter variant of turso_connection_register_scalar_function. flags uses SQLite bit values (e.g. 0x800 for DETERMINISTIC)."]
+    pub fn turso_connection_register_scalar_function_ptr(
+        self_: *const turso_connection_t,
+        name: *const ::std::os::raw::c_char,
+        argc: i32,
+        flags: u32,
+        context: usize,
+        callback: turso_scalar_function_ptr_t,
+        context_destructor: turso_context_destructor_t,
+        value_destructor: turso_value_destructor_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Out-parameter variant of turso_connection_register_aggregate_function. value and inverse must both be passed or both be NULL; with both, the aggregate can also run as a window function. flags uses SQLite bit values (e.g. 0x800 for DETERMINISTIC)."]
+    pub fn turso_connection_register_aggregate_function_ptr(
+        self_: *const turso_connection_t,
+        name: *const ::std::os::raw::c_char,
+        argc: i32,
+        flags: u32,
+        context: usize,
+        init: turso_aggregate_init_function_t,
+        step: turso_aggregate_step_function_ptr_t,
+        finalize: turso_aggregate_final_function_ptr_t,
+        value: turso_aggregate_value_function_ptr_t,
+        inverse: turso_aggregate_inverse_function_ptr_t,
+        context_destructor: turso_context_destructor_t,
+        aggregate_destructor: turso_context_destructor_t,
+        value_destructor: turso_value_destructor_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
     #[doc = " Unregister a per-connection managed scalar or aggregate function."]
     pub fn turso_connection_unregister_function(
         self_: *const turso_connection_t,
         name: *const ::std::os::raw::c_char,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Register or replace a database-level managed scalar function."]
+    pub fn turso_database_register_scalar_function(
+        self_: *const turso_database_t,
+        name: *const ::std::os::raw::c_char,
+        argc: i32,
+        deterministic: bool,
+        context: usize,
+        callback: turso_scalar_function_t,
+        context_destructor: turso_context_destructor_t,
+        value_destructor: turso_value_destructor_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Register or replace a database-level managed aggregate function. flags uses SQLite bit values (e.g. 0x800 for DETERMINISTIC)."]
+    pub fn turso_database_register_aggregate_function(
+        self_: *const turso_database_t,
+        name: *const ::std::os::raw::c_char,
+        argc: i32,
+        flags: u32,
+        context: usize,
+        init: turso_aggregate_init_function_t,
+        step: turso_aggregate_step_function_t,
+        finalize: turso_aggregate_final_function_t,
+        context_destructor: turso_context_destructor_t,
+        aggregate_destructor: turso_context_destructor_t,
+        value_destructor: turso_value_destructor_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Register or replace a database-level managed window-capable aggregate function. flags uses SQLite bit values (e.g. 0x800 for DETERMINISTIC)."]
+    pub fn turso_database_register_window_function(
+        self_: *const turso_database_t,
+        name: *const ::std::os::raw::c_char,
+        argc: i32,
+        flags: u32,
+        context: usize,
+        init: turso_aggregate_init_function_t,
+        step: turso_aggregate_step_function_t,
+        finalize: turso_aggregate_final_function_t,
+        value: turso_aggregate_value_function_t,
+        inverse: turso_aggregate_inverse_function_t,
+        context_destructor: turso_context_destructor_t,
+        aggregate_destructor: turso_context_destructor_t,
+        value_destructor: turso_value_destructor_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Out-parameter variant of turso_database_register_scalar_function. flags uses SQLite bit values (e.g. 0x800 for DETERMINISTIC)."]
+    pub fn turso_database_register_scalar_function_ptr(
+        self_: *const turso_database_t,
+        name: *const ::std::os::raw::c_char,
+        argc: i32,
+        flags: u32,
+        context: usize,
+        callback: turso_scalar_function_ptr_t,
+        context_destructor: turso_context_destructor_t,
+        value_destructor: turso_value_destructor_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Out-parameter variant of turso_database_register_aggregate_function. value and inverse must both be passed or both be NULL. flags uses SQLite bit values (e.g. 0x800 for DETERMINISTIC)."]
+    pub fn turso_database_register_aggregate_function_ptr(
+        self_: *const turso_database_t,
+        name: *const ::std::os::raw::c_char,
+        argc: i32,
+        flags: u32,
+        context: usize,
+        init: turso_aggregate_init_function_t,
+        step: turso_aggregate_step_function_ptr_t,
+        finalize: turso_aggregate_final_function_ptr_t,
+        value: turso_aggregate_value_function_ptr_t,
+        inverse: turso_aggregate_inverse_function_ptr_t,
+        context_destructor: turso_context_destructor_t,
+        aggregate_destructor: turso_context_destructor_t,
+        value_destructor: turso_value_destructor_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Removes the database-level function registered under name with exactly argc arguments. Only connections opened after this call stop seeing it. Removing a function that was never registered is not an error, matching SQLite."]
+    pub fn turso_database_remove_function(
+        self_: *const turso_database_t,
+        name: *const ::std::os::raw::c_char,
+        argc: i32,
         error_opt_out: *mut *const ::std::os::raw::c_char,
     ) -> turso_status_code_t;
 }

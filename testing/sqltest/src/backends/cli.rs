@@ -100,7 +100,11 @@ impl SqlBackend for CliBackend {
     }
 
     fn capabilities(&self) -> HashSet<Capability> {
-        Capability::all_set()
+        // Driving the binary over stdin/stdout leaves nowhere to call
+        // `Connection::create_scalar_function` from, so no `udf`.
+        let mut caps = Capability::all_set();
+        caps.remove(&Capability::Udf);
+        caps
     }
 
     fn is_sqlite(&self) -> bool {

@@ -40,6 +40,7 @@ pub mod connection;
 pub mod params;
 mod rows;
 pub mod transaction;
+pub mod udf;
 pub mod value;
 
 #[cfg(feature = "sync")]
@@ -48,7 +49,7 @@ pub mod sync;
 pub use connection::Connection;
 use turso_sdk_kit::rsapi::TursoError;
 pub use turso_sdk_kit::IoBackend;
-pub use value::Value;
+pub use value::{Value, ValueRef};
 
 pub use params::params_from_iter;
 pub use params::IntoParams;
@@ -350,6 +351,42 @@ impl Database {
     pub fn connect(&self) -> Result<Connection> {
         let conn = self.inner.connect()?;
         Ok(Connection::create(conn, None))
+    }
+
+    /// Applies to connections opened after this call, not to ones already
+    /// open. A connection-level registration of the same name and argument
+    /// count shadows this one, but only on that connection. SQLite has no
+    /// database-level equivalent.
+    pub fn create_scalar_function(
+        &self,
+        name: &str,
+        argc: i32,
+        flags: crate::udf::FunctionFlags,
+        f: impl crate::udf::ScalarFunction + 'static,
+    ) -> Result<()> {
+        self.inner
+            .create_scalar_function(name, argc, flags, crate::udf::ScalarAdapter(f))?;
+        Ok(())
+    }
+
+    /// Applies to connections opened after this call, not to ones already open.
+    pub fn create_aggregate_function(
+        &self,
+        name: &str,
+        argc: i32,
+        flags: crate::udf::FunctionFlags,
+        f: impl crate::udf::AggregateFunction + 'static,
+    ) -> Result<()> {
+        self.inner
+            .create_aggregate_function(name, argc, flags, crate::udf::AggregateAdapter(f))?;
+        Ok(())
+    }
+
+    /// Only connections opened after this call stop seeing the function.
+    /// Removing one that was never registered is not an error, matching SQLite.
+    pub fn remove_function(&self, name: &str, argc: i32) -> Result<()> {
+        self.inner.remove_function(name, argc)?;
+        Ok(())
     }
 }
 

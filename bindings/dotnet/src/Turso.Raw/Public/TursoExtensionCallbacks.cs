@@ -14,6 +14,14 @@ public delegate TursoExtensionValue TursoAggregateStepCallback(IntPtr context, I
 [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
 public delegate TursoExtensionValue TursoAggregateFinalCallback(IntPtr context, IntPtr aggregateContext);
 
+/// <summary>Window aggregate xValue callback: reads the running total without destroying the accumulator.</summary>
+[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+public delegate TursoExtensionValue TursoAggregateValueCallback(IntPtr context, IntPtr aggregateContext);
+
+/// <summary>Window aggregate xInverse callback: undoes an earlier step for a row that left the window frame.</summary>
+[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+public delegate TursoExtensionValue TursoAggregateInverseCallback(IntPtr context, IntPtr aggregateContext, int argc, IntPtr argv);
+
 [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
 public delegate int TursoCollationCallback(IntPtr context, IntPtr leftPtr, UIntPtr leftLen, IntPtr rightPtr, UIntPtr rightLen);
 

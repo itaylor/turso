@@ -234,3 +234,56 @@ async def test_cursor_async_context_manager_closes_cursor():
             await cur.fetchone()
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_create_function_scalar():
+    conn = await turso.aio.connect(":memory:")
+    try:
+        await conn.create_function("addone", 1, lambda x: x + 1)
+        cur = await conn.execute("SELECT addone(41)")
+        assert await cur.fetchone() == (42,)
+
+        await conn.create_function("addone", 1, None)
+        with pytest.raises(Exception):
+            cur = await conn.execute("SELECT addone(41)")
+            await cur.fetchone()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_create_aggregate_and_window_function():
+    class Total:
+        def __init__(self):
+            self.total = 0
+
+        def step(self, value):
+            self.total += value
+
+        def inverse(self, value):
+            self.total -= value
+
+        def value(self):
+            return self.total
+
+        def finalize(self):
+            return self.total
+
+    conn = await turso.aio.connect(":memory:")
+    try:
+        await conn.create_aggregate("total", 1, Total)
+        await conn.create_window_function("wintotal", 1, Total)
+        await conn.execute("CREATE TABLE t (x)")
+        for value in (1, 2, 3):
+            await conn.execute("INSERT INTO t VALUES (?)", (value,))
+
+        cur = await conn.execute("SELECT total(x) FROM t")
+        assert await cur.fetchone() == (6,)
+
+        cur = await conn.execute(
+            "SELECT wintotal(x) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY x"
+        )
+        assert await cur.fetchall() == [(1,), (3,), (5,)]
+    finally:
+        await conn.close()

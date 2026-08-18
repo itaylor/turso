@@ -28,6 +28,15 @@ export interface QueryOptions {
     queryTimeout?: number
 }
 
+export interface NativeUdfOptions {
+    /** Number of arguments, or -1 for a variadic function. */
+    argCount: number;
+    deterministic: boolean;
+    directOnly: boolean;
+    /** Omitted to follow the database's `defaultSafeIntegers` setting. */
+    safeIntegers?: boolean;
+}
+
 export interface NativeDatabase {
     memory: boolean,
     path: string,
@@ -43,6 +52,16 @@ export interface NativeDatabase {
 
     prepare(sql: string): NativeStatement;
     executor(sql: string, queryOptions?: QueryOptions): NativeExecutor;
+
+    createScalarFunction(name: string, options: NativeUdfOptions, fn: Function): void;
+    createAggregateFunction(
+        name: string,
+        options: NativeUdfOptions,
+        start: any,
+        step: Function,
+        inverse?: Function | null,
+        result?: Function | null,
+    ): void;
 
     defaultSafeIntegers(toggle: boolean);
     inTransaction(): boolean;

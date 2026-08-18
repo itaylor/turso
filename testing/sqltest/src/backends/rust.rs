@@ -6,8 +6,10 @@ use crate::{
 use async_trait::async_trait;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use tempfile::NamedTempFile;
-use turso::{Builder, Connection, Database, Value};
+use turso::udf::{AggregateFunction, AggregateState, FunctionFlags};
+use turso::{Builder, Connection, Database, Value, ValueRef};
 
 const TURSO_RUST_EXPERIMENTAL_FEATURES: &[&str] = &[
     "attach",
@@ -33,6 +35,210 @@ fn apply_turso_experimental_features(mut builder: Builder) -> Builder {
         };
     }
     builder
+}
+
+// The standard `udf_*` functions a `.sqltest` file gets by asking for
+// `@requires udf`. Registered on every connection this backend creates, so a
+// test file never registers anything itself. Only this backend advertises
+// `Capability::Udf`.
+
+/// Anything that is not a number, NULL included, reads as 0.
+fn arg_i64(v: &ValueRef<'_>) -> i64 {
+    match v {
+        ValueRef::Integer(i) => *i,
+        ValueRef::Real(f) => *f as i64,
+        _ => 0,
+    }
+}
+
+fn value_ref_to_value(v: &ValueRef<'_>) -> Value {
+    match v {
+        ValueRef::Null => Value::Null,
+        ValueRef::Integer(i) => Value::Integer(*i),
+        ValueRef::Real(f) => Value::Real(*f),
+        ValueRef::Text(s) => Value::Text(String::from_utf8_lossy(s).to_string()),
+        ValueRef::Blob(b) => Value::Blob(b.to_vec()),
+    }
+}
+
+/// `udf_sum(x)`: a plain (non-window) aggregate.
+struct UdfSum;
+struct UdfSumState(i64);
+
+impl AggregateFunction for UdfSum {
+    fn init(&self) -> turso::Result<Box<dyn AggregateState>> {
+        Ok(Box::new(UdfSumState(0)))
+    }
+}
+
+impl AggregateState for UdfSumState {
+    fn step(&mut self, args: &[ValueRef<'_>]) -> turso::Result<()> {
+        self.0 += arg_i64(&args[0]);
+        Ok(())
+    }
+
+    fn finalize(self: Box<Self>) -> turso::Result<Value> {
+        Ok(Value::Integer(self.0))
+    }
+}
+
+/// `udf_wsum(x)`: a window-capable aggregate.
+struct UdfWSum;
+struct UdfWSumState(i64);
+
+impl AggregateFunction for UdfWSum {
+    fn init(&self) -> turso::Result<Box<dyn AggregateState>> {
+        Ok(Box::new(UdfWSumState(0)))
+    }
+
+    fn supports_window(&self) -> bool {
+        true
+    }
+}
+
+impl AggregateState for UdfWSumState {
+    fn step(&mut self, args: &[ValueRef<'_>]) -> turso::Result<()> {
+        self.0 += arg_i64(&args[0]);
+        Ok(())
+    }
+
+    fn finalize(self: Box<Self>) -> turso::Result<Value> {
+        Ok(Value::Integer(self.0))
+    }
+
+    fn value(&self) -> turso::Result<Value> {
+        Ok(Value::Integer(self.0))
+    }
+
+    fn inverse(&mut self, args: &[ValueRef<'_>]) -> turso::Result<()> {
+        self.0 -= arg_i64(&args[0]);
+        Ok(())
+    }
+}
+
+/// `udf_count0()`: a zero-argument aggregate, counts rows.
+struct UdfCount0;
+struct UdfCount0State(i64);
+
+impl AggregateFunction for UdfCount0 {
+    fn init(&self) -> turso::Result<Box<dyn AggregateState>> {
+        Ok(Box::new(UdfCount0State(0)))
+    }
+}
+
+impl AggregateState for UdfCount0State {
+    fn step(&mut self, _args: &[ValueRef<'_>]) -> turso::Result<()> {
+        self.0 += 1;
+        Ok(())
+    }
+
+    fn finalize(self: Box<Self>) -> turso::Result<Value> {
+        Ok(Value::Integer(self.0))
+    }
+}
+
+/// Registers the standard `udf_*` test set on `conn`.
+fn register_udf_functions(conn: &Connection) -> Result<(), BackendError> {
+    let to_backend_err = |e: turso::Error| BackendError::CreateDatabase(e.to_string());
+
+    // udf_add(a, b): deterministic scalar, NULL-propagating integer add.
+    conn.create_scalar_function(
+        "udf_add",
+        2,
+        FunctionFlags::DETERMINISTIC,
+        |args: &[ValueRef<'_>]| -> turso::Result<Value> {
+            if args[0].is_null() || args[1].is_null() {
+                return Ok(Value::Null);
+            }
+            Ok(Value::Integer(arg_i64(&args[0]) + arg_i64(&args[1])))
+        },
+    )
+    .map_err(to_backend_err)?;
+
+    // udf_concat(...): variadic deterministic text concat; NULL contributes
+    // nothing, every other type is stringified.
+    conn.create_scalar_function(
+        "udf_concat",
+        -1,
+        FunctionFlags::DETERMINISTIC,
+        |args: &[ValueRef<'_>]| -> turso::Result<Value> {
+            let mut out = String::new();
+            for arg in args {
+                match arg {
+                    ValueRef::Null => {}
+                    ValueRef::Integer(i) => out.push_str(&i.to_string()),
+                    ValueRef::Real(f) => out.push_str(&f.to_string()),
+                    ValueRef::Text(t) => out.push_str(&String::from_utf8_lossy(t)),
+                    ValueRef::Blob(b) => out.push_str(&String::from_utf8_lossy(b)),
+                }
+            }
+            Ok(Value::Text(out))
+        },
+    )
+    .map_err(to_backend_err)?;
+
+    // udf_nondet(x): non-deterministic — returns x plus a call counter, so
+    // two calls with the same argument differ.
+    let nondet_calls = Arc::new(AtomicI64::new(0));
+    conn.create_scalar_function(
+        "udf_nondet",
+        1,
+        FunctionFlags::empty(),
+        move |args: &[ValueRef<'_>]| -> turso::Result<Value> {
+            let n = nondet_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(Value::Integer(arg_i64(&args[0]) + n))
+        },
+    )
+    .map_err(to_backend_err)?;
+
+    // udf_direct(x): DIRECTONLY identity — top-level SQL only, rejected from
+    // schema SQL.
+    conn.create_scalar_function(
+        "udf_direct",
+        1,
+        FunctionFlags::DIRECTONLY,
+        |args: &[ValueRef<'_>]| -> turso::Result<Value> { Ok(value_ref_to_value(&args[0])) },
+    )
+    .map_err(to_backend_err)?;
+
+    // udf_innocuous(x): INNOCUOUS identity — allowed in schema SQL even with
+    // `PRAGMA trusted_schema=OFF`.
+    conn.create_scalar_function(
+        "udf_innocuous",
+        1,
+        FunctionFlags::INNOCUOUS,
+        |args: &[ValueRef<'_>]| -> turso::Result<Value> { Ok(value_ref_to_value(&args[0])) },
+    )
+    .map_err(to_backend_err)?;
+
+    // udf_plain(x): identity with no flags.
+    conn.create_scalar_function(
+        "udf_plain",
+        1,
+        FunctionFlags::empty(),
+        |args: &[ValueRef<'_>]| -> turso::Result<Value> { Ok(value_ref_to_value(&args[0])) },
+    )
+    .map_err(to_backend_err)?;
+
+    // udf_fail(x): always errors.
+    conn.create_scalar_function(
+        "udf_fail",
+        1,
+        FunctionFlags::empty(),
+        |_args: &[ValueRef<'_>]| -> turso::Result<Value> {
+            Err(turso::Error::Error("udf_fail called".to_string()))
+        },
+    )
+    .map_err(to_backend_err)?;
+
+    conn.create_aggregate_function("udf_sum", 1, FunctionFlags::empty(), UdfSum)
+        .map_err(to_backend_err)?;
+    conn.create_aggregate_function("udf_wsum", 1, FunctionFlags::empty(), UdfWSum)
+        .map_err(to_backend_err)?;
+    conn.create_aggregate_function("udf_count0", 0, FunctionFlags::empty(), UdfCount0)
+        .map_err(to_backend_err)?;
+
+    Ok(())
 }
 
 /// Native Rust backend using Turso bindings directly
@@ -85,6 +291,7 @@ impl SqlBackend for RustBackend {
             Capability::Trigger,
             Capability::MaterializedViews,
             Capability::CustomTypes,
+            Capability::Udf,
         ])
     }
 
@@ -130,6 +337,8 @@ impl SqlBackend for RustBackend {
         let conn = db
             .connect()
             .map_err(|e| BackendError::CreateDatabase(e.to_string()))?;
+
+        register_udf_functions(&conn)?;
 
         // Prepend MVCC pragma if enabled (skip for readonly databases; the generated readonly DBs are already in MVCC mode).
         if self.mvcc && !config.readonly {

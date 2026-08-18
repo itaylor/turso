@@ -6,8 +6,12 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.Executor;
 import tech.turso.annotations.SkipNullableCheck;
+import tech.turso.core.Aggregate;
+import tech.turso.core.ScalarFunction;
 import tech.turso.core.TursoConnection;
+import tech.turso.core.TursoFunction;
 import tech.turso.core.TursoStatement;
+import tech.turso.core.WindowFunction;
 
 /** JDBC 4 Connection implementation for Turso databases. */
 public final class JDBC4Connection implements Connection {
@@ -50,6 +54,31 @@ public final class JDBC4Connection implements Connection {
     final TursoStatement statement = connection.prepare(sql);
     statement.initializeColumnMetadata();
     return statement;
+  }
+
+  /**
+   * See {@link TursoConnection#createFunction}; {@code flags} takes {@link TursoFunction} values.
+   */
+  public void createFunction(String name, int nArgs, int flags, ScalarFunction function)
+      throws SQLException {
+    connection.createFunction(name, nArgs, flags, function);
+  }
+
+  /** See {@link TursoConnection#createAggregate}. */
+  public void createAggregate(String name, int nArgs, int flags, Aggregate<?> aggregate)
+      throws SQLException {
+    connection.createAggregate(name, nArgs, flags, aggregate);
+  }
+
+  /** See {@link TursoConnection#createWindowFunction}. */
+  public void createWindowFunction(String name, int nArgs, int flags, WindowFunction<?> function)
+      throws SQLException {
+    connection.createWindowFunction(name, nArgs, flags, function);
+  }
+
+  /** See {@link TursoConnection#removeFunction}. */
+  public void removeFunction(String name, int nArgs) throws SQLException {
+    connection.removeFunction(name, nArgs);
   }
 
   @Override

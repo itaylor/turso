@@ -680,6 +680,165 @@ public class SqliteFacadeTests
     }
 
     [Test]
+    public void WindowFunctionSupportsMovingFrameWithInverse()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE Data(Value INTEGER); INSERT INTO Data VALUES (1), (2), (3), (4), (5);");
+        connection.CreateWindowFunction<long, long>(
+            "win_sum",
+            0L,
+            (accumulator, x) => accumulator + x,
+            (accumulator, x) => accumulator - x,
+            accumulator => accumulator,
+            accumulator => accumulator);
+
+        using var reader = connection.ExecuteReader(
+            "SELECT win_sum(Value) OVER (ORDER BY Value ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM Data ORDER BY Value;");
+        var results = new List<long>();
+        while (reader.Read())
+            results.Add(reader.GetInt64(0));
+
+        results.Should().Equal(1L, 3L, 5L, 7L, 9L);
+    }
+
+    [Test]
+    public void WindowFunctionCanBeUsedAsPlainAggregateWithGroupBy()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE Data(Grp TEXT, Value INTEGER); INSERT INTO Data VALUES ('A', 1), ('A', 2), ('B', 3);");
+        connection.CreateWindowFunction<long, long>(
+            "win_sum",
+            0L,
+            (accumulator, x) => accumulator + x,
+            (accumulator, x) => accumulator - x,
+            accumulator => accumulator,
+            accumulator => accumulator);
+
+        using var reader = connection.ExecuteReader("SELECT Grp, win_sum(Value) FROM Data GROUP BY Grp ORDER BY Grp;");
+        var results = new List<(string Group, long Sum)>();
+        while (reader.Read())
+            results.Add((reader.GetString(0), reader.GetInt64(1)));
+
+        results.Should().Equal(("A", 3L), ("B", 3L));
+    }
+
+    [Test]
+    public void WindowFunctionValueCallbackReflectsRunningStatePerRow()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE Data(Value INTEGER); INSERT INTO Data VALUES (1), (2), (3);");
+        connection.CreateWindowFunction<long, long>(
+            "win_sum",
+            0L,
+            (accumulator, x) => accumulator + x,
+            (accumulator, x) => accumulator - x,
+            accumulator => accumulator,
+            accumulator => accumulator);
+
+        using var reader = connection.ExecuteReader("SELECT win_sum(Value) OVER (ORDER BY Value) FROM Data ORDER BY Value;");
+        var results = new List<long>();
+        while (reader.Read())
+            results.Add(reader.GetInt64(0));
+
+        results.Should().Equal(1L, 3L, 6L);
+    }
+
+    [Test]
+    public void WindowFunctionInverseExceptionSurfacesAsSqliteException()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE Data(Value INTEGER); INSERT INTO Data VALUES (1), (2), (3);");
+        connection.CreateWindowFunction<long, long>(
+            "win_fail",
+            0L,
+            (accumulator, x) => accumulator + x,
+            (accumulator, x) => x == 1 ? throw new SqliteException("Inverse failed", 205) : accumulator - x,
+            accumulator => accumulator,
+            accumulator => accumulator);
+
+        var exception = Assert.Throws<SqliteException>(() =>
+        {
+            using var reader = connection.ExecuteReader(
+                "SELECT win_fail(Value) OVER (ORDER BY Value ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM Data ORDER BY Value;");
+            while (reader.Read())
+            {
+            }
+        })!;
+
+        exception.SqliteErrorCode.Should().Be(205);
+        exception.Message.Should().Be(Data.Sqlite.Properties.Resources.SqliteNativeError(205, "Inverse failed"));
+    }
+
+    [Test]
+    public void PlainAggregateUsedWithOverIsRejected()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE Data(Value INTEGER); INSERT INTO Data VALUES (1), (2), (3);");
+        connection.CreateAggregate<long, long>("agg_only", 0L, (accumulator, x) => accumulator + x);
+
+        Assert.Throws<SqliteException>(() => connection.ExecuteScalar<long>(
+                "SELECT agg_only(Value) OVER (ORDER BY Value) FROM Data;"))!
+            .Message.Should().Contain("may not be used as a window function");
+    }
+
+    [Test]
+    public void WindowFunctionAcceptsIsDeterministicFlag()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery("CREATE TABLE Data(Value INTEGER); INSERT INTO Data VALUES (1), (2), (3);");
+        connection.CreateWindowFunction<long, long>(
+            "win_det",
+            0L,
+            (accumulator, x) => accumulator + x,
+            (accumulator, x) => accumulator - x,
+            accumulator => accumulator,
+            accumulator => accumulator,
+            isDeterministic: true);
+
+        using var reader = connection.ExecuteReader("SELECT win_det(Value) OVER (ORDER BY Value) FROM Data ORDER BY Value;");
+        var results = new List<long>();
+        while (reader.Read())
+            results.Add(reader.GetInt64(0));
+
+        results.Should().Equal(1L, 3L, 6L);
+    }
+
+    [Test]
+    public void AggregateIsDeterministicFlagReachesTheEngine()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.CreateAggregate<long, long>("agg_det", 0L, (accumulator, x) => accumulator + x, isDeterministic: true);
+        connection.CreateAggregate<long, long>("agg_plain", 0L, (accumulator, x) => accumulator + x);
+
+        connection.ExecuteScalar<long>("SELECT flags & 2048 FROM pragma_function_list() WHERE name = 'agg_det';")
+            .Should().Be(2048);
+        connection.ExecuteScalar<long>("SELECT flags & 2048 FROM pragma_function_list() WHERE name = 'agg_plain';")
+            .Should().Be(0);
+    }
+
+    [Test]
+    public void WindowFunctionRejectsMissingResultSelector()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+
+        Assert.Throws<ArgumentNullException>(() => connection.CreateWindowFunction<long, long>(
+            "win_no_result",
+            0L,
+            (accumulator, x) => accumulator + x,
+            (accumulator, x) => accumulator - x,
+            accumulator => accumulator,
+            result: null));
+    }
+
+    [Test]
     public void CollationWorksWhenRegisteredBeforeOpen()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -704,7 +863,7 @@ public class SqliteFacadeTests
     }
 
     [Test]
-    public void CustomCollationCanBeUsedInExpressionsAndOrderingButNotSchema()
+    public void CustomCollationCanBeUsedInExpressionsOrderingAndSchema()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
         connection.Open();
@@ -714,10 +873,11 @@ public class SqliteFacadeTests
         connection.ExecuteNonQuery("CREATE TABLE Data(Value TEXT); INSERT INTO Data VALUES ('a'), ('b');");
         connection.ExecuteScalar<string>("SELECT Value FROM Data ORDER BY Value COLLATE reverse_text LIMIT 1;")
             .Should().Be("b");
-        Assert.Throws<SqliteException>(() => connection.ExecuteNonQuery("CREATE TABLE Collated(Value TEXT COLLATE reverse_text);"))!
-            .Message.Should().Contain("custom collations are not supported in schema definitions");
-        Assert.Throws<SqliteException>(() => connection.ExecuteNonQuery("CREATE INDEX Data_Value_Custom ON Data(Value COLLATE reverse_text);"))!
-            .Message.Should().Contain("custom collations are not supported in indexes");
+        // An unregistered collation is refused in schema SQL, as in SQLite.
+        connection.ExecuteNonQuery("CREATE TABLE Collated(Value TEXT COLLATE reverse_text);");
+        connection.ExecuteNonQuery("CREATE INDEX Data_Value_Custom ON Data(Value COLLATE reverse_text);");
+        Assert.Throws<SqliteException>(() => connection.ExecuteNonQuery("CREATE TABLE Missing(Value TEXT COLLATE nowhere_text);"))!
+            .Message.Should().Contain("no such collation sequence: nowhere_text");
     }
 
     [Test]

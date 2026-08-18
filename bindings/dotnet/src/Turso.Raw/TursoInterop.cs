@@ -96,10 +96,28 @@ internal static class TursoInterop
         TursoDatabaseHandle connection,
         [MarshalAs(UnmanagedType.LPUTF8Str)] string name,
         int argc,
+        uint flags,
         IntPtr context,
         TursoAggregateInitCallback init,
         TursoAggregateStepCallback step,
         TursoAggregateFinalCallback finalize,
+        TursoContextDestructorCallback contextDestructor,
+        TursoContextDestructorCallback aggregateDestructor,
+        TursoValueDestructorCallback valueDestructor,
+        out IntPtr errorPtr);
+
+    [DllImport(DllName, EntryPoint = "turso_connection_register_window_function", CallingConvention = CallingConvention.Cdecl)]
+    public static extern TursoStatusCode RegisterWindowFunction(
+        TursoDatabaseHandle connection,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string name,
+        int argc,
+        uint flags,
+        IntPtr context,
+        TursoAggregateInitCallback init,
+        TursoAggregateStepCallback step,
+        TursoAggregateFinalCallback finalize,
+        TursoAggregateValueCallback value,
+        TursoAggregateInverseCallback inverse,
         TursoContextDestructorCallback contextDestructor,
         TursoContextDestructorCallback aggregateDestructor,
         TursoValueDestructorCallback valueDestructor,

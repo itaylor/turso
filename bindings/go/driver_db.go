@@ -350,10 +350,25 @@ func WithBusyTimeout(ms int) ConnectorOption {
 	}
 }
 
+// WithFunctions runs fn once per connection this connector opens, before
+// database/sql hands the connection out, so the functions it registers are
+// visible whichever pooled connection a later query lands on. Registering on a
+// single *sql.Conn instead (see [Functions]) leaves the pool's other
+// connections without the function.
+//
+// An error from fn fails the Connect call that triggered it. Multiple
+// WithFunctions options run in the order given.
+func WithFunctions(fn func(f Functions) error) ConnectorOption {
+	return func(c *TursoConnector) {
+		c.onConnect = append(c.onConnect, fn)
+	}
+}
+
 // TursoConnector implements driver.Connector for programmatic configuration.
 type TursoConnector struct {
 	dsn         string
-	busyTimeout int // -1 = use default, 0 = disabled, >0 = custom
+	busyTimeout int                     // -1 = use default, 0 = disabled, >0 = custom
+	onConnect   []func(Functions) error // run on every connection Connect opens
 }
 
 // NewConnector creates a new TursoConnector with the given DSN and options.
@@ -397,7 +412,7 @@ func (c *TursoConnector) Connect(ctx context.Context) (driver.Conn, error) {
 		turso_database_deinit(db)
 		return nil, err
 	}
-	conn, err := turso_database_connect(db)
+	connHandle, err := turso_database_connect(db)
 	if err != nil {
 		turso_database_deinit(db)
 		return nil, err
@@ -411,15 +426,24 @@ func (c *TursoConnector) Connect(ctx context.Context) (driver.Conn, error) {
 		timeout = 0
 	}
 	if timeout > 0 {
-		turso_connection_set_busy_timeout_ms(conn, int64(timeout))
+		turso_connection_set_busy_timeout_ms(connHandle, int64(timeout))
 	}
 
-	return &tursoDbConnection{
+	conn := &tursoDbConnection{
 		db:          db,
-		conn:        conn,
+		conn:        connHandle,
 		busyTimeout: timeout,
 		async:       config.AsyncIO,
-	}, nil
+	}
+
+	for _, fn := range c.onConnect {
+		if err := fn(conn); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+	}
+
+	return conn, nil
 }
 
 // Driver implements driver.Connector.

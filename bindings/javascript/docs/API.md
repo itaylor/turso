@@ -120,11 +120,69 @@ This function is currently not supported.
 
 ### function(name, [options], function) ⇒ this
 
-This function is currently not supported.
+Registers a scalar user-defined function, callable from SQL on this
+connection. Returns the database, so calls can be chained. The callback runs
+while a statement is stepping, so it must be synchronous.
+
+| Param    | Type                  | Description                                                                       |
+| -------- | --------------------- | --------------------------------------------------------------------------------- |
+| name     | <code>string</code>   | The name SQL calls the function by.                                               |
+| options  | <code>object</code>   | Optional. See below.                                                              |
+| function | <code>function</code> | The implementation.                                                               |
+
+| Option        | Default              | Description                                                                                 |
+| ------------- | -------------------- | ------------------------------------------------------------------------------------------- |
+| deterministic | `false`              | The same arguments always produce the same result, so the engine may call it once and reuse the answer. |
+| varargs       | `false`              | Accept any number of arguments. Without it the arity is `function.length`, and a call with a different number of arguments fails with `wrong number of arguments`. |
+| directOnly    | `false`              | Mark the function as callable only from top-level SQL, never from a trigger, view, CHECK constraint, DEFAULT, generated column or index expression; calling it from there fails with `unsafe use of X()`. |
+| safeIntegers  | database default     | Pass INTEGER arguments as BigInt instead of Number. Follows `defaultSafeIntegers()` when omitted. |
+
+```js
+db.function('add2', (a, b) => a + b);
+db.prepare('SELECT add2(2, 3) AS v').get(); // => { v: 5 }
+
+db.function('sum_all', { varargs: true }, (...args) => args.reduce((a, b) => a + b, 0));
+```
+
+Arguments arrive as `null`, Number (or BigInt with `safeIntegers`), string or
+`Uint8Array`. The return value may be `null`/`undefined` (SQL NULL), a number,
+a BigInt, a string, a boolean (0 or 1) or a `Buffer`/`Uint8Array`; anything
+else fails the statement with a `TypeError`. An exception thrown by the
+callback aborts the statement and is rethrown to whoever ran it, unchanged.
+
+A user-defined function may run SQL of its own with `db.prepare(...)`, but not
+through the statement that invoked it — that statement is mid-step and reports
+`statement is already running`. A function registered with the same name and
+argument count as a built-in shadows it.
 
 ### aggregate(name, options) ⇒ this
 
-This function is currently not supported.
+Registers an aggregate user-defined function. Returns the database.
+
+| Option        | Default              | Description                                                                                  |
+| ------------- | -------------------- | ---------------------------------------------------------------------------------------------- |
+| start         | `null`               | The initial value of the accumulator, or a function returning a fresh one for every group.   |
+| step          | *required*           | `(total, ...args)`. Returns the new accumulator, or `undefined` to keep the current one.     |
+| inverse       | none                 | `(total, ...args)`. Removes a row that left the window frame. Providing it makes the aggregate usable as a window function. |
+| result        | none                 | `(total)`. Turns the final accumulator into the value SQL sees. Defaults to the accumulator itself. |
+| deterministic, varargs, directOnly, safeIntegers | | As for `function()`. The arity is `step.length - 1`, since `step` also takes the accumulator. |
+
+```js
+db.aggregate('mysum', {
+  start: 0,
+  step: (total, x) => total + x,
+  inverse: (total, x) => total - x,
+});
+
+db.prepare('SELECT mysum(x) AS v FROM t').get();
+db.prepare(
+  'SELECT x, mysum(x) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS v FROM t'
+).all();
+```
+
+The accumulator can be any JavaScript value, including an object or array.
+Without an `inverse` callback the aggregate cannot be used with `OVER`, and
+such a query fails to compile with `X() may not be used as a window function`.
 
 ### table(name, definition) ⇒ this
 

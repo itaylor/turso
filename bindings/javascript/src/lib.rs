@@ -13,6 +13,8 @@
 #[cfg(feature = "browser")]
 pub mod browser;
 
+mod udf;
+
 use napi::bindgen_prelude::*;
 use napi::{Env, Task};
 use napi_derive::napi;
@@ -64,7 +66,9 @@ pub struct DatabaseInner {
     opts: Option<DatabaseOpts>,
     io: Arc<dyn turso_core::IO>,
     connect: OnceLock<DatabaseConnect>,
-    default_safe_integers: Mutex<bool>,
+    /// Shared with every registered function, so one without an explicit
+    /// `safeIntegers` option follows the current default rather than a copy.
+    default_safe_integers: Arc<Mutex<bool>>,
     /// Weak refs to every shared statement handle created by this database.
     /// `close()` upgrades each live handle and sets it to `None`, which
     /// finalizes the statement and releases its `Arc<Connection>`.
@@ -190,6 +194,27 @@ pub struct QueryOptions {
 }
 
 #[napi(object)]
+pub struct UdfOptions {
+    /// Number of arguments, or -1 for a variadic function.
+    pub arg_count: i32,
+    /// The engine may call the function once and reuse the result.
+    pub deterministic: bool,
+    /// Callable only from top-level SQL, not from triggers, views or CHECK.
+    pub direct_only: bool,
+    /// Pass INTEGER arguments as BigInt; omit to follow `defaultSafeIntegers`.
+    pub safe_integers: Option<bool>,
+}
+
+impl UdfOptions {
+    fn flags(&self) -> turso_core::FunctionFlags {
+        let mut flags = turso_core::FunctionFlags::empty();
+        flags.set(turso_core::FunctionFlags::DETERMINISTIC, self.deterministic);
+        flags.set(turso_core::FunctionFlags::DIRECTONLY, self.direct_only);
+        flags
+    }
+}
+
+#[napi(object)]
 pub struct TableColumn {
     pub name: String,
     #[napi(ts_type = "string | null")]
@@ -202,10 +227,13 @@ pub struct TableColumn {
 /// Step one statement. Returns the step constant plus the requested sleep in
 /// milliseconds, which is nonzero only for `STEP_SLEEP`.
 fn step_sync(stmt: &StatementHandle) -> napi::Result<(u32, u32)> {
-    let mut guard = stmt.borrow_mut();
+    let mut guard = stmt
+        .try_borrow_mut()
+        .map_err(|_| create_generic_error("statement is already running"))?;
     let core_stmt = guard
         .as_mut()
         .ok_or_else(|| create_generic_error("statement has been finalized"))?;
+    udf::clear_pending_js_error();
     match core_stmt.step() {
         Ok(turso_core::StepResult::Row) => Ok((STEP_ROW, 0)),
         Ok(turso_core::StepResult::IO) => Ok((STEP_IO, 0)),
@@ -221,16 +249,14 @@ fn step_sync(stmt: &StatementHandle) -> napi::Result<(u32, u32)> {
             Err(create_generic_error("statement was interrupted"))
         }
         Ok(turso_core::StepResult::Busy) => Err(create_generic_error("database is locked")),
-        Err(e) => Err(to_generic_error("step failed", e)),
+        Err(e) => {
+            Err(udf::take_pending_js_error().unwrap_or_else(|| to_generic_error("step failed", e)))
+        }
     }
 }
 
 fn to_generic_error<E: std::error::Error>(message: &str, e: E) -> napi::Error {
     Error::new(Status::GenericFailure, format!("{message}: {e}"))
-}
-
-fn to_error<E: std::error::Error>(status: napi::Status, message: &str, e: E) -> napi::Error {
-    Error::new(status, format!("{message}: {e}"))
 }
 
 fn create_generic_error(message: &str) -> napi::Error {
@@ -410,7 +436,7 @@ impl Database {
                 opts,
                 io,
                 connect: OnceLock::new(),
-                default_safe_integers: Mutex::new(false),
+                default_safe_integers: Arc::new(Mutex::new(false)),
                 stmts: Mutex::new(Vec::new()),
             })),
         })
@@ -579,19 +605,33 @@ impl Database {
     /// `Ok(())` if the database is closed successfully.
     #[napi]
     pub fn close(&mut self) -> napi::Result<()> {
-        if let Some(inner) = self.inner.take() {
-            // Finalize all outstanding statements.  Each turso_core::Statement
-            // holds Program { connection: Arc<Connection> } which in turn holds
-            // Arc<Database>.  If we don't clear them, the Weak in
-            // DATABASE_MANAGER can still be upgraded after the file is renamed,
-            // causing a stale Database to be returned on the next open().
-            let mut stmts = inner.stmts.lock().unwrap();
-            for weak in stmts.drain(..) {
-                if let Some(stmt) = weak.upgrade() {
-                    *stmt.borrow_mut() = None;
-                }
-            }
+        let Some(inner) = self.inner.as_ref() else {
+            return Ok(());
+        };
+        // Finalize all outstanding statements.  Each turso_core::Statement
+        // holds Program { connection: Arc<Connection> } which in turn holds
+        // Arc<Database>.  If we don't clear them, the Weak in
+        // DATABASE_MANAGER can still be upgraded after the file is renamed,
+        // causing a stale Database to be returned on the next open().
+        //
+        // A statement that is stepping (a user-defined function calling `close`)
+        // is borrowed, so refuse rather than panic on the borrow.
+        let mut stmts = inner
+            .stmts
+            .lock()
+            .map_err(|_| create_generic_error("database statement list is poisoned"))?;
+        let live: Vec<_> = stmts.iter().filter_map(|weak| weak.upgrade()).collect();
+        if live.iter().any(|stmt| stmt.try_borrow_mut().is_err()) {
+            return Err(create_generic_error(
+                "This database connection is busy executing a query",
+            ));
         }
+        stmts.clear();
+        drop(stmts);
+        for stmt in live {
+            *stmt.borrow_mut() = None;
+        }
+        self.inner = None;
         Ok(())
     }
 
@@ -604,6 +644,58 @@ impl Database {
     pub fn default_safe_integers(&self, toggle: Option<bool>) -> napi::Result<()> {
         *self.inner()?.default_safe_integers.lock().unwrap() = toggle.unwrap_or(true);
         Ok(())
+    }
+
+    #[napi(js_name = "createScalarFunction")]
+    pub fn create_scalar_function(
+        &self,
+        env: &Env,
+        name: String,
+        options: UdfOptions,
+        func: Unknown,
+    ) -> napi::Result<()> {
+        let conn = self.conn()?;
+        let default_safe_integers = self.inner()?.default_safe_integers.clone();
+        let function = udf::scalar_function(
+            env,
+            &name,
+            func,
+            options.safe_integers,
+            default_safe_integers,
+        )?;
+        conn.create_scalar_function(&name, options.arg_count, options.flags(), function)
+            .map_err(|e| to_generic_error("failed to register function", e))
+    }
+
+    /// `start` is the initial accumulator value, or a function making one per group.
+    #[napi(js_name = "createAggregateFunction")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_aggregate_function(
+        &self,
+        env: &Env,
+        name: String,
+        options: UdfOptions,
+        start: Unknown,
+        step: Unknown,
+        inverse: Option<Unknown>,
+        result: Option<Unknown>,
+    ) -> napi::Result<()> {
+        let conn = self.conn()?;
+        let default_safe_integers = self.inner()?.default_safe_integers.clone();
+        let function = udf::aggregate_function(
+            env,
+            &name,
+            udf::AggregateCallbacks {
+                start,
+                step,
+                inverse,
+                result,
+            },
+            options.safe_integers,
+            default_safe_integers,
+        )?;
+        conn.create_aggregate_function(&name, options.arg_count, options.flags(), function)
+            .map_err(|e| to_generic_error("failed to register function", e))
     }
 
     /// Runs the I/O loop synchronously.
@@ -714,9 +806,15 @@ pub struct Statement {
 
 #[napi]
 impl Statement {
+    /// `try_borrow` rather than `borrow`: a user-defined function can call back
+    /// into JavaScript, and re-entering this statement must error, not panic.
     fn statement_handle(&self) -> napi::Result<&StatementHandle> {
-        if self.stmt.borrow().is_none() {
-            return Err(create_generic_error("statement has been finalized"));
+        match self.stmt.try_borrow() {
+            Ok(guard) if guard.is_none() => {
+                return Err(create_generic_error("statement has been finalized"))
+            }
+            Ok(_) => {}
+            Err(_) => return Err(create_generic_error("statement is already running")),
         }
         Ok(&self.stmt)
     }
@@ -782,49 +880,9 @@ impl Statement {
         let non_zero_idx = NonZeroUsize::new(index as usize).ok_or_else(|| {
             create_error(Status::InvalidArg, "parameter index must be greater than 0")
         })?;
-        let value_type = value.get_type()?;
-        let turso_value = match value_type {
-            ValueType::Null => turso_core::Value::Null,
-            ValueType::Number => {
-                let n: f64 = unsafe { value.cast()? };
-                if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
-                    turso_core::Value::from_i64(n as i64)
-                } else {
-                    turso_core::Value::from_f64(n)
-                }
-            }
-            ValueType::BigInt => {
-                let bigint_str = value.coerce_to_string()?.into_utf8()?.as_str()?.to_owned();
-                let bigint_value = bigint_str
-                    .parse::<i64>()
-                    .map_err(|e| to_error(Status::NumberExpected, "failed to parse BigInt", e))?;
-                turso_core::Value::from_i64(bigint_value)
-            }
-            ValueType::String => {
-                let s = value.coerce_to_string()?.into_utf8()?;
-                turso_core::Value::Text(s.as_str()?.to_owned().into())
-            }
-            ValueType::Boolean => {
-                let b: bool = unsafe { value.cast()? };
-                turso_core::Value::from_i64(if b { 1 } else { 0 })
-            }
-            ValueType::Object => {
-                let obj = value.coerce_to_object()?;
-
-                if obj.is_buffer()? || obj.is_typedarray()? {
-                    let length = obj.get_named_property::<u32>("length")?;
-                    let mut bytes = Vec::with_capacity(length as usize);
-                    for i in 0..length {
-                        let byte = obj.get_element::<u32>(i)?;
-                        bytes.push(byte as u8);
-                    }
-                    turso_core::Value::Blob(bytes)
-                } else {
-                    let s = value.coerce_to_string()?.into_utf8()?;
-                    turso_core::Value::Text(s.as_str()?.to_owned().into())
-                }
-            }
-            _ => {
+        let turso_value = match udf::js_to_value(value)? {
+            Some(value) => value,
+            None => {
                 let s = value.coerce_to_string()?.into_utf8()?;
                 turso_core::Value::Text(s.as_str()?.to_owned().into())
             }
@@ -966,7 +1024,10 @@ impl Statement {
     /// Finalizes the statement.
     #[napi]
     pub fn finalize(&mut self) -> Result<()> {
-        *self.stmt.borrow_mut() = None;
+        *self
+            .stmt
+            .try_borrow_mut()
+            .map_err(|_| create_generic_error("statement is already running"))? = None;
         Ok(())
     }
 }

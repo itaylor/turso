@@ -89,6 +89,9 @@ const db = new Database({
 | `get(sql, params?)` | Query single row |
 | `all(sql, params?)` | Query all rows |
 | `prepare(sql)` | Create prepared statement |
+| `function(name, [options], fn)` | Register a scalar user-defined function |
+| `aggregate(name, options)` | Register an aggregate (and window) user-defined function |
+| `removeFunction(name)` | Remove every registration of `name` |
 | `close()` | Close database |
 
 ### Sync Methods (when `url` is provided)
@@ -99,6 +102,65 @@ const db = new Database({
 | `pull()` | Pull remote changes to local |
 | `sync()` | Push then pull |
 | `stats()` | Get sync statistics |
+
+### User-Defined Functions
+
+`function()` and `aggregate()` take the same options as better-sqlite3.
+
+```typescript
+// Scalar: fn.length decides how many arguments SQL must pass
+db.function('add_two', (a: number, b: number) => a + b);
+await db.get('SELECT add_two(2, 3) AS sum'); // { sum: 5 }
+
+// Options come before the implementation
+db.function('shout', { deterministic: true }, (text: string) => `${text}!`);
+
+// varargs accepts any number of arguments
+db.function('join_all', { varargs: true }, (...parts: string[]) => parts.join('-'));
+
+// Aggregate
+db.aggregate('total_len', {
+  start: 0,
+  step: (total: number, value: string) => total + value.length,
+});
+await db.get('SELECT total_len(name) AS n FROM users');
+
+// Adding `inverse` makes the aggregate usable as a window function
+db.aggregate('running_sum', {
+  start: 0,
+  step: (total: number, value: number) => total + value,
+  inverse: (total: number, value: number) => total - value,
+  result: (total: number) => total,
+});
+await db.all(
+  'SELECT running_sum(x) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM t'
+);
+
+// Throwing fails the statement with the thrown message
+db.function('strict_abs', (value: number) => {
+  if (typeof value !== 'number') throw new TypeError('expected a number');
+  return Math.abs(value);
+});
+
+db.removeFunction('add_two');
+```
+
+The callbacks run **synchronously on the JavaScript thread**, nested inside the
+`step()` that reached them:
+
+- They must be synchronous. An `async` callback returns a Promise, which SQL has
+  no type for, and the statement fails.
+- They cannot query the database: every query method here is `async` and waits
+  on the lock the running statement already holds, so the Promise a callback
+  would return never resolves.
+- Values map as they do for column values: `null`, number, string and
+  `ArrayBuffer` (a typed array is accepted too and copied as a blob).
+  `undefined` means SQL NULL, and `true`/`false` become 1/0. INTEGER values
+  always arrive as JavaScript numbers — there is no `safeIntegers` option, and
+  passing one throws.
+- `deterministic` and `directOnly` work for scalars and aggregates alike; they
+  are the same flags SQLite's `SQLITE_DETERMINISTIC` and `SQLITE_DIRECTONLY`
+  set.
 
 ### Transactions
 

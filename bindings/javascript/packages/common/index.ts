@@ -3,6 +3,7 @@ import { Database as DatabaseCompat, Statement as StatementCompat } from "./comp
 import { Database as DatabasePromise, Statement as StatementPromise, Transaction, TransactionFunction, AsyncTransactionFunction, assertTransactionCallback } from "./promise.js";
 import { SqliteError } from "./sqlite-error.js";
 import { AsyncLock } from "./async-lock.js";
+import { AggregateOptions, FunctionOptions } from "./udf.js";
 
 export {
     DatabaseOpts,
@@ -12,6 +13,7 @@ export {
     DatabaseCompat, StatementCompat,
     DatabasePromise, StatementPromise, Transaction, TransactionFunction, AsyncTransactionFunction, assertTransactionCallback,
     NativeDatabase, NativeStatement,
+    FunctionOptions, AggregateOptions,
     SqliteError,
     AsyncLock
 }

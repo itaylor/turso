@@ -37,6 +37,24 @@ type CStepFunction = unsafe extern "C" fn(
     *const c::turso_value_t,
 ) -> c::turso_value_t;
 type CFinalizeFunction = unsafe extern "C" fn(usize, *mut c::turso_agg_ctx_t) -> c::turso_value_t;
+type CValueFunction = unsafe extern "C" fn(usize, *mut c::turso_agg_ctx_t) -> c::turso_value_t;
+type CInverseFunction = unsafe extern "C" fn(
+    usize,
+    *mut c::turso_agg_ctx_t,
+    i32,
+    *const c::turso_value_t,
+) -> c::turso_value_t;
+type CScalarPtrFunction =
+    unsafe extern "C" fn(usize, i32, *const c::turso_value_t, *mut c::turso_value_t);
+type CStepPtrFunction = unsafe extern "C" fn(
+    usize,
+    *mut c::turso_agg_ctx_t,
+    i32,
+    *const c::turso_value_t,
+    *mut c::turso_value_t,
+);
+type CFinalizePtrFunction =
+    unsafe extern "C" fn(usize, *mut c::turso_agg_ctx_t, *mut c::turso_value_t);
 
 #[no_mangle]
 #[signature(c)]
@@ -148,12 +166,8 @@ pub extern "C" fn turso_connection_last_insert_rowid(
     }
 }
 
-/// # Safety
-/// All pointers must be valid according to `turso.h`; callback function pointers must use the declared C ABI.
-#[no_mangle]
-#[signature(c)]
-pub unsafe extern "C" fn turso_connection_register_scalar_function(
-    connection: *const c::turso_connection_t,
+#[allow(clippy::too_many_arguments)]
+unsafe fn register_scalar_function_shared(
     name: *const std::ffi::c_char,
     argc: i32,
     deterministic: bool,
@@ -162,6 +176,12 @@ pub unsafe extern "C" fn turso_connection_register_scalar_function(
     context_destructor: c::turso_context_destructor_t,
     value_destructor: c::turso_value_destructor_t,
     error_opt_out: *mut *const std::ffi::c_char,
+    register: impl FnOnce(
+        &str,
+        i32,
+        crate::udf::FunctionFlags,
+        crate::udf::ExtScalarAdapter,
+    ) -> Result<(), rsapi::TursoError>,
 ) -> c::turso_status_code_t {
     let callback = match callback {
         Some(callback) => {
@@ -181,20 +201,13 @@ pub unsafe extern "C" fn turso_connection_register_scalar_function(
         Ok(name) => name,
         Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
-    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
-        Ok(connection) => connection,
-        Err(err) => return unsafe { err.to_capi(error_opt_out) },
-    };
-
-    match connection.register_external_scalar_function(
-        name.to_string(),
-        argc,
-        deterministic,
-        context,
-        callback,
-        context_destructor,
-        value_destructor,
-    ) {
+    let mut flags = crate::udf::FunctionFlags::empty();
+    if deterministic {
+        flags |= crate::udf::FunctionFlags::DETERMINISTIC;
+    }
+    let adapter =
+        crate::udf::ExtScalarAdapter::new(context, callback, context_destructor, value_destructor);
+    match register(name, argc, flags, adapter) {
         Ok(()) => c::turso_status_code_t::TURSO_OK,
         Err(err) => unsafe { err.to_capi(error_opt_out) },
     }
@@ -204,10 +217,81 @@ pub unsafe extern "C" fn turso_connection_register_scalar_function(
 /// All pointers must be valid according to `turso.h`; callback function pointers must use the declared C ABI.
 #[no_mangle]
 #[signature(c)]
-pub unsafe extern "C" fn turso_connection_register_aggregate_function(
+pub unsafe extern "C" fn turso_connection_register_scalar_function(
     connection: *const c::turso_connection_t,
     name: *const std::ffi::c_char,
     argc: i32,
+    deterministic: bool,
+    context: usize,
+    callback: c::turso_scalar_function_t,
+    context_destructor: c::turso_context_destructor_t,
+    value_destructor: c::turso_value_destructor_t,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    unsafe {
+        register_scalar_function_shared(
+            name,
+            argc,
+            deterministic,
+            context,
+            callback,
+            context_destructor,
+            value_destructor,
+            error_opt_out,
+            |name, argc, flags, adapter| {
+                connection.create_scalar_function(name, argc, flags, adapter)
+            },
+        )
+    }
+}
+
+/// Applies to connections opened after this call, not to ones already open.
+///
+/// # Safety
+/// All pointers must be valid according to `turso.h`; callback function pointers must use the declared C ABI.
+#[no_mangle]
+#[signature(c)]
+pub unsafe extern "C" fn turso_database_register_scalar_function(
+    database: *const c::turso_database_t,
+    name: *const std::ffi::c_char,
+    argc: i32,
+    deterministic: bool,
+    context: usize,
+    callback: c::turso_scalar_function_t,
+    context_destructor: c::turso_context_destructor_t,
+    value_destructor: c::turso_value_destructor_t,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let database = match unsafe { TursoDatabase::ref_from_capi(database) } {
+        Ok(database) => database,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    unsafe {
+        register_scalar_function_shared(
+            name,
+            argc,
+            deterministic,
+            context,
+            callback,
+            context_destructor,
+            value_destructor,
+            error_opt_out,
+            |name, argc, flags, adapter| {
+                database.create_scalar_function(name, argc, flags, adapter)
+            },
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn register_aggregate_function_shared(
+    name: *const std::ffi::c_char,
+    argc: i32,
+    flags: u32,
     context: usize,
     init: c::turso_aggregate_init_function_t,
     step: c::turso_aggregate_step_function_t,
@@ -216,6 +300,12 @@ pub unsafe extern "C" fn turso_connection_register_aggregate_function(
     aggregate_destructor: c::turso_context_destructor_t,
     value_destructor: c::turso_value_destructor_t,
     error_opt_out: *mut *const std::ffi::c_char,
+    register: impl FnOnce(
+        &str,
+        i32,
+        crate::udf::FunctionFlags,
+        crate::udf::ExtAggregateAdapter,
+    ) -> Result<(), rsapi::TursoError>,
 ) -> c::turso_status_code_t {
     let (init, step, finalize) = match (init, step, finalize) {
         (Some(init), Some(step), Some(finalize)) => (
@@ -239,14 +329,7 @@ pub unsafe extern "C" fn turso_connection_register_aggregate_function(
         Ok(name) => name,
         Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
-    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
-        Ok(connection) => connection,
-        Err(err) => return unsafe { err.to_capi(error_opt_out) },
-    };
-
-    match connection.register_external_aggregate_function(
-        name.to_string(),
-        argc,
+    let adapter = crate::udf::ExtAggregateAdapter::new(
         context,
         init,
         step,
@@ -254,7 +337,616 @@ pub unsafe extern "C" fn turso_connection_register_aggregate_function(
         context_destructor,
         aggregate_destructor,
         value_destructor,
+    );
+    match register(
+        name,
+        argc,
+        crate::udf::FunctionFlags::from_bits_truncate(flags),
+        adapter,
     ) {
+        Ok(()) => c::turso_status_code_t::TURSO_OK,
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
+    }
+}
+
+/// # Safety
+/// All pointers must be valid according to `turso.h`; callback function pointers must use the declared C ABI.
+#[no_mangle]
+#[signature(c)]
+pub unsafe extern "C" fn turso_connection_register_aggregate_function(
+    connection: *const c::turso_connection_t,
+    name: *const std::ffi::c_char,
+    argc: i32,
+    flags: u32,
+    context: usize,
+    init: c::turso_aggregate_init_function_t,
+    step: c::turso_aggregate_step_function_t,
+    finalize: c::turso_aggregate_final_function_t,
+    context_destructor: c::turso_context_destructor_t,
+    aggregate_destructor: c::turso_context_destructor_t,
+    value_destructor: c::turso_value_destructor_t,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    unsafe {
+        register_aggregate_function_shared(
+            name,
+            argc,
+            flags,
+            context,
+            init,
+            step,
+            finalize,
+            context_destructor,
+            aggregate_destructor,
+            value_destructor,
+            error_opt_out,
+            |name, argc, flags, adapter| {
+                connection.create_aggregate_function(name, argc, flags, adapter)
+            },
+        )
+    }
+}
+
+/// Applies to connections opened after this call, not to ones already open.
+///
+/// # Safety
+/// All pointers must be valid according to `turso.h`; callback function pointers must use the declared C ABI.
+#[no_mangle]
+#[signature(c)]
+pub unsafe extern "C" fn turso_database_register_aggregate_function(
+    database: *const c::turso_database_t,
+    name: *const std::ffi::c_char,
+    argc: i32,
+    flags: u32,
+    context: usize,
+    init: c::turso_aggregate_init_function_t,
+    step: c::turso_aggregate_step_function_t,
+    finalize: c::turso_aggregate_final_function_t,
+    context_destructor: c::turso_context_destructor_t,
+    aggregate_destructor: c::turso_context_destructor_t,
+    value_destructor: c::turso_value_destructor_t,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let database = match unsafe { TursoDatabase::ref_from_capi(database) } {
+        Ok(database) => database,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    unsafe {
+        register_aggregate_function_shared(
+            name,
+            argc,
+            flags,
+            context,
+            init,
+            step,
+            finalize,
+            context_destructor,
+            aggregate_destructor,
+            value_destructor,
+            error_opt_out,
+            |name, argc, flags, adapter| {
+                database.create_aggregate_function(name, argc, flags, adapter)
+            },
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn register_window_function_shared(
+    name: *const std::ffi::c_char,
+    argc: i32,
+    flags: u32,
+    context: usize,
+    init: c::turso_aggregate_init_function_t,
+    step: c::turso_aggregate_step_function_t,
+    finalize: c::turso_aggregate_final_function_t,
+    value: c::turso_aggregate_value_function_t,
+    inverse: c::turso_aggregate_inverse_function_t,
+    context_destructor: c::turso_context_destructor_t,
+    aggregate_destructor: c::turso_context_destructor_t,
+    value_destructor: c::turso_value_destructor_t,
+    error_opt_out: *mut *const std::ffi::c_char,
+    register: impl FnOnce(
+        &str,
+        i32,
+        crate::udf::FunctionFlags,
+        crate::udf::ExtAggregateAdapter,
+    ) -> Result<(), rsapi::TursoError>,
+) -> c::turso_status_code_t {
+    let (init, step, finalize) = match (init, step, finalize) {
+        (Some(init), Some(step), Some(finalize)) => (
+            std::mem::transmute::<CInitAggFunction, turso_ext::InitAggFunction>(init),
+            std::mem::transmute::<CStepFunction, turso_ext::StepFunction>(step),
+            std::mem::transmute::<CFinalizeFunction, turso_ext::FinalizeFunction>(finalize),
+        ),
+        _ => {
+            return unsafe {
+                rsapi::TursoError::Misuse(
+                    "expected aggregate callbacks, got null pointer".to_string(),
+                )
+                .to_capi(error_opt_out)
+            };
+        }
+    };
+    let (value, inverse) = match (value, inverse) {
+        (Some(value), Some(inverse)) => (
+            std::mem::transmute::<CValueFunction, crate::udf::WindowValueFunction>(value),
+            std::mem::transmute::<CInverseFunction, crate::udf::WindowInverseFunction>(inverse),
+        ),
+        _ => {
+            return unsafe {
+                rsapi::TursoError::Misuse("expected window callbacks, got null pointer".to_string())
+                    .to_capi(error_opt_out)
+            };
+        }
+    };
+    let value_destructor = value_destructor.map(|destructor| {
+        std::mem::transmute::<CValueDestructor, turso_ext::ValueDestructor>(destructor)
+    });
+    let name = match unsafe { str_from_c_str(name) } {
+        Ok(name) => name,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    let adapter = crate::udf::ExtAggregateAdapter::new_window(
+        context,
+        init,
+        step,
+        finalize,
+        value,
+        inverse,
+        context_destructor,
+        aggregate_destructor,
+        value_destructor,
+    );
+    match register(
+        name,
+        argc,
+        crate::udf::FunctionFlags::from_bits_truncate(flags),
+        adapter,
+    ) {
+        Ok(()) => c::turso_status_code_t::TURSO_OK,
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
+    }
+}
+
+/// # Safety
+/// All pointers must be valid according to `turso.h`; callback function pointers must use the declared C ABI.
+#[no_mangle]
+#[signature(c)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn turso_connection_register_window_function(
+    connection: *const c::turso_connection_t,
+    name: *const std::ffi::c_char,
+    argc: i32,
+    flags: u32,
+    context: usize,
+    init: c::turso_aggregate_init_function_t,
+    step: c::turso_aggregate_step_function_t,
+    finalize: c::turso_aggregate_final_function_t,
+    value: c::turso_aggregate_value_function_t,
+    inverse: c::turso_aggregate_inverse_function_t,
+    context_destructor: c::turso_context_destructor_t,
+    aggregate_destructor: c::turso_context_destructor_t,
+    value_destructor: c::turso_value_destructor_t,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    unsafe {
+        register_window_function_shared(
+            name,
+            argc,
+            flags,
+            context,
+            init,
+            step,
+            finalize,
+            value,
+            inverse,
+            context_destructor,
+            aggregate_destructor,
+            value_destructor,
+            error_opt_out,
+            |name, argc, flags, adapter| {
+                connection.create_aggregate_function(name, argc, flags, adapter)
+            },
+        )
+    }
+}
+
+/// Applies to connections opened after this call, not to ones already open.
+///
+/// # Safety
+/// All pointers must be valid according to `turso.h`; callback function pointers must use the declared C ABI.
+#[no_mangle]
+#[signature(c)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn turso_database_register_window_function(
+    database: *const c::turso_database_t,
+    name: *const std::ffi::c_char,
+    argc: i32,
+    flags: u32,
+    context: usize,
+    init: c::turso_aggregate_init_function_t,
+    step: c::turso_aggregate_step_function_t,
+    finalize: c::turso_aggregate_final_function_t,
+    value: c::turso_aggregate_value_function_t,
+    inverse: c::turso_aggregate_inverse_function_t,
+    context_destructor: c::turso_context_destructor_t,
+    aggregate_destructor: c::turso_context_destructor_t,
+    value_destructor: c::turso_value_destructor_t,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let database = match unsafe { TursoDatabase::ref_from_capi(database) } {
+        Ok(database) => database,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    unsafe {
+        register_window_function_shared(
+            name,
+            argc,
+            flags,
+            context,
+            init,
+            step,
+            finalize,
+            value,
+            inverse,
+            context_destructor,
+            aggregate_destructor,
+            value_destructor,
+            error_opt_out,
+            |name, argc, flags, adapter| {
+                database.create_aggregate_function(name, argc, flags, adapter)
+            },
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn register_scalar_function_ptr_shared(
+    name: *const std::ffi::c_char,
+    argc: i32,
+    flags: u32,
+    context: usize,
+    callback: c::turso_scalar_function_ptr_t,
+    context_destructor: c::turso_context_destructor_t,
+    value_destructor: c::turso_value_destructor_t,
+    error_opt_out: *mut *const std::ffi::c_char,
+    register: impl FnOnce(
+        &str,
+        i32,
+        crate::udf::FunctionFlags,
+        crate::udf::ExtScalarPtrAdapter,
+    ) -> Result<(), rsapi::TursoError>,
+) -> c::turso_status_code_t {
+    let callback = match callback {
+        Some(callback) => {
+            std::mem::transmute::<CScalarPtrFunction, crate::udf::ScalarPtrFunction>(callback)
+        }
+        None => {
+            return unsafe {
+                rsapi::TursoError::Misuse("expected scalar callback, got null pointer".to_string())
+                    .to_capi(error_opt_out)
+            };
+        }
+    };
+    let value_destructor = value_destructor.map(|destructor| {
+        std::mem::transmute::<CValueDestructor, turso_ext::ValueDestructor>(destructor)
+    });
+    let name = match unsafe { str_from_c_str(name) } {
+        Ok(name) => name,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    let adapter = crate::udf::ExtScalarPtrAdapter::new(
+        context,
+        callback,
+        context_destructor,
+        value_destructor,
+    );
+    match register(
+        name,
+        argc,
+        crate::udf::FunctionFlags::from_bits_truncate(flags),
+        adapter,
+    ) {
+        Ok(()) => c::turso_status_code_t::TURSO_OK,
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
+    }
+}
+
+/// Out-parameter variant of [`turso_connection_register_scalar_function`], for
+/// FFIs that cannot receive a struct returned by value.
+///
+/// # Safety
+/// All pointers must be valid according to `turso.h`; callback function pointers must use the declared C ABI.
+#[no_mangle]
+#[signature(c)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn turso_connection_register_scalar_function_ptr(
+    connection: *const c::turso_connection_t,
+    name: *const std::ffi::c_char,
+    argc: i32,
+    flags: u32,
+    context: usize,
+    callback: c::turso_scalar_function_ptr_t,
+    context_destructor: c::turso_context_destructor_t,
+    value_destructor: c::turso_value_destructor_t,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    unsafe {
+        register_scalar_function_ptr_shared(
+            name,
+            argc,
+            flags,
+            context,
+            callback,
+            context_destructor,
+            value_destructor,
+            error_opt_out,
+            |name, argc, flags, adapter| {
+                connection.create_scalar_function(name, argc, flags, adapter)
+            },
+        )
+    }
+}
+
+/// Applies to connections opened after this call, not to ones already open.
+///
+/// # Safety
+/// All pointers must be valid according to `turso.h`; callback function pointers must use the declared C ABI.
+#[no_mangle]
+#[signature(c)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn turso_database_register_scalar_function_ptr(
+    database: *const c::turso_database_t,
+    name: *const std::ffi::c_char,
+    argc: i32,
+    flags: u32,
+    context: usize,
+    callback: c::turso_scalar_function_ptr_t,
+    context_destructor: c::turso_context_destructor_t,
+    value_destructor: c::turso_value_destructor_t,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let database = match unsafe { TursoDatabase::ref_from_capi(database) } {
+        Ok(database) => database,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    unsafe {
+        register_scalar_function_ptr_shared(
+            name,
+            argc,
+            flags,
+            context,
+            callback,
+            context_destructor,
+            value_destructor,
+            error_opt_out,
+            |name, argc, flags, adapter| {
+                database.create_scalar_function(name, argc, flags, adapter)
+            },
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn register_aggregate_function_ptr_shared(
+    name: *const std::ffi::c_char,
+    argc: i32,
+    flags: u32,
+    context: usize,
+    init: c::turso_aggregate_init_function_t,
+    step: c::turso_aggregate_step_function_ptr_t,
+    finalize: c::turso_aggregate_final_function_ptr_t,
+    value: c::turso_aggregate_value_function_ptr_t,
+    inverse: c::turso_aggregate_inverse_function_ptr_t,
+    context_destructor: c::turso_context_destructor_t,
+    aggregate_destructor: c::turso_context_destructor_t,
+    value_destructor: c::turso_value_destructor_t,
+    error_opt_out: *mut *const std::ffi::c_char,
+    register: impl FnOnce(
+        &str,
+        i32,
+        crate::udf::FunctionFlags,
+        crate::udf::ExtAggregatePtrAdapter,
+    ) -> Result<(), rsapi::TursoError>,
+) -> c::turso_status_code_t {
+    let (init, step, finalize) = match (init, step, finalize) {
+        (Some(init), Some(step), Some(finalize)) => (
+            std::mem::transmute::<CInitAggFunction, turso_ext::InitAggFunction>(init),
+            std::mem::transmute::<CStepPtrFunction, crate::udf::AggregateStepPtrFunction>(step),
+            std::mem::transmute::<CFinalizePtrFunction, crate::udf::AggregateFinalPtrFunction>(
+                finalize,
+            ),
+        ),
+        _ => {
+            return unsafe {
+                rsapi::TursoError::Misuse(
+                    "expected aggregate callbacks, got null pointer".to_string(),
+                )
+                .to_capi(error_opt_out)
+            };
+        }
+    };
+    let window = match (value, inverse) {
+        (Some(value), Some(inverse)) => Some((
+            std::mem::transmute::<CFinalizePtrFunction, crate::udf::AggregateValuePtrFunction>(
+                value,
+            ),
+            std::mem::transmute::<CStepPtrFunction, crate::udf::AggregateInversePtrFunction>(
+                inverse,
+            ),
+        )),
+        (None, None) => None,
+        _ => {
+            return unsafe {
+                rsapi::TursoError::Misuse(
+                    "window aggregate needs both value and inverse callbacks, or neither"
+                        .to_string(),
+                )
+                .to_capi(error_opt_out)
+            };
+        }
+    };
+    let value_destructor = value_destructor.map(|destructor| {
+        std::mem::transmute::<CValueDestructor, turso_ext::ValueDestructor>(destructor)
+    });
+    let name = match unsafe { str_from_c_str(name) } {
+        Ok(name) => name,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    let adapter = crate::udf::ExtAggregatePtrAdapter::new(
+        context,
+        init,
+        step,
+        finalize,
+        window,
+        context_destructor,
+        aggregate_destructor,
+        value_destructor,
+    );
+    match register(
+        name,
+        argc,
+        crate::udf::FunctionFlags::from_bits_truncate(flags),
+        adapter,
+    ) {
+        Ok(()) => c::turso_status_code_t::TURSO_OK,
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
+    }
+}
+
+/// Out-parameter variant of [`turso_connection_register_aggregate_function`].
+/// Pass both `value` and `inverse` for a window-capable aggregate, or neither.
+///
+/// # Safety
+/// All pointers must be valid according to `turso.h`; callback function pointers must use the declared C ABI.
+#[no_mangle]
+#[signature(c)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn turso_connection_register_aggregate_function_ptr(
+    connection: *const c::turso_connection_t,
+    name: *const std::ffi::c_char,
+    argc: i32,
+    flags: u32,
+    context: usize,
+    init: c::turso_aggregate_init_function_t,
+    step: c::turso_aggregate_step_function_ptr_t,
+    finalize: c::turso_aggregate_final_function_ptr_t,
+    value: c::turso_aggregate_value_function_ptr_t,
+    inverse: c::turso_aggregate_inverse_function_ptr_t,
+    context_destructor: c::turso_context_destructor_t,
+    aggregate_destructor: c::turso_context_destructor_t,
+    value_destructor: c::turso_value_destructor_t,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    unsafe {
+        register_aggregate_function_ptr_shared(
+            name,
+            argc,
+            flags,
+            context,
+            init,
+            step,
+            finalize,
+            value,
+            inverse,
+            context_destructor,
+            aggregate_destructor,
+            value_destructor,
+            error_opt_out,
+            |name, argc, flags, adapter| {
+                connection.create_aggregate_function(name, argc, flags, adapter)
+            },
+        )
+    }
+}
+
+/// Applies to connections opened after this call, not to ones already open.
+///
+/// # Safety
+/// All pointers must be valid according to `turso.h`; callback function pointers must use the declared C ABI.
+#[no_mangle]
+#[signature(c)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn turso_database_register_aggregate_function_ptr(
+    database: *const c::turso_database_t,
+    name: *const std::ffi::c_char,
+    argc: i32,
+    flags: u32,
+    context: usize,
+    init: c::turso_aggregate_init_function_t,
+    step: c::turso_aggregate_step_function_ptr_t,
+    finalize: c::turso_aggregate_final_function_ptr_t,
+    value: c::turso_aggregate_value_function_ptr_t,
+    inverse: c::turso_aggregate_inverse_function_ptr_t,
+    context_destructor: c::turso_context_destructor_t,
+    aggregate_destructor: c::turso_context_destructor_t,
+    value_destructor: c::turso_value_destructor_t,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let database = match unsafe { TursoDatabase::ref_from_capi(database) } {
+        Ok(database) => database,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    unsafe {
+        register_aggregate_function_ptr_shared(
+            name,
+            argc,
+            flags,
+            context,
+            init,
+            step,
+            finalize,
+            value,
+            inverse,
+            context_destructor,
+            aggregate_destructor,
+            value_destructor,
+            error_opt_out,
+            |name, argc, flags, adapter| {
+                database.create_aggregate_function(name, argc, flags, adapter)
+            },
+        )
+    }
+}
+
+/// Removes the function registered under `name` with exactly `argc` arguments.
+/// Only connections opened after this call stop seeing it. Removing a function
+/// that was never registered is not an error, matching SQLite.
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_database_remove_function(
+    database: *const c::turso_database_t,
+    name: *const std::ffi::c_char,
+    argc: i32,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let name = match unsafe { str_from_c_str(name) } {
+        Ok(name) => name,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    let database = match unsafe { TursoDatabase::ref_from_capi(database) } {
+        Ok(database) => database,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+
+    match database.remove_function(name, argc) {
         Ok(()) => c::turso_status_code_t::TURSO_OK,
         Err(err) => unsafe { err.to_capi(error_opt_out) },
     }
@@ -1048,8 +1740,12 @@ mod tests {
 
     use crate::capi::{
         c::{
-            self, turso_connection_deinit, turso_connection_prepare_single, turso_database_connect,
-            turso_database_deinit, turso_database_new, turso_database_open, turso_setup,
+            self, turso_connection_deinit, turso_connection_prepare_single,
+            turso_connection_register_aggregate_function_ptr,
+            turso_connection_register_scalar_function_ptr,
+            turso_connection_register_window_function, turso_database_connect,
+            turso_database_deinit, turso_database_new, turso_database_open,
+            turso_database_register_scalar_function_ptr, turso_setup,
             turso_statement_bind_positional_blob, turso_statement_bind_positional_double,
             turso_statement_bind_positional_int, turso_statement_bind_positional_null,
             turso_statement_bind_positional_text, turso_statement_column_count,
@@ -1762,5 +2458,593 @@ mod tests {
             turso_connection_deinit(connection);
             turso_database_deinit(db);
         }
+    }
+
+    unsafe extern "C" fn window_sum_init(_context: usize) -> *mut c::turso_agg_ctx_t {
+        let inner = Box::into_raw(Box::new(0i64)) as *mut std::ffi::c_void;
+        Box::into_raw(Box::new(c::turso_agg_ctx_t { state: inner }))
+    }
+
+    unsafe extern "C" fn window_sum_step(
+        _context: usize,
+        ctx: *mut c::turso_agg_ctx_t,
+        argc: i32,
+        argv: *const c::turso_value_t,
+    ) -> c::turso_value_t {
+        assert_eq!(argc, 1);
+        let n = unsafe { (*argv).value.int_value };
+        let state = unsafe { (*ctx).state as *mut i64 };
+        unsafe { *state += n };
+        integer_value(0)
+    }
+
+    unsafe extern "C" fn window_sum_inverse(
+        _context: usize,
+        ctx: *mut c::turso_agg_ctx_t,
+        argc: i32,
+        argv: *const c::turso_value_t,
+    ) -> c::turso_value_t {
+        assert_eq!(argc, 1);
+        let n = unsafe { (*argv).value.int_value };
+        let state = unsafe { (*ctx).state as *mut i64 };
+        unsafe { *state -= n };
+        integer_value(0)
+    }
+
+    unsafe extern "C" fn window_sum_value(
+        _context: usize,
+        ctx: *mut c::turso_agg_ctx_t,
+    ) -> c::turso_value_t {
+        let state = unsafe { (*ctx).state as *mut i64 };
+        integer_value(unsafe { *state })
+    }
+
+    unsafe extern "C" fn window_sum_finalize(
+        context: usize,
+        ctx: *mut c::turso_agg_ctx_t,
+    ) -> c::turso_value_t {
+        unsafe { window_sum_value(context, ctx) }
+    }
+
+    unsafe extern "C" fn window_sum_aggregate_destructor(state: usize) {
+        let ctx = state as *mut c::turso_agg_ctx_t;
+        unsafe {
+            drop(Box::from_raw((*ctx).state as *mut i64));
+            drop(Box::from_raw(ctx));
+        }
+    }
+
+    fn integer_value(n: i64) -> c::turso_value_t {
+        c::turso_value_t {
+            value_type: c::turso_extension_value_type_t_TURSO_EXTENSION_VALUE_INTEGER,
+            value: c::turso_extension_value_data_t { int_value: n },
+        }
+    }
+
+    #[test]
+    pub fn test_window_function_over_c_abi_moving_frame() {
+        unsafe {
+            let path = CString::new(":memory:").unwrap();
+            let config = c::turso_database_config_t {
+                path: path.as_ptr(),
+                ..Default::default()
+            };
+            let mut db = std::ptr::null();
+            assert_eq!(
+                turso_database_new(&config, &mut db, std::ptr::null_mut()),
+                turso_status_code_t::TURSO_OK
+            );
+            assert_eq!(
+                turso_database_open(db, std::ptr::null_mut()),
+                turso_status_code_t::TURSO_OK
+            );
+            let mut connection = std::ptr::null_mut();
+            assert_eq!(
+                turso_database_connect(db, &mut connection, std::ptr::null_mut()),
+                turso_status_code_t::TURSO_OK
+            );
+
+            let name = c"my_sum";
+            let status = turso_connection_register_window_function(
+                connection,
+                name.as_ptr(),
+                1,
+                0,
+                0,
+                Some(window_sum_init),
+                Some(window_sum_step),
+                Some(window_sum_finalize),
+                Some(window_sum_value),
+                Some(window_sum_inverse),
+                None,
+                Some(window_sum_aggregate_destructor),
+                None,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            let mut setup = std::ptr::null_mut();
+            let sql = c"CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)";
+            assert_eq!(
+                turso_connection_prepare_single(
+                    connection,
+                    sql.as_ptr(),
+                    &mut setup,
+                    std::ptr::null_mut()
+                ),
+                turso_status_code_t::TURSO_OK
+            );
+            assert_eq!(
+                turso_statement_execute(setup, std::ptr::null_mut(), std::ptr::null_mut()),
+                turso_status_code_t::TURSO_DONE
+            );
+            turso_statement_deinit(setup);
+
+            let mut insert = std::ptr::null_mut();
+            let sql = c"INSERT INTO t (id, n) VALUES (1, 10), (2, 20), (3, 30), (4, 40)";
+            assert_eq!(
+                turso_connection_prepare_single(
+                    connection,
+                    sql.as_ptr(),
+                    &mut insert,
+                    std::ptr::null_mut()
+                ),
+                turso_status_code_t::TURSO_OK
+            );
+            assert_eq!(
+                turso_statement_execute(insert, std::ptr::null_mut(), std::ptr::null_mut()),
+                turso_status_code_t::TURSO_DONE
+            );
+            turso_statement_deinit(insert);
+
+            let mut statement = std::ptr::null_mut();
+            let sql = c"SELECT my_sum(n) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY id";
+            assert_eq!(
+                turso_connection_prepare_single(
+                    connection,
+                    sql.as_ptr(),
+                    &mut statement,
+                    std::ptr::null_mut()
+                ),
+                turso_status_code_t::TURSO_OK
+            );
+
+            let mut collected = Vec::new();
+            loop {
+                let status = turso_statement_step(statement, std::ptr::null_mut());
+                if status == turso_status_code_t::TURSO_IO {
+                    assert_eq!(
+                        turso_statement_run_io(statement, std::ptr::null_mut()),
+                        turso_status_code_t::TURSO_OK
+                    );
+                    continue;
+                }
+                if status == turso_status_code_t::TURSO_DONE {
+                    break;
+                }
+                assert_eq!(status, turso_status_code_t::TURSO_ROW);
+                collected.push(value_from_c_value(statement, 0));
+            }
+
+            turso_statement_deinit(statement);
+            turso_connection_deinit(connection);
+            turso_database_deinit(db);
+
+            assert_eq!(
+                collected,
+                vec![
+                    turso_core::Value::from_i64(10),
+                    turso_core::Value::from_i64(30),
+                    turso_core::Value::from_i64(50),
+                    turso_core::Value::from_i64(70),
+                ]
+            );
+        }
+    }
+
+    fn ptr_text_value(s: &str) -> c::turso_value_t {
+        let bytes = s.as_bytes().to_vec().into_boxed_slice();
+        let len = bytes.len();
+        let text = Box::into_raw(Box::new(c::turso_extension_text_t {
+            subtype: c::turso_extension_text_subtype_t_TURSO_EXTENSION_TEXT_TEXT,
+            text: Box::into_raw(bytes) as *const u8,
+            len: len as u32,
+        }));
+        c::turso_value_t {
+            value_type: c::turso_extension_value_type_t_TURSO_EXTENSION_VALUE_TEXT,
+            value: c::turso_extension_value_data_t { text },
+        }
+    }
+
+    unsafe extern "C" fn ptr_value_destructor(result: *mut c::turso_value_t) {
+        let result = unsafe { &mut *result };
+        if result.value_type != c::turso_extension_value_type_t_TURSO_EXTENSION_VALUE_TEXT {
+            return;
+        }
+        let text = unsafe { result.value.text } as *mut c::turso_extension_text_t;
+        result.value_type = c::turso_extension_value_type_t_TURSO_EXTENSION_VALUE_NULL;
+        if text.is_null() {
+            return;
+        }
+        let text = unsafe { Box::from_raw(text) };
+        if !text.text.is_null() {
+            let bytes = std::ptr::slice_from_raw_parts_mut(text.text as *mut u8, text.len as usize);
+            drop(unsafe { Box::from_raw(bytes) });
+        }
+    }
+
+    unsafe extern "C" fn ptr_shout(
+        context: usize,
+        argc: i32,
+        argv: *const c::turso_value_t,
+        result: *mut c::turso_value_t,
+    ) {
+        assert_eq!(context, 7);
+        assert_eq!(argc, 1);
+        let text = unsafe { &*(*argv).value.text };
+        let arg = unsafe { std::slice::from_raw_parts(text.text, text.len as usize) };
+        let arg = std::str::from_utf8(arg).unwrap();
+        unsafe { *result = ptr_text_value(&arg.to_uppercase()) };
+    }
+
+    #[test]
+    pub fn test_scalar_function_ptr_over_c_abi() {
+        unsafe {
+            let (db, connection) = open_memory_connection();
+
+            assert_eq!(
+                turso_connection_register_scalar_function_ptr(
+                    connection,
+                    c"shout".as_ptr(),
+                    1,
+                    0x800,
+                    7,
+                    Some(ptr_shout),
+                    None,
+                    Some(ptr_value_destructor),
+                    std::ptr::null_mut(),
+                ),
+                turso_status_code_t::TURSO_OK
+            );
+
+            assert_eq!(
+                query_one_column(connection, c"SELECT shout('hi'), shout('there')"),
+                vec![
+                    turso_core::Value::Text(Text::new("HI")),
+                    turso_core::Value::Text(Text::new("THERE")),
+                ]
+            );
+
+            turso_connection_deinit(connection);
+            turso_database_deinit(db);
+        }
+    }
+
+    #[test]
+    pub fn test_database_scalar_function_ptr_over_c_abi() {
+        unsafe {
+            let (db, before) = open_memory_connection();
+
+            assert_eq!(
+                turso_database_register_scalar_function_ptr(
+                    db,
+                    c"shout".as_ptr(),
+                    1,
+                    0x800,
+                    7,
+                    Some(ptr_shout),
+                    None,
+                    Some(ptr_value_destructor),
+                    std::ptr::null_mut(),
+                ),
+                turso_status_code_t::TURSO_OK
+            );
+
+            let mut statement = std::ptr::null_mut();
+            let sql = c"SELECT shout('hi')";
+            assert_eq!(
+                turso_connection_prepare_single(
+                    before,
+                    sql.as_ptr(),
+                    &mut statement,
+                    std::ptr::null_mut(),
+                ),
+                turso_status_code_t::TURSO_ERROR
+            );
+
+            let mut after = std::ptr::null_mut();
+            assert_eq!(
+                turso_database_connect(db, &mut after, std::ptr::null_mut()),
+                turso_status_code_t::TURSO_OK
+            );
+            assert_eq!(
+                query_one_column(after, c"SELECT shout('hi'), shout('there')"),
+                vec![
+                    turso_core::Value::Text(Text::new("HI")),
+                    turso_core::Value::Text(Text::new("THERE")),
+                ]
+            );
+
+            turso_connection_deinit(before);
+            turso_connection_deinit(after);
+            turso_database_deinit(db);
+        }
+    }
+
+    unsafe extern "C" fn ptr_concat_init(_context: usize) -> *mut c::turso_agg_ctx_t {
+        let inner = Box::into_raw(Box::new(String::new())) as *mut std::ffi::c_void;
+        Box::into_raw(Box::new(c::turso_agg_ctx_t { state: inner }))
+    }
+
+    unsafe extern "C" fn ptr_concat_step(
+        _context: usize,
+        ctx: *mut c::turso_agg_ctx_t,
+        argc: i32,
+        argv: *const c::turso_value_t,
+        _result: *mut c::turso_value_t,
+    ) {
+        assert_eq!(argc, 1);
+        let n = unsafe { (*argv).value.int_value };
+        let state = unsafe { &mut *((*ctx).state as *mut String) };
+        if !state.is_empty() {
+            state.push('-');
+        }
+        state.push_str(&n.to_string());
+    }
+
+    unsafe extern "C" fn ptr_concat_finalize(
+        _context: usize,
+        ctx: *mut c::turso_agg_ctx_t,
+        result: *mut c::turso_value_t,
+    ) {
+        let state = unsafe { &*((*ctx).state as *mut String) };
+        unsafe { *result = ptr_text_value(state) };
+    }
+
+    unsafe extern "C" fn ptr_concat_aggregate_destructor(state: usize) {
+        let ctx = state as *mut c::turso_agg_ctx_t;
+        unsafe {
+            drop(Box::from_raw((*ctx).state as *mut String));
+            drop(Box::from_raw(ctx));
+        }
+    }
+
+    #[test]
+    pub fn test_aggregate_function_ptr_over_c_abi() {
+        unsafe {
+            let (db, connection) = open_memory_connection();
+
+            assert_eq!(
+                turso_connection_register_aggregate_function_ptr(
+                    connection,
+                    c"dashcat".as_ptr(),
+                    1,
+                    0,
+                    0,
+                    Some(ptr_concat_init),
+                    Some(ptr_concat_step),
+                    Some(ptr_concat_finalize),
+                    None,
+                    None,
+                    None,
+                    Some(ptr_concat_aggregate_destructor),
+                    Some(ptr_value_destructor),
+                    std::ptr::null_mut(),
+                ),
+                turso_status_code_t::TURSO_OK
+            );
+
+            execute(connection, c"CREATE TABLE t (g INTEGER, n INTEGER)");
+            execute(
+                connection,
+                c"INSERT INTO t VALUES (1, 10), (1, 20), (2, 30), (2, 40), (2, 50)",
+            );
+
+            assert_eq!(
+                query_one_column(
+                    connection,
+                    c"SELECT dashcat(n) FROM t GROUP BY g ORDER BY g"
+                ),
+                vec![
+                    turso_core::Value::Text(Text::new("10-20")),
+                    turso_core::Value::Text(Text::new("30-40-50")),
+                ]
+            );
+
+            turso_connection_deinit(connection);
+            turso_database_deinit(db);
+        }
+    }
+
+    unsafe extern "C" fn ptr_sum_init(_context: usize) -> *mut c::turso_agg_ctx_t {
+        let inner = Box::into_raw(Box::new(0i64)) as *mut std::ffi::c_void;
+        Box::into_raw(Box::new(c::turso_agg_ctx_t { state: inner }))
+    }
+
+    unsafe extern "C" fn ptr_sum_step(
+        _context: usize,
+        ctx: *mut c::turso_agg_ctx_t,
+        argc: i32,
+        argv: *const c::turso_value_t,
+        _result: *mut c::turso_value_t,
+    ) {
+        assert_eq!(argc, 1);
+        let n = unsafe { (*argv).value.int_value };
+        let state = unsafe { (*ctx).state as *mut i64 };
+        unsafe { *state += n };
+    }
+
+    unsafe extern "C" fn ptr_sum_inverse(
+        _context: usize,
+        ctx: *mut c::turso_agg_ctx_t,
+        argc: i32,
+        argv: *const c::turso_value_t,
+        _result: *mut c::turso_value_t,
+    ) {
+        assert_eq!(argc, 1);
+        let n = unsafe { (*argv).value.int_value };
+        let state = unsafe { (*ctx).state as *mut i64 };
+        unsafe { *state -= n };
+    }
+
+    unsafe extern "C" fn ptr_sum_value(
+        _context: usize,
+        ctx: *mut c::turso_agg_ctx_t,
+        result: *mut c::turso_value_t,
+    ) {
+        let state = unsafe { (*ctx).state as *mut i64 };
+        unsafe { *result = integer_value(*state) };
+    }
+
+    unsafe extern "C" fn ptr_sum_finalize(
+        context: usize,
+        ctx: *mut c::turso_agg_ctx_t,
+        result: *mut c::turso_value_t,
+    ) {
+        unsafe { ptr_sum_value(context, ctx, result) };
+    }
+
+    unsafe extern "C" fn ptr_sum_aggregate_destructor(state: usize) {
+        let ctx = state as *mut c::turso_agg_ctx_t;
+        unsafe {
+            drop(Box::from_raw((*ctx).state as *mut i64));
+            drop(Box::from_raw(ctx));
+        }
+    }
+
+    #[test]
+    pub fn test_window_function_ptr_over_c_abi_moving_frame() {
+        unsafe {
+            let (db, connection) = open_memory_connection();
+
+            assert_eq!(
+                turso_connection_register_aggregate_function_ptr(
+                    connection,
+                    c"my_sum".as_ptr(),
+                    1,
+                    0,
+                    0,
+                    Some(ptr_sum_init),
+                    Some(ptr_sum_step),
+                    Some(ptr_sum_finalize),
+                    Some(ptr_sum_value),
+                    Some(ptr_sum_inverse),
+                    None,
+                    Some(ptr_sum_aggregate_destructor),
+                    None,
+                    std::ptr::null_mut(),
+                ),
+                turso_status_code_t::TURSO_OK
+            );
+
+            execute(
+                connection,
+                c"CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)",
+            );
+            execute(
+                connection,
+                c"INSERT INTO t (id, n) VALUES (1, 10), (2, 20), (3, 30), (4, 40)",
+            );
+
+            assert_eq!(
+                query_one_column(
+                    connection,
+                    c"SELECT my_sum(n) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY id"
+                ),
+                vec![
+                    turso_core::Value::from_i64(10),
+                    turso_core::Value::from_i64(30),
+                    turso_core::Value::from_i64(50),
+                    turso_core::Value::from_i64(70),
+                ]
+            );
+
+            turso_connection_deinit(connection);
+            turso_database_deinit(db);
+        }
+    }
+
+    unsafe fn open_memory_connection() -> (*const c::turso_database_t, *mut c::turso_connection_t) {
+        let path = CString::new(":memory:").unwrap();
+        let config = c::turso_database_config_t {
+            path: path.as_ptr(),
+            ..Default::default()
+        };
+        let mut db = std::ptr::null();
+        assert_eq!(
+            unsafe { turso_database_new(&config, &mut db, std::ptr::null_mut()) },
+            turso_status_code_t::TURSO_OK
+        );
+        assert_eq!(
+            unsafe { turso_database_open(db, std::ptr::null_mut()) },
+            turso_status_code_t::TURSO_OK
+        );
+        let mut connection = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { turso_database_connect(db, &mut connection, std::ptr::null_mut()) },
+            turso_status_code_t::TURSO_OK
+        );
+        (db, connection)
+    }
+
+    unsafe fn execute(connection: *mut c::turso_connection_t, sql: &CStr) {
+        let mut statement = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                turso_connection_prepare_single(
+                    connection,
+                    sql.as_ptr(),
+                    &mut statement,
+                    std::ptr::null_mut(),
+                )
+            },
+            turso_status_code_t::TURSO_OK
+        );
+        assert_eq!(
+            unsafe {
+                turso_statement_execute(statement, std::ptr::null_mut(), std::ptr::null_mut())
+            },
+            turso_status_code_t::TURSO_DONE
+        );
+        unsafe { turso_statement_deinit(statement) };
+    }
+
+    unsafe fn query_one_column(
+        connection: *mut c::turso_connection_t,
+        sql: &CStr,
+    ) -> Vec<turso_core::Value> {
+        let mut statement = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                turso_connection_prepare_single(
+                    connection,
+                    sql.as_ptr(),
+                    &mut statement,
+                    std::ptr::null_mut(),
+                )
+            },
+            turso_status_code_t::TURSO_OK
+        );
+        let mut collected = Vec::new();
+        loop {
+            let status = unsafe { turso_statement_step(statement, std::ptr::null_mut()) };
+            if status == turso_status_code_t::TURSO_IO {
+                assert_eq!(
+                    unsafe { turso_statement_run_io(statement, std::ptr::null_mut()) },
+                    turso_status_code_t::TURSO_OK
+                );
+                continue;
+            }
+            if status == turso_status_code_t::TURSO_DONE {
+                break;
+            }
+            assert_eq!(status, turso_status_code_t::TURSO_ROW);
+            let columns = unsafe { turso_statement_column_count(statement) };
+            for column in 0..columns {
+                collected.push(value_from_c_value(statement, column as usize));
+            }
+        }
+        unsafe { turso_statement_deinit(statement) };
+        collected
     }
 }

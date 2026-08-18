@@ -51,6 +51,50 @@ print(rows)  # [(1, 'alice'), (2, 'bob')]
 conn.close()
 ```
 
+## User-defined functions
+
+Register Python callables as SQL functions, the same way `sqlite3` does:
+
+```python
+import turso
+
+conn = turso.connect(":memory:")
+
+# Scalar function. narg=-1 accepts any number of arguments; deterministic=True
+# tells the engine the answer only depends on the arguments, which is what
+# lets the function be used in index expressions.
+conn.create_function("shout", 1, lambda s: s.upper(), deterministic=True)
+print(conn.execute("SELECT shout('hi')").fetchone())  # ('HI',)
+
+# Aggregate function: one instance per group, one step() per row.
+class Median:
+    def __init__(self):
+        self.values = []
+
+    def step(self, value):
+        self.values.append(value)
+
+    def finalize(self):
+        self.values.sort()
+        return self.values[len(self.values) // 2]
+
+conn.create_aggregate("median", 1, Median)
+
+conn.execute("CREATE TABLE t (x)")
+conn.executemany("INSERT INTO t VALUES (?)", [(1,), (5,), (3,)])
+print(conn.execute("SELECT median(x) FROM t").fetchone())  # (3,)
+
+conn.close()
+```
+
+An aggregate that also has `value()` and `inverse()` can be registered with
+`create_window_function(name, num_params, cls)` and used with `OVER (...)`.
+Passing `None` instead of the callable or class removes the function again.
+
+Values map to Python as `NULL`/`INTEGER`/`REAL`/`TEXT`/`BLOB` &harr;
+`None`/`int`/`float`/`str`/`bytes`. An exception raised inside a callback
+fails the statement with `OperationalError`, like `sqlite3`.
+
 ## Database driver (asyncio)
 
 Non-blocking access with asyncio:

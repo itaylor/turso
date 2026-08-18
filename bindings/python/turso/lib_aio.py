@@ -128,6 +128,25 @@ class Connection:
     async def rollback(self) -> None:
         await self._run(lambda: self._conn.rollback())  # type: ignore[union-attr]
 
+    # The callables run in the worker thread, where the engine runs.
+    async def create_function(
+        self,
+        name: str,
+        narg: int,
+        func: Optional[Callable[..., Any]],
+        *,
+        deterministic: bool = False,
+    ) -> None:
+        await self._run(
+            lambda: self._conn.create_function(name, narg, func, deterministic=deterministic)  # type: ignore[union-attr]
+        )
+
+    async def create_aggregate(self, name: str, n_arg: int, aggregate_class: Optional[type]) -> None:
+        await self._run(lambda: self._conn.create_aggregate(name, n_arg, aggregate_class))  # type: ignore[union-attr]
+
+    async def create_window_function(self, name: str, num_params: int, aggregate_class: Optional[type]) -> None:
+        await self._run(lambda: self._conn.create_window_function(name, num_params, aggregate_class))  # type: ignore[union-attr]
+
     # Read/write properties mirrored to the underlying blocking connection.
     # DB-API hints:
     # - isolation_level controls implicit transactions (BEGIN DEFERRED/IMMEDIATE/EXCLUSIVE or None for autocommit).

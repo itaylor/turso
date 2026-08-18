@@ -242,6 +242,61 @@ impl Connection {
         conn.set_busy_timeout(duration);
         Ok(())
     }
+
+    /// Replaces any existing function with the same name and argument count,
+    /// matching SQLite's `sqlite3_create_function`. See
+    /// [`crate::udf::ScalarFunction`] for an example.
+    pub fn create_scalar_function(
+        &self,
+        name: &str,
+        argc: i32,
+        flags: crate::udf::FunctionFlags,
+        f: impl crate::udf::ScalarFunction + 'static,
+    ) -> Result<()> {
+        let conn = self.get_inner_connection()?;
+        conn.create_scalar_function(name, argc, flags, crate::udf::ScalarAdapter(f))?;
+        Ok(())
+    }
+
+    /// Usable with `OVER (...)` when the implementation's `supports_window()`
+    /// returns true. Replaces any existing function with the same name and
+    /// argument count, matching SQLite's `sqlite3_create_function`. See
+    /// [`crate::udf::AggregateFunction`] for an example.
+    pub fn create_aggregate_function(
+        &self,
+        name: &str,
+        argc: i32,
+        flags: crate::udf::FunctionFlags,
+        f: impl crate::udf::AggregateFunction + 'static,
+    ) -> Result<()> {
+        let conn = self.get_inner_connection()?;
+        conn.create_aggregate_function(name, argc, flags, crate::udf::AggregateAdapter(f))?;
+        Ok(())
+    }
+
+    /// Removes only the `argc`-argument overload. Removing a function that was
+    /// never registered is not an error, matching SQLite.
+    ///
+    /// ```rust,no_run
+    /// use turso::udf::FunctionFlags;
+    /// use turso::{Builder, Value, ValueRef};
+    ///
+    /// # async fn run() -> turso::Result<()> {
+    /// let db = Builder::new_local(":memory:").build().await?;
+    /// let conn = db.connect()?;
+    /// conn.create_scalar_function("one", 0, FunctionFlags::empty(), |_: &[ValueRef<'_>]| {
+    ///     Ok(Value::Integer(1))
+    /// })?;
+    /// conn.remove_function("one", 0)?;
+    /// assert!(conn.query("SELECT one()", ()).await.is_err());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn remove_function(&self, name: &str, argc: i32) -> Result<()> {
+        let conn = self.get_inner_connection()?;
+        conn.remove_function(name, argc)?;
+        Ok(())
+    }
 }
 
 impl Debug for Connection {

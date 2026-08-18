@@ -1,5 +1,6 @@
 pub mod turso;
 pub mod turso_sync;
+pub mod udf;
 
 // TODO: audit thread-safety of wrapped types and Python::attach() usage before removing gil_used
 #[pyo3::pymodule(gil_used = true)]

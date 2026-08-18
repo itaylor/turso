@@ -139,6 +139,71 @@ public final class TursoConnection {
 
   private native long prepareUtf8(long connectionPtr, byte[] sqlUtf8) throws SQLException;
 
+  /**
+   * Visible only to this connection. {@code nArgs} is -1 for any number of arguments, and an
+   * existing registration with the same name and argument count is replaced.
+   */
+  public void createFunction(String name, int nArgs, int flags, ScalarFunction function)
+      throws SQLException {
+    checkOpen();
+    if (function == null) {
+      throw new SQLException("function must not be null");
+    }
+    createScalarFunctionUtf8(connectionPtr, functionNameBytes(name), nArgs, flags, function);
+  }
+
+  /** Cannot be used with {@code OVER}; use {@link #createWindowFunction} for that. */
+  public void createAggregate(String name, int nArgs, int flags, Aggregate<?> aggregate)
+      throws SQLException {
+    checkOpen();
+    if (aggregate == null) {
+      throw new SQLException("aggregate must not be null");
+    }
+    createAggregateFunctionUtf8(
+        connectionPtr, functionNameBytes(name), nArgs, flags, aggregate, false);
+  }
+
+  /** Usable both with {@code OVER} and as an ordinary aggregate. */
+  public void createWindowFunction(String name, int nArgs, int flags, WindowFunction<?> function)
+      throws SQLException {
+    checkOpen();
+    if (function == null) {
+      throw new SQLException("function must not be null");
+    }
+    createAggregateFunctionUtf8(
+        connectionPtr, functionNameBytes(name), nArgs, flags, function, true);
+  }
+
+  /** Removing a function that was never registered does nothing. */
+  public void removeFunction(String name, int nArgs) throws SQLException {
+    checkOpen();
+    removeFunctionUtf8(connectionPtr, functionNameBytes(name), nArgs);
+  }
+
+  private static byte[] functionNameBytes(String name) throws SQLException {
+    byte[] nameBytes = stringToUtf8ByteArray(name);
+    if (nameBytes == null) {
+      throw new SQLException("Failed to convert function name " + name + " into bytes");
+    }
+    return nameBytes;
+  }
+
+  private native void createScalarFunctionUtf8(
+      long connectionPtr, byte[] nameUtf8, int nArgs, int flags, ScalarFunction function)
+      throws SQLException;
+
+  private native void createAggregateFunctionUtf8(
+      long connectionPtr,
+      byte[] nameUtf8,
+      int nArgs,
+      int flags,
+      Aggregate<?> aggregate,
+      boolean window)
+      throws SQLException;
+
+  private native void removeFunctionUtf8(long connectionPtr, byte[] nameUtf8, int nArgs)
+      throws SQLException;
+
   // TODO: check whether this is still valid for turso
   /**
    * Checks whether the type, concurrency, and holdability settings for a {@link ResultSet} are

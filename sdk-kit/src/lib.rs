@@ -7,6 +7,7 @@ use crate::rsapi::TursoError;
 
 pub mod capi;
 pub mod rsapi;
+pub mod udf;
 
 #[macro_export]
 macro_rules! assert_send {

@@ -42,6 +42,8 @@ public partial class SqliteConnection
         {
             if (handle.Target is AggregateFunctionRegistration aggregate)
                 aggregate.FreeInvocations();
+            if (handle.Target is WindowFunctionRegistration window)
+                window.FreeInvocations();
             if (handle.IsAllocated)
                 handle.Free();
         }

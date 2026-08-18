@@ -1800,3 +1800,421 @@ def test_fts_highlight_wraps_matched_terms():
     cur.execute("SELECT fts_highlight(body, '<b>', '</b>', 'rust') FROM articles WHERE fts_match(title, body, 'rust')")
     assert cur.fetchall() == [("Turso is a SQLite rewrite in <b>Rust</b>",)]
     conn.close()
+
+
+# --- User-defined functions -------------------------------------------------
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_create_function_scalar(provider):
+    conn = connect(provider, ":memory:")
+    conn.create_function("addone", 1, lambda x: x + 1)
+    conn.create_function("joinall", -1, lambda *args: ",".join(str(a) for a in args))
+    conn.create_function("shout", 1, lambda s: s.upper(), deterministic=True)
+
+    cur = conn.cursor()
+    cur.execute("SELECT addone(41), joinall(1, 'a', 2.5), shout('hi')")
+    assert cur.fetchone() == (42, "1,a,2.5", "HI")
+
+    cur.execute("SELECT joinall(NULL, 1, 1.5, 'x', X'6162')")
+    assert cur.fetchone() == ("None,1,1.5,x,b'ab'",)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_create_function_return_types(provider):
+    conn = connect(provider, ":memory:")
+    values = {"null": None, "int": 7, "float": 1.5, "text": "t", "blob": b"ab"}
+    conn.create_function("give", 1, lambda kind: values[kind])
+
+    cur = conn.cursor()
+    cur.execute("SELECT give('null'), give('int'), give('float'), give('text'), give('blob')")
+    assert cur.fetchone() == (None, 7, 1.5, "t", b"ab")
+    cur.execute("SELECT typeof(give('null')), typeof(give('int')), typeof(give('float')), typeof(give('blob'))")
+    assert cur.fetchone() == ("null", "integer", "real", "blob")
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_int_too_large_for_sqlite_is_rejected(provider):
+    conn = connect(provider, ":memory:")
+    with pytest.raises(OverflowError):
+        conn.execute("SELECT ?", (2**70,))
+
+    conn.create_function("big", 0, lambda: 2**70)
+    cur = conn.cursor()
+    with pytest.raises(conn.OperationalError) as excinfo:
+        cur.execute("SELECT big()")
+        cur.fetchall()
+    assert str(excinfo.value) == "user-defined function raised exception"
+    conn.close()
+
+
+def test_raising_function_keeps_the_original_exception_as_cause():
+    conn = connect("turso", ":memory:")
+
+    def boom(x):
+        raise ValueError(f"inner {x}")
+
+    conn.create_function("boom", 1, boom)
+    with pytest.raises(conn.OperationalError) as excinfo:
+        conn.execute("SELECT boom(7)").fetchall()
+    assert str(excinfo.value) == "user-defined function raised exception"
+    assert isinstance(excinfo.value.__cause__, ValueError)
+    assert str(excinfo.value.__cause__) == "inner 7"
+
+    # A later, unrelated error does not carry a stale cause.
+    with pytest.raises(conn.DatabaseError) as excinfo:
+        conn.execute("SELECT no_such_fn(1)").fetchall()
+    assert excinfo.value.__cause__ is None
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_create_function_reads_and_writes_blobs(provider):
+    conn = connect(provider, ":memory:")
+    conn.create_function("flip", 1, lambda b: bytes(reversed(b)))
+
+    cur = conn.cursor()
+    cur.execute("SELECT flip(X'010203')")
+    assert cur.fetchone() == (b"\x03\x02\x01",)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_create_function_wrong_argument_count_is_rejected(provider):
+    conn = connect(provider, ":memory:")
+    conn.create_function("addone", 1, lambda x: x + 1)
+
+    cur = conn.cursor()
+    with pytest.raises(conn.DatabaseError) as excinfo:
+        cur.execute("SELECT addone(1, 2)")
+    assert "wrong number of arguments" in str(excinfo.value)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_create_function_exception_fails_the_statement(provider):
+    conn = connect(provider, ":memory:")
+    conn.create_function("boom", 0, lambda: 1 / 0)
+
+    cur = conn.cursor()
+    with pytest.raises(conn.OperationalError) as excinfo:
+        # sqlite3 fails in execute(), Turso when the row is pulled.
+        cur.execute("SELECT boom()")
+        cur.fetchall()
+    assert str(excinfo.value) == "user-defined function raised exception"
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_create_function_unsupported_return_type_fails_the_statement(provider):
+    conn = connect(provider, ":memory:")
+    conn.create_function("give_list", 0, lambda: [1, 2, 3])
+
+    cur = conn.cursor()
+    with pytest.raises(conn.OperationalError) as excinfo:
+        cur.execute("SELECT give_list()")
+        cur.fetchall()
+    assert str(excinfo.value) == "user-defined function raised exception"
+    conn.close()
+
+
+def test_create_function_rejects_non_callable():
+    # Turso rejects a non-callable at registration; older sqlite3 does not.
+    conn = turso.connect(":memory:")
+    with pytest.raises(TypeError):
+        conn.create_function("nope", 1, 5)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_create_function_rejects_bad_argument_count(provider):
+    conn = connect(provider, ":memory:")
+    # The messages differ between providers, the exception type does not.
+    with pytest.raises(conn.OperationalError):
+        conn.create_function("f", -2, lambda *args: 1)
+    with pytest.raises(conn.OperationalError):
+        conn.create_function("f", 1001, lambda *args: 1)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_create_function_deterministic_is_required_for_index_expressions(provider):
+    conn = connect(provider, ":memory:")
+    conn.create_function("shout", 1, lambda s: s.upper(), deterministic=True)
+    conn.create_function("whisper", 1, lambda s: s.lower())
+
+    conn.execute("CREATE TABLE t (x TEXT)")
+    conn.execute("CREATE INDEX i_shout ON t (shout(x))")
+    with pytest.raises(conn.DatabaseError) as excinfo:
+        conn.execute("CREATE INDEX i_whisper ON t (whisper(x))")
+    assert "non-deterministic functions prohibited in index expressions" in str(excinfo.value)
+    conn.close()
+
+
+def test_create_function_none_removes_the_function():
+    # Turso-only: sqlite3 only removes functions this way in newer CPython.
+    conn = turso.connect(":memory:")
+    conn.create_function("addone", 1, lambda x: x + 1)
+    assert conn.execute("SELECT addone(1)").fetchone() == (2,)
+
+    conn.create_function("addone", 1, None)
+    with pytest.raises(conn.DatabaseError) as excinfo:
+        conn.execute("SELECT addone(1)")
+    assert "no such function: addone" in str(excinfo.value)
+
+    # Removing a function that was never registered is not an error.
+    conn.create_function("never_registered", 1, None)
+    conn.close()
+
+
+def test_create_function_replaces_an_earlier_registration():
+    conn = turso.connect(":memory:")
+    conn.create_function("f", 1, lambda x: x + 1)
+    conn.create_function("f", 1, lambda x: x + 100)
+    assert conn.execute("SELECT f(1)").fetchone() == (101,)
+    conn.close()
+
+
+def test_create_function_runs_sql_on_the_same_connection():
+    conn = turso.connect(":memory:")
+    conn.execute("CREATE TABLE t (x)")
+    for value in (1, 2, 3):
+        conn.execute("INSERT INTO t VALUES (?)", (value,))
+    conn.commit()
+
+    def count_up_to(value):
+        return conn.execute("SELECT count(*) FROM t WHERE x <= ?", (value,)).fetchone()[0]
+
+    conn.create_function("count_up_to", 1, count_up_to)
+    assert conn.execute("SELECT x, count_up_to(x) FROM t ORDER BY x").fetchall() == [(1, 1), (2, 2), (3, 3)]
+    conn.close()
+
+
+class _Concat:
+    def __init__(self):
+        self.parts = []
+
+    def step(self, value):
+        self.parts.append(str(value))
+
+    def finalize(self):
+        return "|".join(self.parts)
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_create_aggregate_with_group_by(provider):
+    conn = connect(provider, ":memory:")
+    conn.create_aggregate("glue", 1, _Concat)
+    conn.execute("CREATE TABLE t (g TEXT, x TEXT)")
+    for group, value in (("a", "1"), ("a", "2"), ("b", "3")):
+        conn.execute("INSERT INTO t VALUES (?, ?)", (group, value))
+
+    rows = conn.execute("SELECT g, glue(x) FROM t GROUP BY g ORDER BY g").fetchall()
+    assert rows == [("a", "1|2"), ("b", "3")]
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_create_aggregate_over_no_rows_is_null(provider):
+    conn = connect(provider, ":memory:")
+    conn.create_aggregate("glue", 1, _Concat)
+    conn.execute("CREATE TABLE t (x TEXT)")
+
+    assert conn.execute("SELECT glue(x) FROM t").fetchall() == [(None,)]
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_create_aggregate_init_error(provider):
+    class BadInit:
+        def __init__(self):
+            raise ValueError("no")
+
+        def step(self, value):
+            pass
+
+        def finalize(self):
+            return 1
+
+    conn = connect(provider, ":memory:")
+    conn.create_aggregate("bad", 1, BadInit)
+    conn.execute("CREATE TABLE t (x)")
+    conn.execute("INSERT INTO t VALUES (1)")
+
+    with pytest.raises(conn.OperationalError) as excinfo:
+        conn.execute("SELECT bad(x) FROM t").fetchall()
+    assert str(excinfo.value) == "user-defined aggregate's '__init__' method raised error"
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_create_aggregate_step_error(provider):
+    class BadStep(_Concat):
+        def step(self, value):
+            raise ValueError("no")
+
+    conn = connect(provider, ":memory:")
+    conn.create_aggregate("bad", 1, BadStep)
+    conn.execute("CREATE TABLE t (x)")
+    conn.execute("INSERT INTO t VALUES (1)")
+
+    with pytest.raises(conn.OperationalError) as excinfo:
+        conn.execute("SELECT bad(x) FROM t").fetchall()
+    assert str(excinfo.value) == "user-defined aggregate's 'step' method raised error"
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_create_aggregate_finalize_error(provider):
+    class BadFinalize(_Concat):
+        def finalize(self):
+            raise ValueError("no")
+
+    conn = connect(provider, ":memory:")
+    conn.create_aggregate("bad", 1, BadFinalize)
+    conn.execute("CREATE TABLE t (x)")
+    conn.execute("INSERT INTO t VALUES (1)")
+
+    with pytest.raises(conn.OperationalError) as excinfo:
+        conn.execute("SELECT bad(x) FROM t").fetchall()
+    assert str(excinfo.value) == "user-defined aggregate's 'finalize' method raised error"
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_create_aggregate_without_window_support_rejected_by_over(provider):
+    conn = connect(provider, ":memory:")
+    conn.create_aggregate("glue", 1, _Concat)
+    conn.execute("CREATE TABLE t (x TEXT)")
+    conn.execute("INSERT INTO t VALUES ('a')")
+
+    with pytest.raises(conn.DatabaseError) as excinfo:
+        conn.execute("SELECT glue(x) OVER () FROM t").fetchall()
+    assert "may not be used as a window function" in str(excinfo.value)
+    conn.close()
+
+
+def test_create_aggregate_none_removes_the_function():
+    conn = turso.connect(":memory:")
+    conn.create_aggregate("glue", 1, _Concat)
+    conn.execute("CREATE TABLE t (x TEXT)")
+    conn.execute("INSERT INTO t VALUES ('a')")
+    assert conn.execute("SELECT glue(x) FROM t").fetchall() == [("a",)]
+
+    conn.create_aggregate("glue", 1, None)
+    with pytest.raises(conn.DatabaseError) as excinfo:
+        conn.execute("SELECT glue(x) FROM t").fetchall()
+    assert "no such function: glue" in str(excinfo.value)
+    conn.close()
+
+
+class _WindowSum:
+    def __init__(self):
+        self.total = 0
+
+    def step(self, value):
+        self.total += value
+
+    def inverse(self, value):
+        self.total -= value
+
+    def value(self):
+        return self.total
+
+    def finalize(self):
+        return self.total
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_create_window_function_moving_frame(provider):
+    conn = connect(provider, ":memory:")
+    if not hasattr(conn, "create_window_function"):
+        conn.close()
+        pytest.skip("sqlite3.Connection.create_window_function needs Python 3.11+")
+
+    conn.create_window_function("winsum", 1, _WindowSum)
+    conn.execute("CREATE TABLE t (x)")
+    for value in (1, 2, 3, 4):
+        conn.execute("INSERT INTO t VALUES (?)", (value,))
+
+    rows = conn.execute(
+        "SELECT x, winsum(x) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY x"
+    ).fetchall()
+    assert rows == [(1, 1), (2, 3), (3, 5), (4, 7)]
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_create_window_function_without_over(provider):
+    conn = connect(provider, ":memory:")
+    if not hasattr(conn, "create_window_function"):
+        conn.close()
+        pytest.skip("sqlite3.Connection.create_window_function needs Python 3.11+")
+
+    conn.create_window_function("winsum", 1, _WindowSum)
+    conn.execute("CREATE TABLE t (x)")
+    for value in (1, 2, 3):
+        conn.execute("INSERT INTO t VALUES (?)", (value,))
+
+    assert conn.execute("SELECT winsum(x) FROM t").fetchall() == [(6,)]
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_create_window_function_value_error(provider):
+    class BadValue(_WindowSum):
+        def value(self):
+            raise ValueError("no")
+
+    conn = connect(provider, ":memory:")
+    if not hasattr(conn, "create_window_function"):
+        conn.close()
+        pytest.skip("sqlite3.Connection.create_window_function needs Python 3.11+")
+
+    conn.create_window_function("bad", 1, BadValue)
+    conn.execute("CREATE TABLE t (x)")
+    for value in (1, 2):
+        conn.execute("INSERT INTO t VALUES (?)", (value,))
+
+    with pytest.raises(conn.OperationalError) as excinfo:
+        conn.execute("SELECT bad(x) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t").fetchall()
+    assert str(excinfo.value) == "user-defined aggregate's 'value' method raised error"
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_create_window_function_inverse_error(provider):
+    class BadInverse(_WindowSum):
+        def inverse(self, value):
+            raise ValueError("no")
+
+    conn = connect(provider, ":memory:")
+    if not hasattr(conn, "create_window_function"):
+        conn.close()
+        pytest.skip("sqlite3.Connection.create_window_function needs Python 3.11+")
+
+    conn.create_window_function("bad", 1, BadInverse)
+    conn.execute("CREATE TABLE t (x)")
+    for value in (1, 2, 3):
+        conn.execute("INSERT INTO t VALUES (?)", (value,))
+
+    with pytest.raises(conn.OperationalError) as excinfo:
+        conn.execute("SELECT bad(x) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t").fetchall()
+    assert str(excinfo.value) == "user-defined aggregate's 'inverse' method raised error"
+    conn.close()
+
+
+def test_create_window_function_none_removes_the_function():
+    conn = turso.connect(":memory:")
+    conn.create_window_function("winsum", 1, _WindowSum)
+    conn.execute("CREATE TABLE t (x)")
+    conn.execute("INSERT INTO t VALUES (1)")
+    assert conn.execute("SELECT winsum(x) OVER () FROM t").fetchall() == [(1,)]
+
+    conn.create_window_function("winsum", 1, None)
+    with pytest.raises(conn.DatabaseError) as excinfo:
+        conn.execute("SELECT winsum(x) FROM t").fetchall()
+    assert "no such function: winsum" in str(excinfo.value)
+    conn.close()

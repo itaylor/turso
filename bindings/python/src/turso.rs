@@ -10,7 +10,7 @@
 //!  (e.g. the itertools library), since Python tends to be slow.
 use pyo3::{
     prelude::*,
-    types::{PyBytes, PyTuple},
+    types::{PyByteArray, PyBytes, PyInt, PyMemoryView, PyTuple},
 };
 use std::sync::Arc;
 use turso_sdk_kit::rsapi::{self, EncryptionOpts, Numeric, TursoError, TursoStatusCode, Value};
@@ -46,11 +46,18 @@ create_exception!(turso, Corrupt, PyException, "database corrupted");
 create_exception!(turso, IoError, PyException, "I/O error");
 
 pub(crate) fn turso_error_to_py_err(err: TursoError) -> PyErr {
+    let cause = crate::udf::take_pending_py_error();
     match err {
         rsapi::TursoError::Busy(message) => Busy::new_err(message),
         rsapi::TursoError::BusySnapshot(message) => BusySnapshot::new_err(message),
         rsapi::TursoError::Interrupt(message) => Interrupt::new_err(message),
-        rsapi::TursoError::Error(message) => Error::new_err(message),
+        rsapi::TursoError::Error(message) => {
+            let err = Error::new_err(message.clone());
+            if let Some(cause) = cause.filter(|_| message.starts_with("user-defined ")) {
+                Python::attach(|py| err.set_cause(py, Some(cause)));
+            }
+            err
+        }
         rsapi::TursoError::Misuse(message) => Misuse::new_err(message),
         rsapi::TursoError::Constraint(message) => Constraint::new_err(message),
         rsapi::TursoError::Readonly(message) => Readonly::new_err(message),
@@ -281,6 +288,31 @@ impl PyTursoConnection {
     pub fn close(&self) -> PyResult<()> {
         self.connection.close().map_err(turso_error_to_py_err)
     }
+    /// `narg` is -1 for a function taking any number of arguments.
+    pub fn create_scalar_function(
+        &self,
+        name: &str,
+        narg: i32,
+        func: Py<PyAny>,
+        deterministic: bool,
+    ) -> PyResult<()> {
+        crate::udf::create_scalar_function(&self.connection, name, narg, func, deterministic)
+    }
+    /// One instance per group, with `step` and `finalize` methods, plus `value`
+    /// and `inverse` when `window` is set.
+    pub fn create_aggregate_function(
+        &self,
+        name: &str,
+        narg: i32,
+        class: Py<PyAny>,
+        window: bool,
+    ) -> PyResult<()> {
+        crate::udf::create_aggregate_function(&self.connection, name, narg, class, window)
+    }
+    /// Removing a function that was never registered is not an error.
+    pub fn remove_function(&self, name: &str, narg: i32) -> PyResult<()> {
+        crate::udf::remove_function(&self.connection, name, narg)
+    }
 }
 
 #[pyclass]
@@ -414,17 +446,28 @@ fn db_value_to_py(py: Python, value: Value) -> PyResult<Py<PyAny>> {
 }
 
 /// Converts a Python object to a Turso Value
-fn py_to_db_value(obj: Bound<PyAny>) -> PyResult<Value> {
+pub(crate) fn py_to_db_value(obj: Bound<PyAny>) -> PyResult<Value> {
     if obj.is_none() {
         Ok(Value::Null)
     } else if let Ok(integer) = obj.extract::<i64>() {
         Ok(Value::from_i64(integer))
+    } else if obj.is_instance_of::<PyInt>() {
+        // An int that does not fit is an error, not a lossy float, as in sqlite3.
+        Err(pyo3::exceptions::PyOverflowError::new_err(
+            "Python int too large to convert to SQLite INTEGER",
+        ))
     } else if let Ok(float) = obj.extract::<f64>() {
         Ok(Value::from_f64(float))
     } else if let Ok(string) = obj.extract::<String>() {
         Ok(Value::Text(string.into()))
     } else if let Ok(bytes) = obj.cast::<PyBytes>() {
         Ok(Value::Blob(bytes.as_bytes().to_vec()))
+    } else if let Ok(bytes) = obj.cast::<PyByteArray>() {
+        Ok(Value::Blob(bytes.to_vec()))
+    } else if let Ok(view) = obj.cast::<PyMemoryView>() {
+        // memoryview has no byte accessor on the stable ABI, so let Python copy.
+        let bytes = view.call_method0("tobytes")?;
+        Ok(Value::Blob(bytes.cast::<PyBytes>()?.as_bytes().to_vec()))
     } else {
         Err(Error::new_err(
             "unexpected parameter value, only None, numbers, strings and bytes are supported"

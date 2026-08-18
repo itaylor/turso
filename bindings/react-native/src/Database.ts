@@ -26,6 +26,8 @@ import {
   driveStatsOperation,
 } from './internal/asyncOperation';
 import { drainSyncIo } from './internal/ioProcessor';
+import { registerAggregateFunction, registerScalarFunction } from './udf';
+import type { AggregateOptions, FunctionOptions, UserFunction } from './udf';
 
 /**
  * Check if config has sync properties (url field)
@@ -319,6 +321,33 @@ export class Database {
     } finally {
       stmt.finalize();
     }
+  }
+
+  /**
+   * The callback runs synchronously while the calling statement steps, so it
+   * cannot query the database: every query method here awaits the lock that
+   * statement holds.
+   */
+  function(name: string, fn: UserFunction): this;
+  function(name: string, options: FunctionOptions, fn: UserFunction): this;
+  function(name: string, options: FunctionOptions | UserFunction, fn?: UserFunction): this {
+    this.checkOpen();
+    registerScalarFunction(this._connection!, name, options, fn);
+    return this;
+  }
+
+  /** Providing an `inverse` callback also allows use as a window function. */
+  aggregate(name: string, options: AggregateOptions): this {
+    this.checkOpen();
+    registerAggregateFunction(this._connection!, name, options);
+    return this;
+  }
+
+  /** Removes every registration of `name`, whatever its argument count. */
+  removeFunction(name: string): this {
+    this.checkOpen();
+    this._connection!.unregisterFunction(name);
+    return this;
   }
 
   /**
