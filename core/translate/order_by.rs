@@ -20,7 +20,7 @@ use crate::{
 };
 
 use super::{
-    emitter::TranslateCtx,
+    emitter::{Resolver, TranslateCtx},
     expr::translate_expr,
     plan::{Distinctness, ResultSetColumn, SelectPlan, TableReferences},
     result_row::{emit_offset, emit_result_row_and_limit},
@@ -48,8 +48,9 @@ fn sort_comparator_from_func_name(func_name: &str) -> Option<SortComparatorType>
 pub(crate) fn custom_type_comparator(
     expr: &ast::Expr,
     referenced_tables: &TableReferences,
-    schema: &Schema,
+    resolver: &Resolver,
 ) -> Option<SortComparatorType> {
+    let schema = resolver.schema();
     if let ast::Expr::Column {
         table: table_ref_id,
         column,
@@ -69,7 +70,8 @@ pub(crate) fn custom_type_comparator(
             .find(|op| op.op == "<")
             .and_then(|op| op.func_name.as_ref())
             .and_then(|func_name| sort_comparator_from_func_name(func_name))
-    } else if super::expr::expr_is_array(expr, Some(referenced_tables)) {
+    } else if super::expr::expr_is_array(expr, Some(referenced_tables), Some(resolver.symbol_table))
+    {
         Some(SortComparatorType::ArrayLt)
     } else {
         None
@@ -300,7 +302,7 @@ impl EmitOrderBy {
             let mut comparators: Vec<Option<SortComparatorType>> = order_by
                 .iter()
                 .map(|(expr, _, _)| {
-                    custom_type_comparator(expr, referenced_tables, t_ctx.resolver.schema())
+                    custom_type_comparator(expr, referenced_tables, &t_ctx.resolver)
                 })
                 .try_collect()?;
 

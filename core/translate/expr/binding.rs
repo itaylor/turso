@@ -614,11 +614,13 @@ pub fn bind_and_rewrite_expr<'a>(
                     }
                 }
                 Expr::FunctionCallStar { name, filter_over } => {
+                    resolve_function_name(name.as_str(), 0, resolver)?;
                     // For functions that need star expansion (json_object, jsonb_object),
                     // expand the * to all columns from the referenced tables as key-value pairs
                     // This needs to happen during bind/rewrite so WHERE clauses can use these functions
                     if let Some(referenced_tables) = &mut referenced_tables {
-                        if let Ok(Some(func)) = Func::resolve_function(name.as_str(), 0) {
+                        // Through the resolver, so an application `json_object` is not mistaken for the built-in that expands the star.
+                        if let Ok(Some(func)) = resolver.resolve_function(name.as_str(), 0) {
                             if func.needs_star_expansion() {
                                 // Only expand if there are actual tables - otherwise leave as
                                 // FunctionCallStar so translate_expr can generate the error
@@ -684,7 +686,21 @@ pub fn bind_and_rewrite_expr<'a>(
                 // Catching errors here avoids wasting optimizer and translation
                 // cycles on invalid queries, and keeps the translate_expr match
                 // arms focused on code generation.
-                Expr::FunctionCall { name, args, .. } => {
+                Expr::FunctionCall {
+                    name,
+                    args,
+                    within_group,
+                    ..
+                } => {
+                    // Resolve names before the optimizer sees the expression, as SQLite's `resolveExprStep` does:
+                    // the optimizer can turn `WHERE dbl(x) = 4` into an expression-index seek and never emit the
+                    // call, but the statement must still fail with `no such function: dbl`.
+                    //
+                    // Ordered-set aggregates are the exception: planning prepends the ORDER BY expression to the
+                    // argument list, so `args.len()` is one short here; `build_ordered_set_aggregate` checks them.
+                    if within_group.is_empty() {
+                        resolve_function_name(name.as_str(), args.len(), resolver)?;
+                    }
                     validate_custom_type_function_call(name.as_str(), args, resolver)?;
                 }
                 _ => {}
@@ -692,6 +708,13 @@ pub fn bind_and_rewrite_expr<'a>(
             Ok(WalkControl::Continue)
         },
     )?;
+    Ok(())
+}
+
+fn resolve_function_name(name: &str, arg_count: usize, resolver: &Resolver) -> Result<()> {
+    if resolver.resolve_function(name, arg_count)?.is_none() {
+        return Err(resolver.no_such_function_error(name));
+    }
     Ok(())
 }
 

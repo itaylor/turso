@@ -108,12 +108,16 @@ pub fn emit_literal(
 }
 
 /// Emit a function call instruction with pre-allocated argument registers
-/// This is shared between different function call contexts
+/// This is shared between different function call contexts.
+///
+/// `constant_mask` has one bit per constant argument; a user-defined function's aux data survives to
+/// the next row only for those. Callers without the argument expressions pass 0.
 pub fn emit_function_call(
     program: &mut ProgramBuilder,
     func_ctx: FuncCtx,
     arg_registers: &[usize],
     target_register: usize,
+    constant_mask: i32,
 ) -> Result<()> {
     let start_reg = if arg_registers.is_empty() {
         target_register // If no arguments, use target register as start
@@ -122,13 +126,27 @@ pub fn emit_function_call(
     };
 
     program.emit_insn(Insn::Function {
-        constant_mask: 0,
+        constant_mask,
         start_reg,
         dest: target_register,
         func: func_ctx,
     });
 
     Ok(())
+}
+
+/// One bit per constant argument, as `Insn::Function` carries it. Like `sqlite3ExprCodeTarget`, only
+/// the first 32 arguments are looked at.
+pub fn constant_arg_mask(args: &[Box<ast::Expr>], resolver: &Resolver<'_>) -> i32 {
+    use crate::translate::optimizer::Optimizable;
+
+    let mut mask = 0i32;
+    for (i, arg) in args.iter().enumerate().take(32) {
+        if arg.is_constant(resolver) {
+            mask |= 1 << i;
+        }
+    }
+    mask
 }
 
 /// Process a RETURNING clause, converting ResultColumn expressions into ResultSetColumn structures

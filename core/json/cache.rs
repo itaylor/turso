@@ -103,10 +103,8 @@ impl Drop for JsonCacheAccessGuard<'_> {
     }
 }
 
-#[expect(
-    clippy::new_without_default,
-    reason = "callers should construct the cache explicitly"
-)]
+// Not `expect`: the lint only fires when the `json` module is public (fuzz/bench builds).
+#[allow(clippy::new_without_default)]
 impl JsonCacheCell {
     pub fn new() -> Self {
         Self {

@@ -21,7 +21,7 @@ use crate::{
         insn::{HashDistinctData, Insn},
         BranchOffset, CursorID,
     },
-    Result, VirtualTable, MAIN_DB_ID,
+    Result, SymbolTable, VirtualTable, MAIN_DB_ID,
 };
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
@@ -2408,6 +2408,7 @@ impl Operation {
 fn query_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
+    syms: Option<&SymbolTable>,
 ) -> Result<alloc::Vec<Column>> {
     let (result_columns, table_references): (&[ResultSetColumn], &TableReferences) = match plan {
         Plan::Select(select_plan) => (&select_plan.result_columns, &select_plan.table_references),
@@ -2470,7 +2471,7 @@ fn query_output_columns(
 
     for (column_index, column) in columns.iter_mut().enumerate() {
         let result_expr = &result_columns[column_index].expr;
-        if super::expr::expr_is_array(result_expr, Some(table_references)) {
+        if super::expr::expr_is_array(result_expr, Some(table_references), syms) {
             column.set_array_dimensions(1);
         }
         column.set_collation(get_collseq_from_expr(result_expr, table_references)?);
@@ -2505,6 +2506,7 @@ impl JoinedTable {
         plan: SelectPlan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
+        syms: Option<&SymbolTable>,
     ) -> Result<Self> {
         let mut columns = plan
             .result_columns
@@ -2530,6 +2532,7 @@ impl JoinedTable {
             if super::expr::expr_is_array(
                 &plan.result_columns[i].expr,
                 Some(&plan.table_references),
+                syms,
             ) {
                 column.set_array_dimensions(1);
             }
@@ -2566,6 +2569,7 @@ impl JoinedTable {
     /// If `cte_id` is provided, this subquery is a CTE reference that can share materialized data.
     /// If `materialize_hint` is true, the CTE was declared with AS MATERIALIZED and should always
     /// be materialized regardless of reference count.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_subquery_from_plan(
         identifier: String,
         plan: Plan,
@@ -2574,8 +2578,9 @@ impl JoinedTable {
         explicit_columns: Option<&[String]>,
         cte_id: Option<usize>,
         materialize_hint: bool,
+        syms: Option<&SymbolTable>,
     ) -> Result<Self> {
-        let columns = query_output_columns(&plan, explicit_columns)?;
+        let columns = query_output_columns(&plan, explicit_columns, syms)?;
         // Get result columns and table references from the plan
         // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
         // Multi-reference CTEs are also detected at emission time via reference counting,
@@ -2612,8 +2617,9 @@ impl JoinedTable {
         query: &Plan,
         internal_id: TableInternalId,
         explicit_columns: Option<&[String]>,
+        syms: Option<&SymbolTable>,
     ) -> Result<Self> {
-        let mut columns = query_output_columns(query, explicit_columns)?;
+        let mut columns = query_output_columns(query, explicit_columns, syms)?;
         // The recursive self-reference reads SQLite's queue table, whose
         // columns have no declared type: comparisons in the recursive term
         // see the stored value without the anchor query's affinity. Only the

@@ -1869,7 +1869,7 @@ fn process_having_clause(
     // inside an aggregate function's arguments resolves to an alias whose original expression
     // has EP_Agg, SQLite reports "misuse of aliased aggregate X".
     for expr in predicates.iter() {
-        check_aliased_aggregate_misuse(expr, result_columns)?;
+        check_aliased_aggregate_misuse(expr, result_columns, resolver)?;
     }
 
     for expr in predicates.iter_mut() {
@@ -1897,15 +1897,17 @@ fn process_having_clause(
 fn check_aliased_aggregate_misuse(
     expr: &ast::Expr,
     result_columns: &[ResultSetColumn],
+    resolver: &Resolver,
 ) -> Result<()> {
     use crate::translate::expr::{walk_expr, WalkControl};
 
     walk_expr(expr, &mut |e| {
         match e {
             Expr::FunctionCall { name, args, .. } => {
+                // An application function shadowing an aggregate's name is not an aggregate.
                 let is_agg = matches!(
-                    crate::function::Func::resolve_function(name.as_str(), args.len()),
-                    Ok(Some(crate::function::Func::Agg(_)))
+                    resolver.resolve_function(name.as_str(), args.len()),
+                    Ok(Some(func)) if func.is_aggregate()
                 );
                 if is_agg {
                     for arg in args.iter() {
@@ -1916,8 +1918,8 @@ fn check_aliased_aggregate_misuse(
             }
             Expr::FunctionCallStar { name, .. } => {
                 if matches!(
-                    crate::function::Func::resolve_function(name.as_str(), 0),
-                    Ok(Some(crate::function::Func::Agg(_)))
+                    resolver.resolve_function(name.as_str(), 0),
+                    Ok(Some(func)) if func.is_aggregate()
                 ) {
                     return Ok(WalkControl::SkipChildren);
                 }

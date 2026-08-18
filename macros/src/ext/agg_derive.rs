@@ -10,6 +10,8 @@ pub fn derive_agg_func(input: TokenStream) -> TokenStream {
     let step_fn_name = format_ident!("{}_step", struct_name);
     let finalize_fn_name = format_ident!("{}_finalize", struct_name);
     let init_fn_name = format_ident!("{}_init", struct_name);
+    let value_fn_name = format_ident!("{}_value", struct_name);
+    let inverse_fn_name = format_ident!("{}_inverse", struct_name);
     let register_fn_name = format_ident!("register_{}", struct_name);
 
     let expanded = quote! {
@@ -61,6 +63,43 @@ pub fn derive_agg_func(input: TokenStream) -> TokenStream {
             }
 
             #[no_mangle]
+            pub extern "C" fn #value_fn_name(
+                _context: usize,
+                ctx: *mut ::turso_ext::AggCtx
+            ) -> ::turso_ext::Value {
+                unsafe {
+                    let ctx = &*ctx;
+                    let state = &*(ctx.state as *const <#struct_name as ::turso_ext::AggFunc>::State);
+                    match <#struct_name as ::turso_ext::AggFunc>::value(state) {
+                        Ok(val) => val,
+                        Err(e) => {
+                            ::turso_ext::Value::error_with_message(e.to_string())
+                        }
+                    }
+                }
+            }
+
+            #[no_mangle]
+            pub extern "C" fn #inverse_fn_name(
+                _context: usize,
+                ctx: *mut ::turso_ext::AggCtx,
+                argc: i32,
+                argv: *const ::turso_ext::Value,
+            ) -> ::turso_ext::Value {
+                unsafe {
+                    let ctx = &mut *ctx;
+                    let state = &mut *(ctx.state as *mut <#struct_name as ::turso_ext::AggFunc>::State);
+                    let args = if argc <= 0 || argv.is_null() {
+                        &[]
+                    } else {
+                        ::std::slice::from_raw_parts(argv, argc as usize)
+                    };
+                    <#struct_name as ::turso_ext::AggFunc>::inverse(state, args);
+                }
+                ::turso_ext::Value::null()
+            }
+
+            #[no_mangle]
             pub unsafe extern "C" fn #register_fn_name(
                 api: *const ::turso_ext::ExtensionApi
             ) -> ::turso_ext::ResultCode {
@@ -74,6 +113,29 @@ pub fn derive_agg_func(input: TokenStream) -> TokenStream {
                     Ok(cname) => cname,
                     Err(_) => return ::turso_ext::ResultCode::Error,
                 };
+
+                if <#struct_name as ::turso_ext::AggFunc>::WINDOW {
+                    return (api.register_window_function)(
+                        api.ctx,
+                        c_name.as_ptr(),
+                        #struct_name::ARGS,
+                        0,
+                        0,
+                        #struct_name::#init_fn_name
+                            as ::turso_ext::InitAggFunction,
+                        #struct_name::#step_fn_name
+                            as ::turso_ext::StepFunction,
+                        #struct_name::#finalize_fn_name
+                            as ::turso_ext::FinalizeFunction,
+                        #struct_name::#value_fn_name
+                            as ::turso_ext::WindowValueFunction,
+                        #struct_name::#inverse_fn_name
+                            as ::turso_ext::WindowInverseFunction,
+                        None,
+                        None,
+                        None,
+                    );
+                }
 
                 (api.register_aggregate_function)(
                     api.ctx,

@@ -11,7 +11,12 @@ enum Error {
     InvalidUtf8,
 }
 
-#[scalar(name = "crypto_sha256", alias = "crypto_sha256")]
+#[scalar(
+    name = "crypto_sha256",
+    alias = "crypto_sha256",
+    argc = 1,
+    deterministic
+)]
 fn crypto_sha256(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::Error);
@@ -24,7 +29,12 @@ fn crypto_sha256(args: &[Value]) -> Value {
     Value::from_blob(hash)
 }
 
-#[scalar(name = "crypto_sha512", alias = "crypto_sha512")]
+#[scalar(
+    name = "crypto_sha512",
+    alias = "crypto_sha512",
+    argc = 1,
+    deterministic
+)]
 fn crypto_sha512(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::Error);
@@ -37,7 +47,12 @@ fn crypto_sha512(args: &[Value]) -> Value {
     Value::from_blob(hash)
 }
 
-#[scalar(name = "crypto_sha384", alias = "crypto_sha384")]
+#[scalar(
+    name = "crypto_sha384",
+    alias = "crypto_sha384",
+    argc = 1,
+    deterministic
+)]
 fn crypto_sha384(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::Error);
@@ -50,7 +65,12 @@ fn crypto_sha384(args: &[Value]) -> Value {
     Value::from_blob(hash)
 }
 
-#[scalar(name = "crypto_blake3", alias = "crypto_blake3")]
+#[scalar(
+    name = "crypto_blake3",
+    alias = "crypto_blake3",
+    argc = 1,
+    deterministic
+)]
 fn crypto_blake3(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::Error);
@@ -63,7 +83,7 @@ fn crypto_blake3(args: &[Value]) -> Value {
     Value::from_blob(hash)
 }
 
-#[scalar(name = "crypto_sha1", alias = "crypto_sha1")]
+#[scalar(name = "crypto_sha1", alias = "crypto_sha1", argc = 1, deterministic)]
 fn crypto_sha1(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::Error);
@@ -76,7 +96,7 @@ fn crypto_sha1(args: &[Value]) -> Value {
     Value::from_blob(hash)
 }
 
-#[scalar(name = "crypto_md5", alias = "crypto_md5")]
+#[scalar(name = "crypto_md5", alias = "crypto_md5", argc = 1, deterministic)]
 fn crypto_md5(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::Error);
@@ -89,7 +109,12 @@ fn crypto_md5(args: &[Value]) -> Value {
     Value::from_blob(hash)
 }
 
-#[scalar(name = "crypto_encode", alias = "crypto_encode")]
+#[scalar(
+    name = "crypto_encode",
+    alias = "crypto_encode",
+    argc = 2,
+    deterministic
+)]
 fn crypto_encode(args: &[Value]) -> Value {
     if args.len() != 2 {
         return Value::error(ResultCode::Error);
@@ -102,7 +127,12 @@ fn crypto_encode(args: &[Value]) -> Value {
     payload
 }
 
-#[scalar(name = "crypto_decode", alias = "crypto_decode")]
+#[scalar(
+    name = "crypto_decode",
+    alias = "crypto_decode",
+    argc = 2,
+    deterministic
+)]
 fn crypto_decode(args: &[Value]) -> Value {
     if args.len() != 2 {
         return Value::error(ResultCode::Error);

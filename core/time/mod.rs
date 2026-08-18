@@ -4,7 +4,6 @@ use chrono::prelude::*;
 use core::cmp::Ordering;
 use thiserror::Error;
 
-use crate::ext::register_scalar_function;
 use turso_ext::{scalar, ExtensionApi, ResultCode, Value, ValueType};
 
 mod internal;
@@ -13,57 +12,53 @@ use internal::*;
 
 pub fn register_extension(ext_api: &mut ExtensionApi) {
     unsafe {
-        register_scalar_function(ext_api.ctx, c"time_now".as_ptr(), time_now);
-        register_scalar_function(ext_api.ctx, c"time_date".as_ptr(), time_date);
-        register_scalar_function(ext_api.ctx, c"make_date".as_ptr(), make_date);
-        register_scalar_function(ext_api.ctx, c"make_timestamp".as_ptr(), make_timestamp);
-        register_scalar_function(ext_api.ctx, c"time_get".as_ptr(), time_get);
-        register_scalar_function(ext_api.ctx, c"time_get_year".as_ptr(), time_get_year);
-        register_scalar_function(ext_api.ctx, c"time_get_month".as_ptr(), time_get_month);
-        register_scalar_function(ext_api.ctx, c"time_get_day".as_ptr(), time_get_day);
-        register_scalar_function(ext_api.ctx, c"time_get_hour".as_ptr(), time_get_hour);
-        register_scalar_function(ext_api.ctx, c"time_get_minute".as_ptr(), time_get_minute);
-        register_scalar_function(ext_api.ctx, c"time_get_second".as_ptr(), time_get_second);
-        register_scalar_function(ext_api.ctx, c"time_get_nano".as_ptr(), time_get_nano);
-        register_scalar_function(ext_api.ctx, c"time_get_weekday".as_ptr(), time_get_weekday);
-        register_scalar_function(ext_api.ctx, c"time_get_yearday".as_ptr(), time_get_yearday);
-        register_scalar_function(ext_api.ctx, c"time_get_isoyear".as_ptr(), time_get_isoyear);
-        register_scalar_function(ext_api.ctx, c"time_get_isoweek".as_ptr(), time_get_isoweek);
-        register_scalar_function(ext_api.ctx, c"time_unix".as_ptr(), time_unix);
-        register_scalar_function(ext_api.ctx, c"to_timestamp".as_ptr(), to_timestamp);
-        register_scalar_function(ext_api.ctx, c"time_milli".as_ptr(), time_milli);
-        register_scalar_function(ext_api.ctx, c"time_micro".as_ptr(), time_micro);
-        register_scalar_function(ext_api.ctx, c"time_nano".as_ptr(), time_nano);
-        register_scalar_function(ext_api.ctx, c"time_to_unix".as_ptr(), time_to_unix);
-        register_scalar_function(ext_api.ctx, c"time_to_milli".as_ptr(), time_to_milli);
-        register_scalar_function(ext_api.ctx, c"time_to_micro".as_ptr(), time_to_micro);
-        register_scalar_function(ext_api.ctx, c"time_to_nano".as_ptr(), time_to_nano);
-        register_scalar_function(ext_api.ctx, c"time_after".as_ptr(), time_after);
-        register_scalar_function(ext_api.ctx, c"time_before".as_ptr(), time_before);
-        register_scalar_function(ext_api.ctx, c"time_compare".as_ptr(), time_compare);
-        register_scalar_function(ext_api.ctx, c"time_equal".as_ptr(), time_equal);
-        register_scalar_function(ext_api.ctx, c"dur_ns".as_ptr(), dur_ns);
-        register_scalar_function(ext_api.ctx, c"dur_us".as_ptr(), dur_us);
-        register_scalar_function(ext_api.ctx, c"dur_ms".as_ptr(), dur_ms);
-        register_scalar_function(ext_api.ctx, c"dur_s".as_ptr(), dur_s);
-        register_scalar_function(ext_api.ctx, c"dur_m".as_ptr(), dur_m);
-        register_scalar_function(ext_api.ctx, c"dur_h".as_ptr(), dur_h);
-        register_scalar_function(ext_api.ctx, c"time_add".as_ptr(), time_add);
-        register_scalar_function(ext_api.ctx, c"time_add_date".as_ptr(), time_add_date);
-        register_scalar_function(ext_api.ctx, c"time_sub".as_ptr(), time_sub);
-        register_scalar_function(ext_api.ctx, c"time_since".as_ptr(), time_since);
-        register_scalar_function(ext_api.ctx, c"time_until".as_ptr(), time_until);
-        register_scalar_function(ext_api.ctx, c"time_trunc".as_ptr(), time_trunc);
-        register_scalar_function(ext_api.ctx, c"time_round".as_ptr(), time_round);
-        register_scalar_function(ext_api.ctx, c"time_fmt_iso".as_ptr(), time_fmt_iso);
-        register_scalar_function(
-            ext_api.ctx,
-            c"time_fmt_datetime".as_ptr(),
-            time_fmt_datetime,
-        );
-        register_scalar_function(ext_api.ctx, c"time_fmt_date".as_ptr(), time_fmt_date);
-        register_scalar_function(ext_api.ctx, c"time_fmt_time".as_ptr(), time_fmt_time);
-        register_scalar_function(ext_api.ctx, c"time_parse".as_ptr(), time_parse);
+        register_time_now(ext_api);
+        register_time_date(ext_api);
+        register_make_date(ext_api);
+        register_make_timestamp(ext_api);
+        register_time_get(ext_api);
+        register_time_get_year(ext_api);
+        register_time_get_month(ext_api);
+        register_time_get_day(ext_api);
+        register_time_get_hour(ext_api);
+        register_time_get_minute(ext_api);
+        register_time_get_second(ext_api);
+        register_time_get_nano(ext_api);
+        register_time_get_weekday(ext_api);
+        register_time_get_yearday(ext_api);
+        register_time_get_isoyear(ext_api);
+        register_time_get_isoweek(ext_api);
+        register_time_unix(ext_api);
+        register_to_timestamp(ext_api);
+        register_time_milli(ext_api);
+        register_time_micro(ext_api);
+        register_time_nano(ext_api);
+        register_time_to_unix(ext_api);
+        register_time_to_milli(ext_api);
+        register_time_to_micro(ext_api);
+        register_time_to_nano(ext_api);
+        register_time_after(ext_api);
+        register_time_before(ext_api);
+        register_time_compare(ext_api);
+        register_time_equal(ext_api);
+        register_dur_ns(ext_api);
+        register_dur_us(ext_api);
+        register_dur_ms(ext_api);
+        register_dur_s(ext_api);
+        register_dur_m(ext_api);
+        register_dur_h(ext_api);
+        register_time_add(ext_api);
+        register_time_add_date(ext_api);
+        register_time_sub(ext_api);
+        register_time_since(ext_api);
+        register_time_until(ext_api);
+        register_time_trunc(ext_api);
+        register_time_round(ext_api);
+        register_time_fmt_iso(ext_api);
+        register_time_fmt_datetime(ext_api);
+        register_time_fmt_date(ext_api);
+        register_time_fmt_time(ext_api);
+        register_time_parse(ext_api);
     }
 }
 
@@ -136,7 +131,7 @@ pub enum TimeError {
 
 type Result<T> = core::result::Result<T, TimeError>;
 
-#[scalar(name = "time_now", alias = "now")]
+#[scalar(name = "time_now")]
 fn time_now(args: &[Value]) -> Value {
     if !args.is_empty() {
         return Value::error(ResultCode::InvalidArgs);
@@ -208,12 +203,12 @@ fn time_date_internal(args: &[Value]) -> Value {
     }
 }
 
-#[scalar(name = "time_date")]
+#[scalar(name = "time_date", deterministic)]
 fn time_date(args: &[Value]) {
     time_date_internal(args)
 }
 
-#[scalar(name = "make_date")]
+#[scalar(name = "make_date", deterministic)]
 fn make_date(args: &[Value]) -> Value {
     if args.len() != 3 {
         return Value::error(ResultCode::InvalidArgs);
@@ -222,7 +217,7 @@ fn make_date(args: &[Value]) -> Value {
     time_date_internal(args)
 }
 
-#[scalar(name = "make_timestamp")]
+#[scalar(name = "make_timestamp", deterministic)]
 fn make_timestamp(args: &[Value]) -> Value {
     if args.len() != 6 {
         return Value::error(ResultCode::InvalidArgs);
@@ -231,7 +226,7 @@ fn make_timestamp(args: &[Value]) -> Value {
     time_date_internal(args)
 }
 
-#[scalar(name = "time_get", alias = "date_part")]
+#[scalar(name = "time_get", deterministic)]
 fn time_get(args: &[Value]) -> Value {
     if args.len() != 2 {
         return Value::error(ResultCode::InvalidArgs);
@@ -248,7 +243,7 @@ fn time_get(args: &[Value]) -> Value {
     t.time_get(field)
 }
 
-#[scalar(name = "time_get_year")]
+#[scalar(name = "time_get_year", deterministic)]
 fn time_get_year(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -261,7 +256,7 @@ fn time_get_year(args: &[Value]) -> Value {
     t.time_get(TimeField::Year)
 }
 
-#[scalar(name = "time_get_month")]
+#[scalar(name = "time_get_month", deterministic)]
 fn time_get_month(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -274,7 +269,7 @@ fn time_get_month(args: &[Value]) -> Value {
     t.time_get(TimeField::Month)
 }
 
-#[scalar(name = "time_get_day")]
+#[scalar(name = "time_get_day", deterministic)]
 fn time_get_day(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -287,7 +282,7 @@ fn time_get_day(args: &[Value]) -> Value {
     t.time_get(TimeField::Day)
 }
 
-#[scalar(name = "time_get_hour")]
+#[scalar(name = "time_get_hour", deterministic)]
 fn time_get_hour(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -300,7 +295,7 @@ fn time_get_hour(args: &[Value]) -> Value {
     t.time_get(TimeField::Hour)
 }
 
-#[scalar(name = "time_get_minute")]
+#[scalar(name = "time_get_minute", deterministic)]
 fn time_get_minute(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -313,7 +308,7 @@ fn time_get_minute(args: &[Value]) -> Value {
     t.time_get(TimeField::Minute)
 }
 
-#[scalar(name = "time_get_second")]
+#[scalar(name = "time_get_second", deterministic)]
 fn time_get_second(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -326,7 +321,7 @@ fn time_get_second(args: &[Value]) -> Value {
     Value::from_integer(t.get_second())
 }
 
-#[scalar(name = "time_get_nano")]
+#[scalar(name = "time_get_nano", deterministic)]
 fn time_get_nano(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -339,7 +334,7 @@ fn time_get_nano(args: &[Value]) -> Value {
     Value::from_integer(t.get_nanosecond())
 }
 
-#[scalar(name = "time_get_weekday")]
+#[scalar(name = "time_get_weekday", deterministic)]
 fn time_get_weekday(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -352,7 +347,7 @@ fn time_get_weekday(args: &[Value]) -> Value {
     t.time_get(TimeField::WeekDay)
 }
 
-#[scalar(name = "time_get_yearday")]
+#[scalar(name = "time_get_yearday", deterministic)]
 fn time_get_yearday(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -365,7 +360,7 @@ fn time_get_yearday(args: &[Value]) -> Value {
     t.time_get(TimeField::YearDay)
 }
 
-#[scalar(name = "time_get_isoyear")]
+#[scalar(name = "time_get_isoyear", deterministic)]
 fn time_get_isoyear(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -378,7 +373,7 @@ fn time_get_isoyear(args: &[Value]) -> Value {
     t.time_get(TimeField::IsoYear)
 }
 
-#[scalar(name = "time_get_isoweek")]
+#[scalar(name = "time_get_isoweek", deterministic)]
 fn time_get_isoweek(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -419,12 +414,12 @@ fn time_unix_internal(args: &[Value]) -> Value {
     t.into_blob()
 }
 
-#[scalar(name = "time_unix")]
+#[scalar(name = "time_unix", deterministic)]
 fn time_unix(args: &[Value]) -> Value {
     time_unix_internal(args)
 }
 
-#[scalar(name = "to_timestamp")]
+#[scalar(name = "to_timestamp", deterministic)]
 fn to_timestamp(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -433,7 +428,7 @@ fn to_timestamp(args: &[Value]) -> Value {
     time_unix_internal(args)
 }
 
-#[scalar(name = "time_milli")]
+#[scalar(name = "time_milli", deterministic)]
 fn time_milli(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -454,7 +449,7 @@ fn time_milli(args: &[Value]) -> Value {
     t.into_blob()
 }
 
-#[scalar(name = "time_micro")]
+#[scalar(name = "time_micro", deterministic)]
 fn time_micro(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -475,7 +470,7 @@ fn time_micro(args: &[Value]) -> Value {
     t.into_blob()
 }
 
-#[scalar(name = "time_nano")]
+#[scalar(name = "time_nano", deterministic)]
 fn time_nano(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -496,7 +491,7 @@ fn time_nano(args: &[Value]) -> Value {
     t.into_blob()
 }
 
-#[scalar(name = "time_to_unix")]
+#[scalar(name = "time_to_unix", deterministic)]
 fn time_to_unix(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -509,7 +504,7 @@ fn time_to_unix(args: &[Value]) -> Value {
     Value::from_integer(t.to_unix())
 }
 
-#[scalar(name = "time_to_milli")]
+#[scalar(name = "time_to_milli", deterministic)]
 fn time_to_milli(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -522,7 +517,7 @@ fn time_to_milli(args: &[Value]) -> Value {
     Value::from_integer(t.to_unix_milli())
 }
 
-#[scalar(name = "time_to_micro")]
+#[scalar(name = "time_to_micro", deterministic)]
 fn time_to_micro(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -535,7 +530,7 @@ fn time_to_micro(args: &[Value]) -> Value {
     Value::from_integer(t.to_unix_micro())
 }
 
-#[scalar(name = "time_to_nano")]
+#[scalar(name = "time_to_nano", deterministic)]
 fn time_to_nano(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -550,7 +545,7 @@ fn time_to_nano(args: &[Value]) -> Value {
 
 // Comparisons
 
-#[scalar(name = "time_after")]
+#[scalar(name = "time_after", deterministic)]
 fn time_after(args: &[Value]) -> Value {
     if args.len() != 2 {
         return Value::error(ResultCode::InvalidArgs);
@@ -567,7 +562,7 @@ fn time_after(args: &[Value]) -> Value {
     Value::from_integer((t > u).into())
 }
 
-#[scalar(name = "time_before")]
+#[scalar(name = "time_before", deterministic)]
 fn time_before(args: &[Value]) -> Value {
     if args.len() != 2 {
         return Value::error(ResultCode::InvalidArgs);
@@ -584,7 +579,7 @@ fn time_before(args: &[Value]) -> Value {
     Value::from_integer((t < u).into())
 }
 
-#[scalar(name = "time_compare")]
+#[scalar(name = "time_compare", deterministic)]
 fn time_compare(args: &[Value]) -> Value {
     if args.len() != 2 {
         return Value::error(ResultCode::InvalidArgs);
@@ -607,7 +602,7 @@ fn time_compare(args: &[Value]) -> Value {
     Value::from_integer(cmp)
 }
 
-#[scalar(name = "time_equal")]
+#[scalar(name = "time_equal", deterministic)]
 fn time_equal(args: &[Value]) -> Value {
     if args.len() != 2 {
         return Value::error(ResultCode::InvalidArgs);
@@ -627,7 +622,7 @@ fn time_equal(args: &[Value]) -> Value {
 // Duration Constants
 
 /// 1 nanosecond
-#[scalar(name = "dur_ns")]
+#[scalar(name = "dur_ns", deterministic)]
 fn dur_ns(args: &[Value]) -> Value {
     if !args.is_empty() {
         return Value::error(ResultCode::InvalidArgs);
@@ -637,7 +632,7 @@ fn dur_ns(args: &[Value]) -> Value {
 }
 
 /// 1 microsecond
-#[scalar(name = "dur_us")]
+#[scalar(name = "dur_us", deterministic)]
 fn dur_us(args: &[Value]) -> Value {
     if !args.is_empty() {
         return Value::error(ResultCode::InvalidArgs);
@@ -647,7 +642,7 @@ fn dur_us(args: &[Value]) -> Value {
 }
 
 /// 1 millisecond
-#[scalar(name = "dur_ms")]
+#[scalar(name = "dur_ms", deterministic)]
 fn dur_ms(args: &[Value]) -> Value {
     if !args.is_empty() {
         return Value::error(ResultCode::InvalidArgs);
@@ -657,7 +652,7 @@ fn dur_ms(args: &[Value]) -> Value {
 }
 
 /// 1 second
-#[scalar(name = "dur_s")]
+#[scalar(name = "dur_s", deterministic)]
 fn dur_s(args: &[Value]) -> Value {
     if !args.is_empty() {
         return Value::error(ResultCode::InvalidArgs);
@@ -667,7 +662,7 @@ fn dur_s(args: &[Value]) -> Value {
 }
 
 /// 1 minute
-#[scalar(name = "dur_m")]
+#[scalar(name = "dur_m", deterministic)]
 fn dur_m(args: &[Value]) -> Value {
     if !args.is_empty() {
         return Value::error(ResultCode::InvalidArgs);
@@ -677,7 +672,7 @@ fn dur_m(args: &[Value]) -> Value {
 }
 
 /// 1 hour
-#[scalar(name = "dur_h")]
+#[scalar(name = "dur_h", deterministic)]
 fn dur_h(args: &[Value]) -> Value {
     if !args.is_empty() {
         return Value::error(ResultCode::InvalidArgs);
@@ -689,7 +684,7 @@ fn dur_h(args: &[Value]) -> Value {
 // Time Arithmetic
 
 /// Do not use `time_add` to add days, months or years. Use `time_add_date` instead.
-#[scalar(name = "time_add", alias = "date_add")]
+#[scalar(name = "time_add", deterministic)]
 fn time_add(args: &[Value]) -> Value {
     if args.len() != 2 {
         return Value::error(ResultCode::InvalidArgs);
@@ -711,7 +706,7 @@ fn time_add(args: &[Value]) -> Value {
     t.add_duration(d).into_blob()
 }
 
-#[scalar(name = "time_add_date")]
+#[scalar(name = "time_add_date", deterministic)]
 fn time_add_date(args: &[Value]) -> Value {
     if args.len() != 2 && args.len() != 3 && args.len() != 4 {
         return Value::error(ResultCode::InvalidArgs);
@@ -775,7 +770,7 @@ fn time_sub_internal(t: Time, u: Time) -> Value {
     Value::from_integer(nano_secs)
 }
 
-#[scalar(name = "time_sub", alias = "age")]
+#[scalar(name = "time_sub", deterministic)]
 fn time_sub(args: &[Value]) -> Value {
     if args.len() != 2 {
         return Value::error(ResultCode::InvalidArgs);
@@ -820,7 +815,7 @@ fn time_until(args: &[Value]) -> Value {
 
 // Rounding
 
-#[scalar(name = "time_trunc", alias = "date_trunc")]
+#[scalar(name = "time_trunc", deterministic)]
 fn time_trunc(args: &[Value]) -> Value {
     if args.len() != 2 {
         return Value::error(ResultCode::InvalidArgs);
@@ -851,7 +846,7 @@ fn time_trunc(args: &[Value]) -> Value {
     }
 }
 
-#[scalar(name = "time_round")]
+#[scalar(name = "time_round", deterministic)]
 fn time_round(args: &[Value]) -> Value {
     if args.len() != 2 {
         return Value::error(ResultCode::InvalidArgs);
@@ -875,7 +870,7 @@ fn time_round(args: &[Value]) -> Value {
 
 // Formatting
 
-#[scalar(name = "time_fmt_iso")]
+#[scalar(name = "time_fmt_iso", deterministic)]
 fn time_fmt_iso(args: &[Value]) -> Value {
     if args.len() != 1 && args.len() != 2 {
         return Value::error(ResultCode::InvalidArgs);
@@ -902,7 +897,7 @@ fn time_fmt_iso(args: &[Value]) -> Value {
     Value::from_text(fmt_str)
 }
 
-#[scalar(name = "time_fmt_datetime")]
+#[scalar(name = "time_fmt_datetime", deterministic)]
 fn time_fmt_datetime(args: &[Value]) -> Value {
     if args.len() != 1 && args.len() != 2 {
         return Value::error(ResultCode::InvalidArgs);
@@ -929,7 +924,7 @@ fn time_fmt_datetime(args: &[Value]) -> Value {
     Value::from_text(fmt_str)
 }
 
-#[scalar(name = "time_fmt_date")]
+#[scalar(name = "time_fmt_date", deterministic)]
 fn time_fmt_date(args: &[Value]) -> Value {
     if args.len() != 1 && args.len() != 2 {
         return Value::error(ResultCode::InvalidArgs);
@@ -956,7 +951,7 @@ fn time_fmt_date(args: &[Value]) -> Value {
     Value::from_text(fmt_str)
 }
 
-#[scalar(name = "time_fmt_time")]
+#[scalar(name = "time_fmt_time", deterministic)]
 fn time_fmt_time(args: &[Value]) -> Value {
     if args.len() != 1 && args.len() != 2 {
         return Value::error(ResultCode::InvalidArgs);
@@ -983,7 +978,7 @@ fn time_fmt_time(args: &[Value]) -> Value {
     Value::from_text(fmt_str)
 }
 
-#[scalar(name = "time_parse")]
+#[scalar(name = "time_parse", deterministic)]
 fn time_parse(args: &[Value]) -> Value {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);

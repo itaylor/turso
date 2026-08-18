@@ -678,7 +678,7 @@ pub fn translate_expr(
             let func_type = resolver.resolve_function(name.as_str(), args_count)?;
 
             if func_type.is_none() {
-                crate::bail_parse_error!("no such function: {}", name.as_str());
+                return Err(resolver.no_such_function_error(name.as_str()));
             }
 
             let func_ctx = FuncCtx {
@@ -701,7 +701,19 @@ pub fn translate_expr(
                 Func::Window(_) => {
                     crate::bail_parse_error!("misuse of window function {}()", name.as_str())
                 }
+                Func::External(external) if external.is_aggregate() => {
+                    crate::bail_parse_error!(
+                        "misuse of {} function {}()",
+                        if filter_over.over_clause.is_some() {
+                            "window"
+                        } else {
+                            "aggregate"
+                        },
+                        name.as_str()
+                    )
+                }
                 Func::External(_) | Func::Dialect(_) => {
+                    let constant_mask = constant_arg_mask(args, resolver);
                     let regs = program.alloc_registers(args_count);
                     for (i, arg_expr) in args.iter().enumerate() {
                         translate_expr(program, referenced_tables, arg_expr, regs + i, resolver)?;
@@ -709,7 +721,13 @@ pub fn translate_expr(
 
                     // Use shared function call helper
                     let arg_registers: Vec<usize> = (regs..regs + args_count).collect();
-                    emit_function_call(program, func_ctx, &arg_registers, target_register)?;
+                    emit_function_call(
+                        program,
+                        func_ctx,
+                        &arg_registers,
+                        target_register,
+                        constant_mask,
+                    )?;
 
                     Ok(target_register)
                 }
@@ -863,7 +881,7 @@ pub fn translate_expr(
                         let start_reg = program.alloc_register();
                         translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
 
-                        emit_function_call(program, func_ctx, &[start_reg], target_register)?;
+                        emit_function_call(program, func_ctx, &[start_reg], target_register, 0)?;
                         Ok(target_register)
                     }
                     VectorFunc::Vector32Sparse => {
@@ -871,7 +889,7 @@ pub fn translate_expr(
                         let start_reg = program.alloc_register();
                         translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
 
-                        emit_function_call(program, func_ctx, &[start_reg], target_register)?;
+                        emit_function_call(program, func_ctx, &[start_reg], target_register, 0)?;
                         Ok(target_register)
                     }
                     VectorFunc::Vector64 => {
@@ -879,7 +897,7 @@ pub fn translate_expr(
                         let start_reg = program.alloc_register();
                         translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
 
-                        emit_function_call(program, func_ctx, &[start_reg], target_register)?;
+                        emit_function_call(program, func_ctx, &[start_reg], target_register, 0)?;
                         Ok(target_register)
                     }
                     VectorFunc::Vector8 => {
@@ -887,7 +905,7 @@ pub fn translate_expr(
                         let start_reg = program.alloc_register();
                         translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
 
-                        emit_function_call(program, func_ctx, &[start_reg], target_register)?;
+                        emit_function_call(program, func_ctx, &[start_reg], target_register, 0)?;
                         Ok(target_register)
                     }
                     VectorFunc::Vector1Bit => {
@@ -895,7 +913,7 @@ pub fn translate_expr(
                         let start_reg = program.alloc_register();
                         translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
 
-                        emit_function_call(program, func_ctx, &[start_reg], target_register)?;
+                        emit_function_call(program, func_ctx, &[start_reg], target_register, 0)?;
                         Ok(target_register)
                     }
                     VectorFunc::VectorExtract => {
@@ -903,7 +921,7 @@ pub fn translate_expr(
                         let start_reg = program.alloc_register();
                         translate_expr(program, referenced_tables, &args[0], start_reg, resolver)?;
 
-                        emit_function_call(program, func_ctx, &[start_reg], target_register)?;
+                        emit_function_call(program, func_ctx, &[start_reg], target_register, 0)?;
                         Ok(target_register)
                     }
                     VectorFunc::VectorDistanceCos => {
@@ -912,7 +930,13 @@ pub fn translate_expr(
                         translate_expr(program, referenced_tables, &args[0], regs, resolver)?;
                         translate_expr(program, referenced_tables, &args[1], regs + 1, resolver)?;
 
-                        emit_function_call(program, func_ctx, &[regs, regs + 1], target_register)?;
+                        emit_function_call(
+                            program,
+                            func_ctx,
+                            &[regs, regs + 1],
+                            target_register,
+                            0,
+                        )?;
                         Ok(target_register)
                     }
                     VectorFunc::VectorDistanceL2 => {
@@ -921,7 +945,13 @@ pub fn translate_expr(
                         translate_expr(program, referenced_tables, &args[0], regs, resolver)?;
                         translate_expr(program, referenced_tables, &args[1], regs + 1, resolver)?;
 
-                        emit_function_call(program, func_ctx, &[regs, regs + 1], target_register)?;
+                        emit_function_call(
+                            program,
+                            func_ctx,
+                            &[regs, regs + 1],
+                            target_register,
+                            0,
+                        )?;
                         Ok(target_register)
                     }
                     VectorFunc::VectorDistanceJaccard => {
@@ -930,7 +960,13 @@ pub fn translate_expr(
                         translate_expr(program, referenced_tables, &args[0], regs, resolver)?;
                         translate_expr(program, referenced_tables, &args[1], regs + 1, resolver)?;
 
-                        emit_function_call(program, func_ctx, &[regs, regs + 1], target_register)?;
+                        emit_function_call(
+                            program,
+                            func_ctx,
+                            &[regs, regs + 1],
+                            target_register,
+                            0,
+                        )?;
                         Ok(target_register)
                     }
                     VectorFunc::VectorDistanceDot => {
@@ -939,7 +975,13 @@ pub fn translate_expr(
                         translate_expr(program, referenced_tables, &args[0], regs, resolver)?;
                         translate_expr(program, referenced_tables, &args[1], regs + 1, resolver)?;
 
-                        emit_function_call(program, func_ctx, &[regs, regs + 1], target_register)?;
+                        emit_function_call(
+                            program,
+                            func_ctx,
+                            &[regs, regs + 1],
+                            target_register,
+                            0,
+                        )?;
                         Ok(target_register)
                     }
                     VectorFunc::VectorConcat => {
@@ -948,7 +990,13 @@ pub fn translate_expr(
                         translate_expr(program, referenced_tables, &args[0], regs, resolver)?;
                         translate_expr(program, referenced_tables, &args[1], regs + 1, resolver)?;
 
-                        emit_function_call(program, func_ctx, &[regs, regs + 1], target_register)?;
+                        emit_function_call(
+                            program,
+                            func_ctx,
+                            &[regs, regs + 1],
+                            target_register,
+                            0,
+                        )?;
                         Ok(target_register)
                     }
                     VectorFunc::VectorSlice => {
@@ -958,7 +1006,13 @@ pub fn translate_expr(
                         translate_expr(program, referenced_tables, &args[1], regs + 1, resolver)?;
                         translate_expr(program, referenced_tables, &args[2], regs + 2, resolver)?;
 
-                        emit_function_call(program, func_ctx, &[regs, regs + 2], target_register)?;
+                        emit_function_call(
+                            program,
+                            func_ctx,
+                            &[regs, regs + 2],
+                            target_register,
+                            0,
+                        )?;
                         Ok(target_register)
                     }
                 },
@@ -2145,7 +2199,7 @@ pub fn translate_expr(
             let func_type = resolver.resolve_function(name.as_str(), args_count)?;
 
             if func_type.is_none() {
-                crate::bail_parse_error!("no such function: {}", name.as_str());
+                return Err(resolver.no_such_function_error(name.as_str()));
             }
 
             let func = func_type.unwrap();
@@ -2165,6 +2219,17 @@ pub fn translate_expr(
                 }
                 Func::Window(_) => {
                     crate::bail_parse_error!("misuse of window function {}()", name.as_str())
+                }
+                Func::External(external) if external.is_aggregate() => {
+                    crate::bail_parse_error!(
+                        "misuse of {} function {}(*)",
+                        if filter_over.over_clause.is_some() {
+                            "window"
+                        } else {
+                            "aggregate"
+                        },
+                        name.as_str()
+                    )
                 }
                 // For functions that need star expansion (json_object, jsonb_object),
                 // expand the * to all columns from the referenced tables as key-value pairs

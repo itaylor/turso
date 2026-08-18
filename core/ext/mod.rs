@@ -1,3 +1,4 @@
+pub mod adapter;
 #[cfg(feature = "fs")]
 mod dynamic;
 mod vtab_xconnect;
@@ -16,10 +17,15 @@ use crate::UringIO;
 #[cfg(all(target_os = "windows", feature = "experimental_win_iocp", not(miri)))]
 use crate::WindowsIOCP;
 
-use crate::{function::ExternalFunc, Connection, Database};
+use crate::sync::RwLock;
+use crate::udf::{validate_registration, ExternalFunc, FunctionFlags};
 use crate::{vtab::VirtualTable, SymbolTable};
+use crate::{Connection, Database};
 #[cfg(feature = "fs")]
 use crate::{LimboError, IO};
+pub use adapter::{
+    ExtAggregateAdapter, ExtScalarAdapter, WindowInverseFunction, WindowValueFunction,
+};
 #[cfg(feature = "fs")]
 pub use dynamic::{add_builtin_vfs_extensions, add_vfs_module, list_vfs_modules, VfsMod};
 use std::{
@@ -28,20 +34,35 @@ use std::{
 };
 use turso_ext::{
     ContextDestructor, ExtensionApi, InitAggFunction, ResultCode, ScalarFunction, VTabKind,
-    VTabModuleImpl, ValueDestructor,
+    VTabModuleImpl, ValueDestructor, TURSO_EXT_API_VERSION,
 };
 pub use turso_ext::{FinalizeFunction, StepFunction, Value as ExtValue, ValueType as ExtValueType};
 pub use vtab_xconnect::{execute, prepare_stmt};
 
 /// The context passed to extensions to register with Core
-/// along with the function pointers
+/// along with the function pointers.
+///
+/// Holds the symbol table's lock, not the table, so the C-ABI shims take the
+/// write lock like every other writer. The pointer stays valid because the
+/// context only lives between `_build_turso_ext` and `_free_extension_ctx`.
 #[repr(C)]
 pub struct ExtensionCtx {
-    syms: *mut SymbolTable,
+    syms: *const RwLock<SymbolTable>,
     schema: *mut c_void,
     /// We must bump the prepare context generation so prepared statements
     /// know they need to be reprepared after extension registration.
     prepare_context_generation: *const AtomicU64,
+    /// ABI the registering extension was built against. One context is built
+    /// per `load_extension` call, so this is per-extension.
+    abi_version: u32,
+}
+
+impl ExtensionCtx {
+    unsafe fn bump_generation(&self) {
+        if !self.prepare_context_generation.is_null() {
+            unsafe { (*self.prepare_context_generation).fetch_add(1, Ordering::Release) };
+        }
+    }
 }
 
 pub(crate) unsafe extern "C" fn register_vtab_module(
@@ -68,24 +89,30 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
     };
 
     unsafe {
-        let syms = &mut *ext_ctx.syms;
-        syms.vtab_modules.insert(name_str.clone(), vmodule.into());
-        if !ext_ctx.prepare_context_generation.is_null() {
-            (*ext_ctx.prepare_context_generation).fetch_add(1, Ordering::Release);
-        }
-
-        if kind == VTabKind::TableValuedFunction {
-            if let Ok(vtab) = VirtualTable::function(&name_str, syms) {
-                let table = Arc::new(Table::Virtual(vtab));
-                let mutex = &*(ext_ctx.schema as *mut Mutex<Arc<Schema>>);
-                let mut guard = mutex.lock();
-                let Ok(schema) = Schema::try_make_mut(&mut guard) else {
-                    return ResultCode::Error;
-                };
-                schema.tables.insert(name_str, table);
+        let vtab = {
+            let mut syms = (*ext_ctx.syms).write();
+            syms.vtab_modules.insert(name_str.clone(), vmodule.into());
+            if kind == VTabKind::TableValuedFunction {
+                match VirtualTable::function(&name_str, &syms) {
+                    Ok(vtab) => Some(vtab),
+                    Err(_) => return ResultCode::Error,
+                }
             } else {
-                return ResultCode::Error;
+                None
             }
+        };
+        ext_ctx.bump_generation();
+
+        // Take the schema lock only after dropping the symbol-table lock, so
+        // the two never nest.
+        if let Some(vtab) = vtab {
+            let table = Arc::new(Table::Virtual(vtab));
+            let mutex = &*(ext_ctx.schema as *mut Mutex<Arc<Schema>>);
+            let mut guard = mutex.lock();
+            let Ok(schema) = Schema::try_make_mut(&mut guard) else {
+                return ResultCode::Error;
+            };
+            schema.tables.insert(name_str, table);
         }
     }
     ResultCode::OK
@@ -95,14 +122,6 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
 pub struct VTabImpl {
     pub module_kind: VTabKind,
     pub implementation: Arc<VTabModuleImpl>,
-}
-
-pub(crate) unsafe fn register_scalar_function(
-    ctx: *mut c_void,
-    name: *const c_char,
-    func: ScalarFunction,
-) -> ResultCode {
-    unsafe { register_scalar_function_with_options(ctx, name, -1, false, 0, func, None, None) }
 }
 
 pub(crate) unsafe extern "C" fn register_scalar_function_with_options(
@@ -115,7 +134,7 @@ pub(crate) unsafe extern "C" fn register_scalar_function_with_options(
     context_destructor: Option<ContextDestructor>,
     value_destructor: Option<ValueDestructor>,
 ) -> ResultCode {
-    if ctx.is_null() || name.is_null() || argc < -1 {
+    if ctx.is_null() || name.is_null() {
         return ResultCode::InvalidArgs;
     }
     let c_str = unsafe { CStr::from_ptr(name) };
@@ -123,23 +142,26 @@ pub(crate) unsafe extern "C" fn register_scalar_function_with_options(
         Ok(s) => crate::util::normalize_ident(s),
         Err(_) => return ResultCode::InvalidArgs,
     };
+    if validate_registration(&name_str, argc).is_err() {
+        return ResultCode::InvalidArgs;
+    }
+    let mut flags = FunctionFlags::empty();
+    if deterministic {
+        flags |= FunctionFlags::DETERMINISTIC;
+    }
+    let func = Arc::new(ExternalFunc::new_scalar(
+        name_str,
+        argc,
+        flags,
+        Arc::new(
+            ExtScalarAdapter::new(context, callback, context_destructor, value_destructor)
+                .with_abi_version(unsafe { (*(ctx as *mut ExtensionCtx)).abi_version }),
+        ),
+    ));
     let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };
     unsafe {
-        (*ext_ctx.syms).functions.insert(
-            name_str.clone(),
-            Arc::new(ExternalFunc::new_scalar(
-                name_str,
-                argc,
-                deterministic,
-                context,
-                callback,
-                context_destructor,
-                value_destructor,
-            )),
-        );
-        if !ext_ctx.prepare_context_generation.is_null() {
-            (*ext_ctx.prepare_context_generation).fetch_add(1, Ordering::Release);
-        }
+        (*ext_ctx.syms).write().insert_function(func);
+        ext_ctx.bump_generation();
     }
     ResultCode::OK
 }
@@ -158,12 +180,14 @@ pub(crate) unsafe extern "C" fn unregister_function(
     };
     let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };
     unsafe {
-        if (*ext_ctx.syms).functions.remove(&name_str).is_none() {
+        // The C ABI takes no argument count, so every arity goes.
+        if !(*ext_ctx.syms)
+            .write()
+            .remove_all_functions_named(&name_str)
+        {
             return ResultCode::NotFound;
         }
-        if !ext_ctx.prepare_context_generation.is_null() {
-            (*ext_ctx.prepare_context_generation).fetch_add(1, Ordering::Release);
-        }
+        ext_ctx.bump_generation();
     }
     ResultCode::OK
 }
@@ -180,7 +204,7 @@ pub(crate) unsafe extern "C" fn register_aggregate_function(
     aggregate_destructor: Option<ContextDestructor>,
     value_destructor: Option<ValueDestructor>,
 ) -> ResultCode {
-    if ctx.is_null() || name.is_null() || args < -1 {
+    if ctx.is_null() || name.is_null() {
         return ResultCode::InvalidArgs;
     }
     let c_str = unsafe { CStr::from_ptr(name) };
@@ -188,23 +212,88 @@ pub(crate) unsafe extern "C" fn register_aggregate_function(
         Ok(s) => crate::util::normalize_ident(s),
         Err(_) => return ResultCode::InvalidArgs,
     };
-    let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };
-    unsafe {
-        (*ext_ctx.syms).functions.insert(
-            name_str.clone(),
-            Arc::new(ExternalFunc::new_aggregate(
-                name_str,
-                args,
+    if validate_registration(&name_str, args).is_err() {
+        return ResultCode::InvalidArgs;
+    }
+    // The ABI has no way to declare flags for a plain aggregate.
+    let func = Arc::new(ExternalFunc::new_aggregate(
+        name_str,
+        args,
+        FunctionFlags::empty(),
+        Arc::new(
+            ExtAggregateAdapter::new(
                 context,
-                (init_func, step_func, finalize_func),
+                init_func,
+                step_func,
+                finalize_func,
                 context_destructor,
                 aggregate_destructor,
                 value_destructor,
-            )),
-        );
-        if !ext_ctx.prepare_context_generation.is_null() {
-            (*ext_ctx.prepare_context_generation).fetch_add(1, Ordering::Release);
-        }
+            )
+            .with_abi_version(unsafe { (*(ctx as *mut ExtensionCtx)).abi_version }),
+        ),
+    ));
+    let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };
+    unsafe {
+        (*ext_ctx.syms).write().insert_function(func);
+        ext_ctx.bump_generation();
+    }
+    ResultCode::OK
+}
+
+/// [`register_aggregate_function`] plus the `xValue`/`xInverse` callbacks that
+/// let the aggregate run over a window frame.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe extern "C" fn register_window_function(
+    ctx: *mut c_void,
+    name: *const c_char,
+    args: i32,
+    flags: u32,
+    context: usize,
+    init_func: InitAggFunction,
+    step_func: StepFunction,
+    finalize_func: FinalizeFunction,
+    value_func: WindowValueFunction,
+    inverse_func: WindowInverseFunction,
+    context_destructor: Option<ContextDestructor>,
+    aggregate_destructor: Option<ContextDestructor>,
+    value_destructor: Option<ValueDestructor>,
+) -> ResultCode {
+    if ctx.is_null() || name.is_null() {
+        return ResultCode::InvalidArgs;
+    }
+    let c_str = unsafe { CStr::from_ptr(name) };
+    let name_str = match c_str.to_str() {
+        Ok(s) => crate::util::normalize_ident(s),
+        Err(_) => return ResultCode::InvalidArgs,
+    };
+    if validate_registration(&name_str, args).is_err() {
+        return ResultCode::InvalidArgs;
+    }
+    let func = Arc::new(ExternalFunc::new_aggregate(
+        name_str,
+        args,
+        // Truncate rather than reject, so a newer header still registers.
+        FunctionFlags::from_bits_truncate(flags),
+        Arc::new(
+            ExtAggregateAdapter::new_window(
+                context,
+                init_func,
+                step_func,
+                finalize_func,
+                value_func,
+                inverse_func,
+                context_destructor,
+                aggregate_destructor,
+                value_destructor,
+            )
+            .with_abi_version(unsafe { (*(ctx as *mut ExtensionCtx)).abi_version }),
+        ),
+    ));
+    let ext_ctx = unsafe { &mut *(ctx as *mut ExtensionCtx) };
+    unsafe {
+        (*ext_ctx.syms).write().insert_function(func);
+        ext_ctx.bump_generation();
     }
     ResultCode::OK
 }
@@ -258,7 +347,7 @@ impl Database {
             syms.index_methods
                 .insert(FTS_INDEX_METHOD_NAME.to_string(), Arc::new(FtsIndexMethod));
         }
-        let syms = self.builtin_syms.data_ptr();
+        let syms = &self.builtin_syms as *const RwLock<SymbolTable>;
         // Pass the mutex pointer and the appropriate handler
         let schema_mutex_ptr =
             &*self.schema as *const Mutex<Arc<Schema>> as *mut Mutex<Arc<Schema>>;
@@ -266,6 +355,8 @@ impl Database {
             syms,
             schema: schema_mutex_ptr as *mut c_void,
             prepare_context_generation: std::ptr::null(),
+            // Built-ins are compiled together with the host.
+            abi_version: TURSO_EXT_API_VERSION,
         }));
         #[allow(unused)]
         let mut ext_api = ExtensionApi {
@@ -280,6 +371,8 @@ impl Database {
                 builtin_vfs: std::ptr::null_mut(),
                 builtin_vfs_count: 0,
             },
+            api_version: TURSO_EXT_API_VERSION,
+            register_window_function,
         };
 
         #[cfg(feature = "uuid")]
@@ -335,12 +428,22 @@ impl Connection {
     /// }
     ///```
     pub unsafe fn _build_turso_ext(&self) -> ExtensionApi {
+        // Statically linked extensions are compiled with the host.
+        unsafe { self.build_turso_ext_for_abi(TURSO_EXT_API_VERSION) }
+    }
+
+    /// Same, for an extension that reported its own ABI version.
+    ///
+    /// # Safety
+    /// Same as [`Connection::_build_turso_ext`].
+    pub(crate) unsafe fn build_turso_ext_for_abi(&self, abi_version: u32) -> ExtensionApi {
         let schema_mutex_ptr =
             &*self.db.schema as *const Mutex<Arc<Schema>> as *mut Mutex<Arc<Schema>>;
         let ctx = ExtensionCtx {
-            syms: self.syms.data_ptr(),
+            syms: &self.syms as *const RwLock<SymbolTable>,
             schema: schema_mutex_ptr as *mut c_void,
             prepare_context_generation: &self.prepare_context_generation as *const _,
+            abi_version,
         };
         let ctx = Box::into_raw(Box::new(ctx)) as *mut c_void;
         ExtensionApi {
@@ -355,6 +458,8 @@ impl Connection {
                 builtin_vfs: std::ptr::null_mut(),
                 builtin_vfs_count: 0,
             },
+            api_version: TURSO_EXT_API_VERSION,
+            register_window_function,
         }
     }
 

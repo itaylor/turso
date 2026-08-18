@@ -400,7 +400,7 @@ pub fn plan_subqueries_from_select_plan(
         recollect_aggregates(plan, resolver)?;
     }
 
-    assign_select_subquery_eval_phases(plan);
+    assign_select_subquery_eval_phases(plan, resolver);
     mark_shared_cte_materialization_requirements(
         &mut plan.table_references,
         &mut plan.non_from_clause_subqueries,
@@ -2097,7 +2097,7 @@ pub fn emit_non_from_clause_subqueries_for_eval_at(
     )
 }
 
-fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
+fn assign_select_subquery_eval_phases(plan: &mut SelectPlan, resolver: &Resolver) {
     let has_grouped_output = plan
         .group_by
         .as_ref()
@@ -2127,7 +2127,7 @@ fn assign_select_subquery_eval_phases(plan: &mut SelectPlan) {
         // in the outer query's aggregate-output phase, after that aggregate has
         // been finalized into a register; run earlier, the aggregate expression
         // inside the subquery has no register to read.
-        if subquery_reads_outer_aggregate(subquery) {
+        if subquery_reads_outer_aggregate(subquery, resolver) {
             subquery.eval_phase = if has_grouped_output {
                 SubqueryEvalPhase::GroupedOutput
             } else {
@@ -2185,7 +2185,7 @@ fn expr_reads_subquery(expr: &ast::Expr, subquery_ids: &[ast::TableInternalId]) 
 /// Window functions (an aggregate name with an `OVER` clause) are computed by
 /// the subquery itself, not the outer query, so they are not counted here even
 /// though they also do not appear in `aggregates`.
-fn subquery_reads_outer_aggregate(subquery: &NonFromClauseSubquery) -> bool {
+fn subquery_reads_outer_aggregate(subquery: &NonFromClauseSubquery, resolver: &Resolver) -> bool {
     let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state else {
         return false;
     };
@@ -2202,10 +2202,12 @@ fn subquery_reads_outer_aggregate(subquery: &NonFromClauseSubquery) -> bool {
                 ..
             } = e
             {
+                // An application function shadowing an aggregate's name is not an aggregate; an application
+                // aggregate under a new name is one.
                 let is_plain_aggregate = filter_over.over_clause.is_none()
                     && matches!(
-                        crate::function::Func::resolve_function(name.as_str(), args.len()),
-                        Ok(Some(crate::function::Func::Agg(_)))
+                        resolver.resolve_function(name.as_str(), args.len()),
+                        Ok(Some(func)) if func.is_aggregate()
                     );
                 if is_plain_aggregate && !select.aggregates.iter().any(|a| a.original_expr == *e) {
                     found = true;

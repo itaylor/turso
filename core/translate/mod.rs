@@ -116,6 +116,7 @@ pub fn translate(
         connection.attached_databases(),
         syms,
         connection.experimental_custom_types_enabled(),
+        connection.trusted_schema(),
         connection.get_dqs_dml().into(),
         // Engine-generated helper statements are always SQLite text and
         // must resolve functions with SQLite semantics regardless of the

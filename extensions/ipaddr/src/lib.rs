@@ -7,7 +7,7 @@ register_extension! {
     scalars: { ip_contains, ip_family, ip_host, ip_masklen, ip_network },
 }
 
-#[scalar(name = "ipcontains")]
+#[scalar(name = "ipcontains", argc = 2, deterministic)]
 fn ip_contains(args: &[Value]) -> Value {
     let Some(cidr_arg) = args[0].to_text() else {
         return Value::error(ResultCode::InvalidArgs);
@@ -28,7 +28,7 @@ fn ip_contains(args: &[Value]) -> Value {
     Value::from_integer(network.contains(ip) as i64)
 }
 
-#[scalar(name = "ipfamily")]
+#[scalar(name = "ipfamily", argc = 1, deterministic)]
 fn ip_family(args: &[Value]) -> Value {
     let Some(ip_addr) = args[0].to_text() else {
         return Value::error(ResultCode::InvalidArgs);
@@ -41,7 +41,7 @@ fn ip_family(args: &[Value]) -> Value {
     }
 }
 
-#[scalar(name = "iphost")]
+#[scalar(name = "iphost", argc = 1, deterministic)]
 fn ip_host(args: &[Value]) -> Value {
     let Some(cidr_arg) = args[0].to_text() else {
         return Value::error(ResultCode::InvalidArgs);
@@ -54,7 +54,7 @@ fn ip_host(args: &[Value]) -> Value {
     return Value::from_text(network.ip().to_string());
 }
 
-#[scalar(name = "ipmasklen")]
+#[scalar(name = "ipmasklen", argc = 1, deterministic)]
 fn ip_masklen(args: &[Value]) -> Value {
     let Some(cidr_arg) = args[0].to_text() else {
         return Value::error(ResultCode::InvalidArgs);
@@ -67,7 +67,7 @@ fn ip_masklen(args: &[Value]) -> Value {
     Value::from_integer(network.prefix() as i64)
 }
 
-#[scalar(name = "ipnetwork")]
+#[scalar(name = "ipnetwork", argc = 1, deterministic)]
 fn ip_network(args: &[Value]) -> Value {
     let Some(cidr_arg) = args[0].to_text() else {
         return Value::error(ResultCode::InvalidArgs);

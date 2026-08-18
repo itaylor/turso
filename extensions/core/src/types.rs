@@ -108,11 +108,24 @@ pub enum ValueType {
     Error,
 }
 
+/// Subtype stamped on JSON results, matching SQLite. The only subtype the
+/// engine itself interprets; extensions may use any other byte.
+pub const JSON_SUBTYPE: u8 = b'J';
+
 #[repr(C)]
 pub struct Value {
     value_type: ValueType,
+    /// `0` means no subtype. Only trustworthy when the extension reports ABI
+    /// version 2 or later; older extensions leave these bytes uninitialized.
+    subtype: u8,
+    _reserved: [u8; 3],
     value: ValueData,
 }
+
+// Layout is ABI: extensions already compiled against this header depend on it.
+const _: () = assert!(std::mem::size_of::<Value>() == 16);
+const _: () = assert!(std::mem::align_of::<Value>() == 8);
+const _: () = assert!(std::mem::offset_of!(Value, value) == 8);
 impl Default for Value {
     fn default() -> Self {
         Self::null()
@@ -285,6 +298,8 @@ impl Value {
     pub const fn null() -> Self {
         Self {
             value_type: ValueType::Null,
+            subtype: 0,
+            _reserved: [0; 3],
             value: ValueData { int: 0 },
         }
     }
@@ -332,6 +347,12 @@ impl Value {
     }
 
     pub fn is_json(&self) -> bool {
+        self.subtype() == JSON_SUBTYPE
+    }
+
+    /// Reads the JSON flag stored inside the text itself, ignoring the
+    /// subtype byte. Used when the extension may predate the subtype byte.
+    pub fn is_json_text(&self) -> bool {
         unsafe {
             if self.value_type == ValueType::Text && !self.value.text.is_null() {
                 let txt = &*self.value.text;
@@ -339,6 +360,36 @@ impl Value {
             }
         }
         false
+    }
+
+    /// `0` means no subtype. Text whose in-text JSON flag is set reports
+    /// [`JSON_SUBTYPE`] even when the byte is unset, for pre-v2 extensions.
+    pub fn subtype(&self) -> u8 {
+        if self.subtype != 0 {
+            return self.subtype;
+        }
+        if self.is_json_text() {
+            JSON_SUBTYPE
+        } else {
+            0
+        }
+    }
+
+    /// Subtypes are transient: a value written into a table row loses its
+    /// subtype.
+    #[must_use]
+    pub fn with_subtype(mut self, subtype: u8) -> Self {
+        self.subtype = subtype;
+        // Keep the in-text JSON flag in step, for pre-v2 hosts.
+        if self.value_type == ValueType::Text && !unsafe { self.value.text }.is_null() {
+            let txt = unsafe { &mut *(self.value.text as *mut TextValue) };
+            txt._type = if subtype == JSON_SUBTYPE {
+                TextSubtype::Json
+            } else {
+                TextSubtype::Text
+            };
+        }
+        self
     }
 
     /// Returns the blob value if the ValueType is Blob (copies the data)
@@ -434,6 +485,8 @@ impl Value {
     pub fn from_integer(i: i64) -> Self {
         Self {
             value_type: ValueType::Integer,
+            subtype: 0,
+            _reserved: [0; 3],
             value: ValueData { int: i },
         }
     }
@@ -442,6 +495,8 @@ impl Value {
     pub fn from_float(value: f64) -> Self {
         Self {
             value_type: ValueType::Float,
+            subtype: 0,
+            _reserved: [0; 3],
             value: ValueData { float: value },
         }
     }
@@ -452,6 +507,8 @@ impl Value {
         let ptr = Box::into_raw(txt_value);
         Self {
             value_type: ValueType::Text,
+            subtype: 0,
+            _reserved: [0; 3],
             value: ValueData { text: ptr },
         }
     }
@@ -461,6 +518,8 @@ impl Value {
         let ptr = Box::into_raw(txt_value);
         Self {
             value_type: ValueType::Text,
+            subtype: JSON_SUBTYPE,
+            _reserved: [0; 3],
             value: ValueData { text: ptr },
         }
     }
@@ -470,6 +529,8 @@ impl Value {
         let err_val = ErrValue::new(code);
         Self {
             value_type: ValueType::Error,
+            subtype: 0,
+            _reserved: [0; 3],
             value: ValueData {
                 error: Box::into_raw(Box::new(err_val)) as *const ErrValue,
             },
@@ -482,6 +543,8 @@ impl Value {
         let err_box = Box::new(err_value);
         Self {
             value_type: ValueType::Error,
+            subtype: 0,
+            _reserved: [0; 3],
             value: ValueData {
                 error: Box::into_raw(err_box) as *const ErrValue,
             },
@@ -496,6 +559,8 @@ impl Value {
         let boxed_blob = Box::new(Blob::new(ptr, len as u64));
         Self {
             value_type: ValueType::Blob,
+            subtype: 0,
+            _reserved: [0; 3],
             value: ValueData {
                 blob: Box::into_raw(boxed_blob) as *const Blob,
             },
@@ -528,5 +593,115 @@ impl Value {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TextSubtype, Value, ValueType, JSON_SUBTYPE};
+
+    /// The `core_only` free path is not enabled in tests, so free by hand.
+    fn free(value: Value) {
+        unsafe {
+            match value.value_type {
+                ValueType::Text => {
+                    let txt = Box::from_raw(value.value.text as *mut super::TextValue);
+                    if !txt.text.is_null() {
+                        let ptr = std::ptr::slice_from_raw_parts_mut(
+                            txt.text as *mut u8,
+                            txt.len as usize,
+                        );
+                        drop(Box::from_raw(ptr));
+                    }
+                }
+                ValueType::Blob => {
+                    let blob = Box::from_raw(value.value.blob as *mut super::Blob);
+                    if !blob.data.is_null() {
+                        let ptr = std::ptr::slice_from_raw_parts_mut(
+                            blob.data as *mut u8,
+                            blob.size as usize,
+                        );
+                        drop(Box::from_raw(ptr));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn subtype_byte_did_not_move_the_union_or_grow_the_value() {
+        assert_eq!(std::mem::size_of::<Value>(), 16);
+        assert_eq!(std::mem::align_of::<Value>(), 8);
+        assert_eq!(std::mem::offset_of!(Value, value), 8);
+        assert_eq!(std::mem::offset_of!(Value, subtype), 4);
+        assert_eq!(std::mem::offset_of!(Value, _reserved), 5);
+    }
+
+    #[test]
+    fn a_value_with_no_subtype_reports_zero() {
+        assert_eq!(Value::null().subtype(), 0);
+        assert_eq!(Value::from_integer(5).subtype(), 0);
+        assert_eq!(Value::from_float(1.5).subtype(), 0);
+        let text = Value::from_text("hi".to_string());
+        assert_eq!(text.subtype(), 0);
+        free(text);
+        let blob = Value::from_blob(vec![0u8]);
+        assert_eq!(blob.subtype(), 0);
+        free(blob);
+    }
+
+    #[test]
+    fn every_value_type_can_carry_a_subtype() {
+        assert_eq!(Value::null().with_subtype(42).subtype(), 42);
+        assert_eq!(Value::from_integer(5).with_subtype(42).subtype(), 42);
+        assert_eq!(Value::from_float(1.5).with_subtype(42).subtype(), 42);
+        let text = Value::from_text("hi".to_string()).with_subtype(42);
+        assert_eq!(text.subtype(), 42);
+        free(text);
+        let blob = Value::from_blob(vec![0u8]).with_subtype(42);
+        assert_eq!(blob.subtype(), 42);
+        free(blob);
+    }
+
+    #[test]
+    fn json_text_says_so_in_both_places() {
+        let json = Value::from_json("[1]".to_string());
+        assert_eq!(json.subtype(), JSON_SUBTYPE);
+        assert!(json.is_json());
+        assert!(json.is_json_text());
+        free(json);
+
+        let tagged = Value::from_text("[1]".to_string()).with_subtype(JSON_SUBTYPE);
+        assert!(tagged.is_json_text());
+        assert!(tagged.is_json());
+        free(tagged);
+    }
+
+    #[test]
+    fn retagging_json_text_clears_its_json_flag() {
+        let value = Value::from_json("[1]".to_string()).with_subtype(7);
+        assert_eq!(value.subtype(), 7);
+        assert!(!value.is_json());
+        assert!(!value.is_json_text());
+        free(value);
+    }
+
+    #[test]
+    fn text_from_an_older_extension_still_reads_as_json() {
+        let value = Value::from_text("[1]".to_string());
+        unsafe { (*(value.value.text as *mut super::TextValue))._type = TextSubtype::Json };
+        assert_eq!(value.subtype, 0);
+        assert_eq!(value.subtype(), JSON_SUBTYPE);
+        assert!(value.is_json());
+        free(value);
+    }
+
+    #[test]
+    fn a_subtype_of_zero_means_no_subtype() {
+        let value = Value::from_json("[1]".to_string()).with_subtype(0);
+        assert_eq!(value.subtype(), 0);
+        assert!(!value.is_json());
+        free(value);
     }
 }

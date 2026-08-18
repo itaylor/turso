@@ -635,6 +635,7 @@ fn try_rewrite_single_value_aggregate(
             no_reorder: false,
         }),
         subquery_id,
+        Some(resolver.symbol_table),
     )?;
     // A scalar subquery result has no text order. Do not give its replacement
     // the text order of the grouped table's first result column.
@@ -657,6 +658,15 @@ fn try_rewrite_single_value_aggregate(
     };
     let replacement = match empty_value {
         EmptyInputValue::Null => result_column,
+        // The rewrite emits `coalesce(x, 0)`; an application two-argument `coalesce` would change the answer.
+        EmptyInputValue::IntegerZero | EmptyInputValue::RealZero
+            if resolver
+                .symbol_table
+                .resolve_function("coalesce", 2)
+                .is_some() =>
+        {
+            return Ok(None);
+        }
         EmptyInputValue::IntegerZero => coalesce_with_zero(result_column, "0"),
         EmptyInputValue::RealZero => coalesce_with_zero(result_column, "0.0"),
     };

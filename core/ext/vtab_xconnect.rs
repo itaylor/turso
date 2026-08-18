@@ -10,6 +10,12 @@ use turso_ext::{Conn as ExtConn, ResultCode, Stmt, Value as ExtValue};
 
 /// Wrapper around core Connection::execute with optional arguments to bind
 /// to the statment This function takes ownership of the optional turso_ext::Value array if provided
+///
+/// # Safety
+///
+/// `ctx` must be a live `ExtConn`, `sql` a NUL-terminated C string, `args`
+/// null or an array of `arg_count` values this call takes ownership of, and
+/// `last_insert_rowid` writable or null.
 pub unsafe extern "C" fn execute(
     ctx: *mut ExtConn,
     sql: *const c_char,
@@ -82,6 +88,10 @@ pub unsafe extern "C" fn execute(
 
 /// Wraps core Connection::prepare with a custom Stmt object with the necessary function pointers.
 /// This object is boxed/leaked and the caller is responsible for freeing the memory.
+///
+/// # Safety
+///
+/// `ctx` must be a live `ExtConn` and `sql` a NUL-terminated C string.
 pub unsafe extern "C" fn prepare_stmt(ctx: *mut ExtConn, sql: *const c_char) -> *mut Stmt {
     let c_str = unsafe { CStr::from_ptr(sql as *mut c_char) };
     let sql_str = match c_str.to_str() {

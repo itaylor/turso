@@ -4307,7 +4307,27 @@ fn string_literal_eq(value: &str, expected: &str) -> bool {
     value.trim_matches('\'').eq_ignore_ascii_case(expected)
 }
 
-pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
+/// How function calls in a schema-stored expression (generated column, index expression, partial
+/// index WHERE) are checked.
+#[derive(Clone, Copy)]
+pub(crate) enum SchemaFunctionCheck<'a> {
+    /// Compiling CREATE/ALTER: every function must be registered now, non-aggregate and deterministic.
+    Creating(&'a Resolver<'a>),
+    /// Reading a stored schema row back: skipped, since the function may not be registered on this
+    /// connection. Like SQLite, it fails when a statement actually needs it.
+    Loading,
+}
+
+/// The CREATE/ALTER-time check: functions must resolve, be scalar and deterministic, and be
+/// usable from schema SQL (no DIRECTONLY; only INNOCUOUS when `trusted_schema` is off).
+pub(crate) fn validate_generated_expr_on_create(expr: &Expr, resolver: &Resolver) -> Result<()> {
+    let saved = resolver.begin_schema_sql();
+    let result = validate_generated_expr(expr, SchemaFunctionCheck::Creating(resolver));
+    resolver.end_schema_sql(saved);
+    result
+}
+
+pub(crate) fn validate_generated_expr(expr: &Expr, funcs: SchemaFunctionCheck<'_>) -> Result<()> {
     use ast::Expr;
     match expr {
         Expr::Qualified(_, _) => {
@@ -4334,21 +4354,21 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
             if filter_over.over_clause.is_some() {
                 bail_parse_error!("window functions prohibited in generated columns");
             }
-            let arg_count = args.len();
-            let Some(func) = Func::resolve_function(name.as_str(), arg_count)? else {
-                return Err(LimboError::ParseError(format!(
-                    "could not resolve function {}",
-                    name.as_str()
-                )));
-            };
-            if matches!(func, Func::Agg(_)) {
-                bail_parse_error!("aggregate functions prohibited in generated columns");
-            }
-            if !is_deterministic_schema_function_call(&func, args) {
-                bail_parse_error!("non-deterministic functions prohibited in generated columns");
+            if let SchemaFunctionCheck::Creating(resolver) = funcs {
+                let Some(func) = resolver.resolve_function(name.as_str(), args.len())? else {
+                    return Err(resolver.no_such_function_error(name.as_str()));
+                };
+                if func.is_aggregate() {
+                    bail_parse_error!("aggregate functions prohibited in generated columns");
+                }
+                if !is_deterministic_schema_function_call(&func, args) {
+                    bail_parse_error!(
+                        "non-deterministic functions prohibited in generated columns"
+                    );
+                }
             }
             for arg in args {
-                validate_generated_expr(arg)?;
+                validate_generated_expr(arg, funcs)?;
             }
         }
 
@@ -4356,31 +4376,31 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
             if filter_over.over_clause.is_some() {
                 bail_parse_error!("window functions prohibited in generated columns");
             }
-            let Some(func) = Func::resolve_function(name.as_str(), 0)? else {
-                return Err(LimboError::ParseError(format!(
-                    "could not resolve function {}",
-                    name.as_str()
-                )));
-            };
-
-            if matches!(func, Func::Agg(_)) {
-                bail_parse_error!("aggregate functions prohibited in generated columns");
-            }
-            if !func.is_deterministic() {
-                bail_parse_error!("non-deterministic functions prohibited in generated columns");
+            if let SchemaFunctionCheck::Creating(resolver) = funcs {
+                let Some(func) = resolver.resolve_function(name.as_str(), 0)? else {
+                    return Err(resolver.no_such_function_error(name.as_str()));
+                };
+                if func.is_aggregate() {
+                    bail_parse_error!("aggregate functions prohibited in generated columns");
+                }
+                if !func.is_deterministic() {
+                    bail_parse_error!(
+                        "non-deterministic functions prohibited in generated columns"
+                    );
+                }
             }
         }
 
         Expr::Binary(lhs, _, rhs) => {
-            validate_generated_expr(lhs)?;
-            validate_generated_expr(rhs)?;
+            validate_generated_expr(lhs, funcs)?;
+            validate_generated_expr(rhs, funcs)?;
         }
         Expr::Unary(_, inner) => {
-            validate_generated_expr(inner)?;
+            validate_generated_expr(inner, funcs)?;
         }
         Expr::Parenthesized(exprs) => {
             for e in exprs {
-                validate_generated_expr(e)?;
+                validate_generated_expr(e, funcs)?;
             }
         }
         Expr::Case {
@@ -4390,46 +4410,46 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
             ..
         } => {
             if let Some(b) = base {
-                validate_generated_expr(b)?;
+                validate_generated_expr(b, funcs)?;
             }
             for (w, t) in when_then_pairs {
-                validate_generated_expr(w)?;
-                validate_generated_expr(t)?;
+                validate_generated_expr(w, funcs)?;
+                validate_generated_expr(t, funcs)?;
             }
             if let Some(e) = else_expr {
-                validate_generated_expr(e)?;
+                validate_generated_expr(e, funcs)?;
             }
         }
         Expr::Cast { expr, .. } => {
-            validate_generated_expr(expr)?;
+            validate_generated_expr(expr, funcs)?;
         }
         Expr::InList { lhs, rhs, .. } => {
-            validate_generated_expr(lhs)?;
+            validate_generated_expr(lhs, funcs)?;
             for e in rhs {
-                validate_generated_expr(e)?;
+                validate_generated_expr(e, funcs)?;
             }
         }
         Expr::Between {
             lhs, start, end, ..
         } => {
-            validate_generated_expr(lhs)?;
-            validate_generated_expr(start)?;
-            validate_generated_expr(end)?;
+            validate_generated_expr(lhs, funcs)?;
+            validate_generated_expr(start, funcs)?;
+            validate_generated_expr(end, funcs)?;
         }
         Expr::Like {
             lhs, rhs, escape, ..
         } => {
-            validate_generated_expr(lhs)?;
-            validate_generated_expr(rhs)?;
+            validate_generated_expr(lhs, funcs)?;
+            validate_generated_expr(rhs, funcs)?;
             if let Some(e) = escape {
-                validate_generated_expr(e)?;
+                validate_generated_expr(e, funcs)?;
             }
         }
         Expr::Collate(inner, _) => {
-            validate_generated_expr(inner)?;
+            validate_generated_expr(inner, funcs)?;
         }
         Expr::IsNull(inner) | Expr::NotNull(inner) => {
-            validate_generated_expr(inner)?;
+            validate_generated_expr(inner, funcs)?;
         }
         // CURRENT_TIME/DATE/TIMESTAMP parse as literals but evaluate to a
         // different value on every read; SQLite rejects them like any other
@@ -4720,7 +4740,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             {
                                 bail_parse_error!("Stored generated columns are not supported");
                             }
-                            validate_generated_expr(expr)?;
+                            // `create_table` also reads existing schema rows back; the strict check runs where the statement is compiled.
+                            validate_generated_expr(expr, SchemaFunctionCheck::Loading)?;
                             generated = Some(expr.clone());
                         }
                         ast::ColumnConstraint::PrimaryKey {
@@ -5944,9 +5965,10 @@ impl Index {
 
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
     /// tables or use any disallowed constructs.
-    pub fn validate_where_expr(&self, table: &Table, _resolver: &Resolver) -> bool {
+    /// A non-deterministic function gets SQLite's own wording; anything else the generic message.
+    pub fn validate_where_expr(&self, table: &Table, resolver: &Resolver) -> crate::Result<()> {
         let Some(where_clause) = &self.where_clause else {
-            return true;
+            return Ok(());
         };
 
         let tbl_norm = self.table_name.as_str();
@@ -5958,11 +5980,12 @@ impl Index {
             })
         };
         let is_tbl = |ns: &str| normalize_ident(ns) == tbl_norm;
-        let is_deterministic_fn = |name: &str, argc: usize| {
+        let resolve_fn = |name: &str, argc: usize| -> Option<Func> {
             let n = normalize_ident(name);
-            Func::resolve_function(&n, argc).is_ok_and(|f| f.is_some_and(|f| f.is_deterministic()))
+            resolver.resolve_function(&n, argc).ok().flatten()
         };
 
+        let mut non_deterministic_fn = false;
         let mut ok = true;
         let _ = walk_expr(where_clause.as_ref(), &mut |e: &Expr| -> crate::Result<
             WalkControl,
@@ -6003,8 +6026,14 @@ impl Index {
                         // Reject non-deterministic functions. Function arguments can reference
                         // columns of the indexed table (e.g., LENGTH(t0.c0)), which will be
                         // validated by the Expr::Id and Expr::Qualified cases during the walk.
-                        if !is_deterministic_fn(name.as_str(), argc) {
-                            ok = false;
+                        match resolve_fn(name.as_str(), argc) {
+                            Some(func) if func.is_aggregate() => ok = false,
+                            Some(func) if func.is_deterministic() => {}
+                            Some(_) => {
+                                ok = false;
+                                non_deterministic_fn = true;
+                            }
+                            None => ok = false,
                         }
                     }
                 }
@@ -6024,7 +6053,18 @@ impl Index {
                 WalkControl::SkipChildren
             })
         });
-        ok
+        if ok {
+            Ok(())
+        } else if non_deterministic_fn {
+            bail_parse_error!(
+                "non-deterministic functions prohibited in partial index WHERE clauses"
+            )
+        } else {
+            bail_parse_error!(
+                "Error: cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX:\n {}",
+                where_clause
+            )
+        }
     }
 
     /// Bind a copy of this index's WHERE clause against the given table references.

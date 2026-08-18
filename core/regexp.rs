@@ -1,13 +1,12 @@
-use crate::ext::register_scalar_function;
 use turso_ext::{scalar, ExtensionApi, Value};
 
 pub fn register_extension(ext_api: &mut ExtensionApi) {
     unsafe {
-        register_scalar_function(ext_api.ctx, c"regexp".as_ptr(), regexp);
+        register_regexp(ext_api);
     }
 }
 
-#[scalar(name = "regexp")]
+#[scalar(name = "regexp", deterministic)]
 fn regexp(args: &[Value]) -> Value {
     // Registered as varargs, so this is the only arity check. Indexing out of
     // bounds below would panic through the `extern "C"` shim and abort.

@@ -27,6 +27,8 @@ mod stmt_readonly;
 mod storage;
 mod suspended_statement_checkpoint;
 mod trigger;
+mod udf;
+mod udf_registry;
 mod unreliable_io;
 mod wal;
 

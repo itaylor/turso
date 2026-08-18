@@ -91,7 +91,7 @@ pub(crate) fn validate_check_expr(
                         bail_parse_error!("misuse of window function {}()", name.as_str());
                     }
                 } else {
-                    bail_parse_error!("no such function: {}", name.as_str());
+                    return Err(resolver.no_such_function_error(name.as_str()));
                 }
             }
             ast::Expr::FunctionCallStar { name, filter_over } => {
@@ -106,7 +106,7 @@ pub(crate) fn validate_check_expr(
                         bail_parse_error!("misuse of window function {}()", name.as_str());
                     }
                 } else {
-                    bail_parse_error!("no such function: {}", name.as_str());
+                    return Err(resolver.no_such_function_error(name.as_str()));
                 }
             }
             ast::Expr::Variable(_) => {
@@ -747,6 +747,10 @@ fn validate(
                         bail_parse_error!(
                             "Generated columns require --experimental-generated-columns flag"
                         );
+                    }
+                    // `create_table` also loads stored schema rows; only this path has the connection's functions.
+                    ast::ColumnConstraint::Generated { expr, .. } => {
+                        crate::schema::validate_generated_expr_on_create(expr, resolver)?;
                     }
                     ast::ColumnConstraint::Default(expr) => {
                         let expr =
@@ -2518,11 +2522,8 @@ fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &Resolver) -> Resu
                             name.as_str()
                         );
                     }
-                    // Reject known non-deterministic built-in functions.
-                    // External functions are excluded from this check since
-                    // they default to non-deterministic but may actually be
-                    // deterministic (e.g. uuid_blob).
-                    if !matches!(func, Func::External(_)) && !func.is_deterministic() {
+                    // A user-defined function says which it is with the DETERMINISTIC flag.
+                    if !func.is_deterministic() {
                         bail_parse_error!(
                             "non-deterministic functions prohibited in {kind} expressions: {}",
                             name.as_str()

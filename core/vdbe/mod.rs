@@ -20,6 +20,7 @@
 use crate::alloc::{TryReserveError, TursoFromIterator};
 use crate::translate::plan::BitSet;
 use crate::types::{Extendable, Text, ValueBlob};
+use crate::udf::{PointerValue, ValueTag};
 use crate::{turso_assert, turso_assert_ne, turso_debug_assert, NonNan};
 pub mod affinity;
 pub mod array;
@@ -265,9 +266,19 @@ impl CommitState {
     }
 }
 
+/// A value plus what a user-defined function attached to it. Boxed so untagged registers stay small.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaggedValue {
+    pub value: Value,
+    pub tag: ValueTag,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Register {
     Value(Value),
+    /// A function result carrying a subtype or pointer. Only function results and pointer-bound parameters
+    /// produce one; every other register write builds a plain `Value`, which is how tags stay transient.
+    Tagged(Box<TaggedValue>),
     Aggregate(AggContext),
     Record(ImmutableRecord),
 }
@@ -278,6 +289,10 @@ impl TryClone for Register {
     fn try_clone(&self) -> Result<Self, Self::Error> {
         match self {
             Register::Value(value) => Ok(Register::Value(value.try_clone()?)),
+            Register::Tagged(tagged) => Ok(Register::Tagged(Box::new(TaggedValue {
+                value: tagged.value.try_clone()?,
+                tag: tagged.tag.clone(),
+            }))),
             Register::Aggregate(context) => Ok(Register::Aggregate(context.try_clone()?)),
             Register::Record(record) => Ok(Register::Record(ImmutableRecord::copy_payload(
                 record.get_payload(),
@@ -302,6 +317,15 @@ impl TryClone for Register {
                 let mut value = Value::Null;
                 value.try_clone_from(src)?;
                 *dst = Register::Value(value);
+            }
+            // Copy keeps the tag, like OP_Copy/OP_SCopy.
+            (dst, Register::Tagged(src)) => {
+                let mut value = Value::Null;
+                value.try_clone_from(&src.value)?;
+                *dst = Register::Tagged(Box::new(TaggedValue {
+                    value,
+                    tag: src.tag.clone(),
+                }));
             }
             (dst, Register::Record(src)) => {
                 *dst = Register::Record(ImmutableRecord::copy_payload(
@@ -343,8 +367,13 @@ impl Register {
     }
 
     #[inline]
-    pub const fn is_null(&self) -> bool {
-        matches!(self, Register::Value(Value::Null))
+    pub fn is_null(&self) -> bool {
+        match self {
+            Register::Value(value) => matches!(value, Value::Null),
+            // A pointer value is a NULL carrying an object.
+            Register::Tagged(tagged) => matches!(tagged.value, Value::Null),
+            _ => false,
+        }
     }
 
     #[inline(always)]
@@ -442,6 +471,35 @@ impl Register {
             _ => {
                 *self = Register::Value(val);
             }
+        }
+    }
+
+    pub fn set_tagged(&mut self, value: Value, tag: ValueTag) {
+        *self = Register::Tagged(Box::new(TaggedValue { value, tag }));
+    }
+
+    #[inline]
+    pub fn value_mut(&mut self) -> Option<&mut Value> {
+        match self {
+            Register::Value(value) => Some(value),
+            Register::Tagged(tagged) => Some(&mut tagged.value),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn tag(&self) -> Option<&ValueTag> {
+        match self {
+            Register::Tagged(tagged) => Some(&tagged.tag),
+            _ => None,
+        }
+    }
+
+    /// What a co-routine boundary does to its output columns.
+    pub fn clear_tag(&mut self) {
+        if let Register::Tagged(tagged) = self {
+            let value = std::mem::replace(&mut tagged.value, Value::Null);
+            *self = Register::Value(value);
         }
     }
 }
@@ -816,6 +874,8 @@ pub struct ProgramState {
     /// Excludes new root statements while an explicit checkpoint is suspended.
     pub(crate) explicit_checkpoint_guard: Option<crate::connection::ExplicitCheckpointGuard>,
     pub parameters: Vec<Value>,
+    /// Pointers bound with `bind_pointer`, indexed like `parameters`. Empty until one is bound.
+    parameter_pointers: Vec<Option<std::sync::Arc<PointerValue>>>,
     commit_state: CommitState,
     /// In-flight commit-state-machine for an autonomous sequence
     /// inner-tx. `Insn::SequenceCommitInnerTx` constructs this on first
@@ -888,6 +948,8 @@ pub struct ProgramState {
     /// Cached subprogram Statements keyed by the PC of the Program instruction.
     /// Avoids re-allocating ProgramState on each trigger/FK-action fire.
     pub(crate) subprogram_stmt_cache: HashMap<usize, Box<Statement>>,
+    /// Aux data stashed by user-defined functions, keyed by instruction and argument. Cleared on reset.
+    auxdata: crate::udf::AuxDataStore,
     /// RowSet objects stored by register index
     rowsets: HashMap<usize, RowSet>,
     /// Bloom filters stored by cursor ID for probabilistic set membership testing
@@ -954,6 +1016,7 @@ impl ProgramState {
             query_deadline: None,
             explicit_checkpoint_guard: None,
             parameters: Vec::new(),
+            parameter_pointers: Vec::new(),
             commit_state: CommitState::Ready,
             sequence_inner_commit: None,
             sequence_inner_tx_pending: None,
@@ -969,6 +1032,7 @@ impl ProgramState {
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
+            auxdata: crate::udf::AuxDataStore::default(),
             rowsets: HashMap::default(),
             bloom_filters: HashMap::default(),
             hash_tables: HashMap::default(),
@@ -991,6 +1055,17 @@ impl ProgramState {
 
     pub fn set_register(&mut self, idx: usize, value: Register) {
         self.registers[idx] = value;
+    }
+
+    pub(crate) fn drop_non_constant_auxdata(&mut self, pc: u32, constant_mask: i32) {
+        if !self.auxdata.is_empty() {
+            self.auxdata.drop_non_constant(pc, constant_mask);
+        }
+    }
+
+    /// `Insn::Function` borrows argument values from the registers while the function writes aux data.
+    pub(crate) fn registers_and_auxdata(&mut self) -> (&[Register], &mut crate::udf::AuxDataStore) {
+        (&self.registers, &mut self.auxdata)
     }
 
     pub fn get_register(&self, idx: usize) -> &Register {
@@ -1018,6 +1093,10 @@ impl ProgramState {
         if i >= self.parameters.len() {
             self.parameters.resize(i + 1, Value::Null);
         }
+        // Binding a plain value over a pointer drops the pointer.
+        if i < self.parameter_pointers.len() {
+            self.parameter_pointers[i] = None;
+        }
         let slot = &mut self.parameters[i];
         match (slot, value) {
             (Value::Null, Value::Null) => {}
@@ -1034,13 +1113,37 @@ impl ProgramState {
         Ok(())
     }
 
+    /// `sqlite3_bind_pointer`: NULL to SQL, visible only to a function asking for the same `ptype`.
+    pub fn bind_pointer(
+        &mut self,
+        index: NonZero<usize>,
+        object: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+        ptype: impl Into<std::borrow::Cow<'static, str>>,
+    ) -> Result<()> {
+        self.bind_at(index, Value::Null)?;
+        let i = index.get() - 1;
+        if i >= self.parameter_pointers.len() {
+            self.parameter_pointers.resize(i + 1, None);
+        }
+        self.parameter_pointers[i] = Some(std::sync::Arc::new(PointerValue::new(object, ptype)));
+        Ok(())
+    }
+
     pub fn clear_bindings(&mut self) {
         self.parameters.clear();
+        self.parameter_pointers.clear();
     }
 
     pub fn get_parameter(&self, index: NonZero<usize>) -> Value {
         let i = index.get() - 1;
         self.parameters.get(i).cloned().unwrap_or(Value::Null)
+    }
+
+    pub fn get_parameter_pointer(
+        &self,
+        index: NonZero<usize>,
+    ) -> Option<std::sync::Arc<PointerValue>> {
+        self.parameter_pointers.get(index.get() - 1)?.clone()
     }
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
@@ -1119,6 +1222,9 @@ impl ProgramState {
             .store(0, Ordering::SeqCst);
         self.fk_deferred_violations_when_stmt_started
             .store(0, Ordering::SeqCst);
+        if !self.auxdata.is_empty() {
+            self.auxdata.clear();
+        }
         self.rowsets.clear();
         self.bloom_filters.clear();
         self.hash_tables.clear();
@@ -1532,6 +1638,7 @@ impl Register {
     pub fn get_value(&self) -> &Value {
         match self {
             Register::Value(v) => v,
+            Register::Tagged(tagged) => &tagged.value,
             Register::Record(r) => {
                 turso_assert!(!r.is_invalidated());
                 r.as_blob_value()
@@ -2072,6 +2179,9 @@ impl Program {
                             if old_reg != new_reg {
                                 match new_reg {
                                     Register::Value(v) => eprintln!("R[{i}] = {v}"),
+                                    Register::Tagged(t) => {
+                                        eprintln!("R[{i}] = {} {:?}", t.value, t.tag)
+                                    }
                                     Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
                                     Register::Record(_) => eprintln!("R[{i}] = <record>"),
                                 }
@@ -3294,6 +3404,8 @@ impl Row {
         };
         let value = match value {
             Register::Value(value) => value,
+            // There is no column-level subtype API, in SQLite either.
+            Register::Tagged(tagged) => &tagged.value,
             _ => unreachable!("a row should be formed of values only"),
         };
         T::from_value(value)
@@ -3308,6 +3420,7 @@ impl Row {
         };
         match value {
             Register::Value(value) => value,
+            Register::Tagged(tagged) => &tagged.value,
             _ => unreachable!("a row should be formed of values only"),
         }
     }
@@ -3578,6 +3691,70 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
 mod tests {
     use super::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[test]
+    fn a_tagged_register_keeps_its_tag_through_a_clone_and_loses_it_on_a_plain_write() {
+        let tag = ValueTag::from_subtype(42);
+        let mut tagged = Register::Value(Value::Null);
+        tagged.set_tagged(Value::from_i64(7), tag.clone());
+        assert_eq!(tagged.tag(), Some(&tag));
+        assert_eq!(tagged.get_value(), &Value::from_i64(7));
+
+        let copied = tagged
+            .try_clone()
+            .expect("cloning a small value cannot fail");
+        assert_eq!(copied.tag(), Some(&tag));
+        assert_eq!(copied.get_value(), &Value::from_i64(7));
+
+        let mut dest = Register::Value(Value::from_i64(1));
+        dest.try_clone_from(&tagged)
+            .expect("cloning a small value cannot fail");
+        assert_eq!(dest.tag(), Some(&tag));
+        assert_eq!(dest.get_value(), &Value::from_i64(7));
+
+        dest.set_value(Value::from_i64(2));
+        assert_eq!(dest.tag(), None);
+        assert_eq!(dest.get_value(), &Value::from_i64(2));
+
+        let mut dest = tagged.try_clone().expect("cloning cannot fail");
+        dest.set_int(3);
+        assert_eq!(dest.tag(), None);
+
+        let mut dest = tagged.try_clone().expect("cloning cannot fail");
+        dest.set_null();
+        assert_eq!(dest.tag(), None);
+        assert!(dest.is_null());
+
+        let mut dest = tagged.try_clone().expect("cloning cannot fail");
+        dest.try_clone_from(&Register::Value(Value::from_i64(9)))
+            .expect("cloning cannot fail");
+        assert_eq!(dest.tag(), None);
+
+        let mut dest = tagged.try_clone().expect("cloning cannot fail");
+        dest.clear_tag();
+        assert_eq!(dest.tag(), None);
+        assert_eq!(dest.get_value(), &Value::from_i64(7));
+    }
+
+    #[test]
+    fn a_pointer_register_is_null_and_only_unwraps_under_its_own_type_name() {
+        let object: std::sync::Arc<dyn std::any::Any + Send + Sync> =
+            std::sync::Arc::new(String::from("payload"));
+        let tag = ValueTag::from_pointer(std::sync::Arc::new(PointerValue::new(
+            object.clone(),
+            "mytype",
+        )));
+        let mut reg = Register::Value(Value::Null);
+        reg.set_tagged(Value::Null, tag);
+
+        assert!(reg.is_null(), "a pointer value is a NULL");
+        assert_eq!(reg.tag().unwrap().subtype(), crate::udf::POINTER_SUBTYPE);
+
+        let pointer = reg.tag().unwrap().pointer().expect("it is a pointer");
+        assert!(pointer.get("othertype").is_none());
+        let got = pointer.get("mytype").expect("the name matches");
+        assert_eq!(got.downcast_ref::<String>().unwrap(), "payload");
+    }
 
     #[test]
     fn active_opcode_helpers_initialize_defaults() {

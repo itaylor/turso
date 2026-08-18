@@ -5,7 +5,7 @@ register_extension! {
     scalars: { regexp, regexp_like, regexp_substr, regexp_replace, regexp_capture }
 }
 
-#[scalar(name = "regexp")]
+#[scalar(name = "regexp", argc = 2, deterministic)]
 fn regexp(args: &[Value]) -> Value {
     regex(&args[0], &args[1])
 }
@@ -29,12 +29,12 @@ fn regex(pattern: &Value, haystack: &Value) -> Value {
     }
 }
 
-#[scalar(name = "regexp_like")]
+#[scalar(name = "regexp_like", argc = 2, deterministic)]
 fn regexp_like(args: &[Value]) -> Value {
     regex(&args[1], &args[0])
 }
 
-#[scalar(name = "regexp_substr")]
+#[scalar(name = "regexp_substr", argc = 2, deterministic)]
 fn regexp_substr(&self, args: &[Value]) -> Value {
     match (args[0].value_type(), args[1].value_type()) {
         (ValueType::Text, ValueType::Text) => {
@@ -57,7 +57,7 @@ fn regexp_substr(&self, args: &[Value]) -> Value {
     }
 }
 
-#[scalar(name = "regexp_replace")]
+#[scalar(name = "regexp_replace", deterministic)]
 fn regexp_replace(&self, args: &[Value]) -> Value {
     if args.len() < 2 {
         return Value::from_text("".to_string());
@@ -81,7 +81,7 @@ fn regexp_replace(&self, args: &[Value]) -> Value {
     Value::from_text(re.replace(source_text, replacement).to_string())
 }
 
-#[scalar(name = "regexp_capture")]
+#[scalar(name = "regexp_capture", deterministic)]
 fn regexp_capture(args: &[Value]) -> Value {
     if args.len() < 2 {
         return Value::from_text("".to_string());

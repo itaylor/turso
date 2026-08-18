@@ -1,4 +1,5 @@
 use super::*;
+use crate::SymbolTable;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn binary_expr_shared(
@@ -484,8 +485,15 @@ pub(super) fn emit_binary_insn(
     if op.is_comparison() {
         affinity = comparison_affinity(lhs_expr, rhs_expr, referenced_tables, resolver);
     }
-    let is_array_cmp =
-        expr_is_array(lhs_expr, referenced_tables) && expr_is_array(rhs_expr, referenced_tables);
+    let is_array_cmp = expr_is_array(
+        lhs_expr,
+        referenced_tables,
+        resolver.map(|r| r.symbol_table),
+    ) && expr_is_array(
+        rhs_expr,
+        referenced_tables,
+        resolver.map(|r| r.symbol_table),
+    );
     let cmp_flags = || {
         let f = CmpInsFlags::default().with_affinity(affinity);
         if is_array_cmp {
@@ -724,9 +732,15 @@ pub(super) fn emit_binary_insn(
             })
         }
         ast::Operator::Concat => {
-            if expr_is_array(lhs_expr, referenced_tables)
-                || expr_is_array(rhs_expr, referenced_tables)
-            {
+            if expr_is_array(
+                lhs_expr,
+                referenced_tables,
+                resolver.map(|r| r.symbol_table),
+            ) || expr_is_array(
+                rhs_expr,
+                referenced_tables,
+                resolver.map(|r| r.symbol_table),
+            ) {
                 program.emit_insn(Insn::ArrayConcat {
                     lhs,
                     rhs,
@@ -785,7 +799,14 @@ pub(super) fn emit_binary_insn(
 }
 
 /// Check if an expression is known to produce an array value.
-pub(crate) fn expr_is_array(expr: &Expr, referenced_tables: Option<&TableReferences>) -> bool {
+///
+/// `syms` lets this tell an application function that shadows a built-in name (nothing is known about
+/// what it returns) from the built-in itself; `None` assumes the built-in.
+pub(crate) fn expr_is_array(
+    expr: &Expr,
+    referenced_tables: Option<&TableReferences>,
+    syms: Option<&SymbolTable>,
+) -> bool {
     match expr {
         Expr::Column { table, column, .. } => {
             if let Some(tables) = referenced_tables {
@@ -799,6 +820,9 @@ pub(crate) fn expr_is_array(expr: &Expr, referenced_tables: Option<&TableReferen
             }
         }
         Expr::FunctionCall { name, args, .. } => {
+            if syms.is_some_and(|syms| syms.resolve_function(name.as_str(), args.len()).is_some()) {
+                return false;
+            }
             if let Ok(Some(f)) = Func::resolve_function(name.as_str(), args.len()) {
                 match &f {
                     Func::Scalar(sf) if sf.returns_array_blob() => return true,
@@ -808,20 +832,20 @@ pub(crate) fn expr_is_array(expr: &Expr, referenced_tables: Option<&TableReferen
             }
             // Wrapper functions that pass through an array value
             match name.as_str().to_lowercase().as_str() {
-                "coalesce" | "ifnull" | "min" | "max" => {
-                    args.iter().any(|a| expr_is_array(a, referenced_tables))
-                }
+                "coalesce" | "ifnull" | "min" | "max" => args
+                    .iter()
+                    .any(|a| expr_is_array(a, referenced_tables, syms)),
                 "iif" => {
                     // args: condition, then_val, else_val
                     args.get(1)
-                        .is_some_and(|a| expr_is_array(a, referenced_tables))
+                        .is_some_and(|a| expr_is_array(a, referenced_tables, syms))
                         || args
                             .get(2)
-                            .is_some_and(|a| expr_is_array(a, referenced_tables))
+                            .is_some_and(|a| expr_is_array(a, referenced_tables, syms))
                 }
                 "nullif" => args
                     .first()
-                    .is_some_and(|a| expr_is_array(a, referenced_tables)),
+                    .is_some_and(|a| expr_is_array(a, referenced_tables, syms)),
                 "array_element" => {
                     // Subscripting a multi-dim array yields a lower-dim array
                     if let Some(tables) = referenced_tables {
@@ -838,7 +862,8 @@ pub(crate) fn expr_is_array(expr: &Expr, referenced_tables: Option<&TableReferen
             unreachable!("Array and Subscript are desugared into function calls by the parser")
         }
         Expr::Binary(lhs, ast::Operator::Concat, rhs) => {
-            expr_is_array(lhs, referenced_tables) || expr_is_array(rhs, referenced_tables)
+            expr_is_array(lhs, referenced_tables, syms)
+                || expr_is_array(rhs, referenced_tables, syms)
         }
         Expr::Case {
             when_then_pairs,
@@ -847,10 +872,10 @@ pub(crate) fn expr_is_array(expr: &Expr, referenced_tables: Option<&TableReferen
         } => {
             when_then_pairs
                 .iter()
-                .any(|(_, then_expr)| expr_is_array(then_expr, referenced_tables))
+                .any(|(_, then_expr)| expr_is_array(then_expr, referenced_tables, syms))
                 || else_expr
                     .as_ref()
-                    .is_some_and(|e| expr_is_array(e, referenced_tables))
+                    .is_some_and(|e| expr_is_array(e, referenced_tables, syms))
         }
         _ => false,
     }
@@ -929,7 +954,15 @@ pub(super) fn emit_binary_condition_insn(
     // When jump_if_condition_is_true: we jump on true, so set jump_if_null when NULL should also jump (e.g. CHECK constraints in integrity_check).
     // When !jump_if_condition_is_true: we jump on false, so set jump_if_null when NULL should also jump (standard SQL 3-valued logic).
     let mut flags = CmpInsFlags::default().with_affinity(affinity);
-    if expr_is_array(lhs_expr, referenced_tables) && expr_is_array(rhs_expr, referenced_tables) {
+    if expr_is_array(
+        lhs_expr,
+        referenced_tables,
+        resolver.map(|r| r.symbol_table),
+    ) && expr_is_array(
+        rhs_expr,
+        referenced_tables,
+        resolver.map(|r| r.symbol_table),
+    ) {
         flags = flags.array_cmp();
     }
     if condition_metadata.jump_if_condition_is_true {
@@ -1146,9 +1179,15 @@ pub(super) fn emit_binary_condition_insn(
             eval_result(program, target_register);
         }
         ast::Operator::Concat => {
-            if expr_is_array(lhs_expr, referenced_tables)
-                || expr_is_array(rhs_expr, referenced_tables)
-            {
+            if expr_is_array(
+                lhs_expr,
+                referenced_tables,
+                resolver.map(|r| r.symbol_table),
+            ) || expr_is_array(
+                rhs_expr,
+                referenced_tables,
+                resolver.map(|r| r.symbol_table),
+            ) {
                 program.emit_insn(Insn::ArrayConcat {
                     lhs,
                     rhs,

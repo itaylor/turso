@@ -260,6 +260,7 @@ fn prepare_window_subquery(
         inner_plan,
         None,
         subquery_id,
+        Some(resolver.symbol_table),
     )?;
 
     // Verify that the subquery has the expected database ID.
@@ -1592,7 +1593,7 @@ impl EmitWindow {
                 });
             }
             if window.frame.exclude.is_none() {
-                emit_window_agg_final(program, window, &registers, &minmax, false);
+                emit_window_agg_final(program, window, &registers, &minmax, false)?;
             }
             // The row was just inserted, so the empty branch of this
             // Rewind is unreachable — the label lands on the next
@@ -2240,8 +2241,19 @@ fn emit_window_agg_final(
     registers: &WindowRegisters,
     minmax: &[Option<WindowMinMax>],
     finalize: bool,
-) {
+) -> Result<()> {
     for (i, func) in window.functions.iter().enumerate() {
+        // AggValue reads the accumulator without consuming it, which needs `value`.
+        if !finalize {
+            if let AccumulatorFunc::Agg(crate::function::AggFunc::External(call)) = &func.func {
+                if !call.func.supports_window() {
+                    crate::bail_parse_error!(
+                        "{}() may not be used as a window function",
+                        call.func.name()
+                    );
+                }
+            }
+        }
         let positional = matches!(
             &func.func,
             AccumulatorFunc::Window(WindowFunc::FirstValue | WindowFunc::NthValue)
@@ -2297,6 +2309,7 @@ fn emit_window_agg_final(
             });
         }
     }
+    Ok(())
 }
 
 /// Recompute every function from scratch over the current frame. Used when
@@ -2463,7 +2476,7 @@ fn emit_window_full_scan(
         fullscan: false,
     });
     program.preassign_label_to_next_insn(label_break);
-    emit_window_agg_final(program, window, &registers, &minmax, true);
+    emit_window_agg_final(program, window, &registers, &minmax, true)?;
     Ok(())
 }
 
@@ -2815,7 +2828,7 @@ fn emit_window_op(
     // RETURN_ROW finalizes accumulators before emitting (SQLite's
     // windowAggFinal at window.c:2284).
     if matches!(op, WindowOp::ReturnRow) && window.frame.exclude.is_none() {
-        emit_window_agg_final(program, window, &registers, &minmax, false);
+        emit_window_agg_final(program, window, &registers, &minmax, false)?;
     }
 
     let label_continue = program.allocate_label();

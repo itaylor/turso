@@ -30,6 +30,7 @@ Then you just the compile the dynamic library and extract the necessary `.so/.dy
 
  - [ x ] **Scalar Functions**: Create scalar functions using the `scalar` macro.
  - [ x ] **Aggregate Functions**: Define aggregate functions with `AggregateDerive` macro and `AggFunc` trait.
+ - [ x ] **Window Functions**: An aggregate opts in with `const WINDOW: bool = true;` plus `value`/`inverse`.
  - [ x ]  **Virtual tables**: Create a module for a virtual table with the `VTabModuleDerive` macro and `VTabCursor` trait.
  - [ x ] **VFS Modules**: Extend Turso's OS interface by implementing `VfsExtension` and `VfsFile` traits.
 ---
@@ -115,6 +116,46 @@ fn double(&self, args: &[Value]) -> Value {
 }
 ```
 
+The `#[scalar(...)]` attribute also accepts two optional keys:
+
+- `argc = <int>`: the exact number of arguments the function accepts. Defaults
+  to `-1`, meaning the function is variadic and accepts any number of
+  arguments. Set this only when the function's arity is truly fixed — the
+  engine rejects calls with the wrong number of arguments at parse time
+  (`wrong number of arguments to function <name>()`) before your function is
+  ever invoked, so this both documents the signature and removes the need to
+  validate `args.len()` yourself. Leave it at the default for functions that
+  accept optional/variable arguments.
+- `deterministic` (or `deterministic = true`/`deterministic = false`): whether
+  the function always returns the same output for the same inputs, with no
+  dependence on the current time, randomness, or other external state.
+  Defaults to `false`. Marking a function deterministic lets the query
+  planner treat calls to it as constant-foldable/cacheable, so only mark
+  functions that are actually pure — never functions like `random()` or
+  `now()`.
+
+```rust
+/// A fixed 2-argument, pure function: safe to mark both `argc` and `deterministic`.
+#[scalar(name = "add", argc = 2, deterministic)]
+fn add(args: &[Value]) -> Value {
+    Value::from_integer(args[0].to_integer().unwrap_or(0) + args[1].to_integer().unwrap_or(0))
+}
+```
+
+The context-aware `ScalarDerive` path (see below) exposes the same options as
+the `ARGC` and `DETERMINISTIC` associated consts on `ScalarFunc`, which
+default the same way:
+
+```rust
+impl ScalarFunc for Multiply {
+    type State = i64;
+    const NAME: &'static str = "ctx_multiply";
+    const ARGC: i32 = 1;
+    const DETERMINISTIC: bool = true;
+    // ...
+}
+```
+
 ### Aggregates Example:
 
 ```rust
@@ -185,6 +226,118 @@ impl AggFunc for Percentile {
     }
 }
 ```
+
+### Window Function Example:
+
+An aggregate can also run over a window frame, e.g.
+`SELECT my_sum(x) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)`.
+That needs two things `step`/`finalize` cannot do:
+
+- `value` — the aggregate's answer *right now*, without consuming the state,
+  because the frame is read once per row and keeps going afterwards.
+- `inverse` — undo the `step` for a row that has dropped out of the frame,
+  because a frame with a moving start throws rows away as it slides.
+
+Opt in by setting `const WINDOW: bool = true;` on your `AggFunc` impl and
+implementing both. The `AggregateDerive` macro then registers your aggregate
+through `ExtensionApi::register_window_function` instead of
+`register_aggregate_function`; nothing else about the registration changes,
+and the aggregate still works as a plain aggregate in `GROUP BY`.
+
+Only opt in when undoing a step is cheap and exact. A running sum or count
+qualifies; a median or a percentile does not — it would have to remove an
+arbitrary value from its sample on every row. Aggregates that leave `WINDOW`
+at its default `false` are rejected at compile time with
+`X() may not be used as a window function`, which is the right answer for
+them.
+
+```rust
+use turso_ext::{register_extension, AggFunc, AggregateDerive, Value};
+
+register_extension! { aggregates: { WindowSum } }
+
+#[derive(AggregateDerive)]
+struct WindowSum;
+
+impl AggFunc for WindowSum {
+    type State = i64;
+    type Error = &'static str;
+    const NAME: &'static str = "window_sum";
+    const ARGS: i32 = 1;
+    /// Opt in: a running sum can undo a row by subtracting it.
+    const WINDOW: bool = true;
+
+    fn step(state: &mut Self::State, args: &[Value]) {
+        *state += args.first().and_then(Value::to_integer).unwrap_or_default();
+    }
+
+    /// Called for each row that leaves the frame; undoes its `step`.
+    fn inverse(state: &mut Self::State, args: &[Value]) {
+        *state -= args.first().and_then(Value::to_integer).unwrap_or_default();
+    }
+
+    /// Called once per row of the frame. Must not consume the state.
+    fn value(state: &Self::State) -> Result<Value, Self::Error> {
+        Ok(Value::from_integer(*state))
+    }
+
+    fn finalize(state: Self::State) -> Result<Value, Self::Error> {
+        Ok(Value::from_integer(state))
+    }
+}
+```
+
+If you are writing the C ABI by hand rather than using the derive, call
+`ExtensionApi::register_window_function` directly. It takes the same arguments
+as `register_aggregate_function` plus a `flags` word (the SQLite bits, e.g.
+`0x800` for `SQLITE_DETERMINISTIC`; pass `0` for none) and the `value` and
+`inverse` callbacks. Flags the host does not know about are ignored rather
+than rejected.
+
+### Value subtypes
+
+A `Value` carries a subtype byte, the same one SQLite's
+`sqlite3_result_subtype` sets and `sqlite3_value_subtype` returns. Any value
+type can carry one, not just text:
+
+```rust
+#[scalar(name = "tag")]
+fn tag(args: &[Value]) -> Value {
+    // What the function that produced this argument attached to it, or 0.
+    let incoming = args[0].subtype();
+    Value::from_integer(incoming as i64).with_subtype(7)
+}
+```
+
+The byte flows from one function's result into the next function's argument,
+and it works in both directions: an extension sees the subtype a built-in or
+a native Rust function attached, and a built-in or native function sees the
+one the extension attached. Subtypes are transient, exactly as in SQLite — a
+value written into a table row loses its subtype, and so does one crossing a
+subquery boundary.
+
+`JSON_SUBTYPE` (74, the ASCII code of 'J') is the one byte the engine itself
+gives a meaning to: text carrying it is treated as already-parsed JSON.
+`Value::from_json` sets it, and `Value::is_json` reports it.
+
+#### ABI versions
+
+`ExtensionApi` carries an `api_version` field holding the host's
+`TURSO_EXT_API_VERSION`. The struct only ever grows by appending fields below
+that field, so an extension built against an older header keeps reading a
+newer host's struct at the right offsets. Going the other way, an extension
+that uses a field added in version *N* must check `api.api_version >= N`
+first and fail cleanly on an older host.
+
+The version also travels the other way. `register_extension!` exports the
+constant as a `turso_ext_api_version` function, so the host asks a
+dynamically loaded extension which version it was built against. An
+extension without that symbol is treated as version 1. An extension built
+against a *newer* `turso_ext` than the host refuses to load, with an error
+naming both versions.
+
+One thing the version does not cover — the `vfs` feature changes the layout,
+so host and extension must enable the same `turso_ext` features.
 
 ### Virtual Table Example:
 

@@ -528,7 +528,12 @@ pub(crate) fn emit_array_decode_for_results(
         };
 
         // Check if this expression produces an array (function call, || operator, etc.)
-        let is_array_expr = array_col.is_none() && expr_is_array(&rc.expr, Some(table_references));
+        let is_array_expr = array_col.is_none()
+            && expr_is_array(
+                &rc.expr,
+                Some(table_references),
+                Some(resolver.symbol_table),
+            );
 
         if array_col.is_some() || is_array_expr {
             let reg = start_reg + i;

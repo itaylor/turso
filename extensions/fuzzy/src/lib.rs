@@ -14,7 +14,7 @@ register_extension! {
 }
 
 /// Calculates and returns the Levenshtein distance of two non NULL strings.
-#[scalar(name = "fuzzy_leven")]
+#[scalar(name = "fuzzy_leven", argc = 2, deterministic)]
 fn levenshtein(args: &[Value]) -> Value {
     if args.len() != 2 {
         return Value::error(ResultCode::InvalidArgs);
@@ -78,7 +78,7 @@ fn leven(s1: &str, s2: &str) -> i64 {
 }
 
 /// Calculates and returns the Damerau-Levenshtein distance of two non NULL
-#[scalar(name = "fuzzy_damlev")]
+#[scalar(name = "fuzzy_damlev", argc = 2, deterministic)]
 fn damerau_levenshtein(args: &[Value]) -> Value {
     if args.len() != 2 {
         return Value::error(ResultCode::InvalidArgs);
@@ -173,7 +173,7 @@ fn damlev(s1: &str, s2: &str) -> i64 {
 // a prefix of B and extra characters on the end of B have minimal additional
 // cost.
 //
-#[scalar(name = "fuzzy_editdist")]
+#[scalar(name = "fuzzy_editdist", argc = 2, deterministic)]
 fn edit_distance(args: &[Value]) {
     if args.len() != 2 {
         return Value::error(ResultCode::InvalidArgs);
@@ -194,7 +194,7 @@ fn edit_distance(args: &[Value]) {
 }
 
 // returns the hamming distance between two strings
-#[scalar(name = "fuzzy_hamming")]
+#[scalar(name = "fuzzy_hamming", argc = 2, deterministic)]
 fn hamming(args: &[Value]) {
     if args.len() != 2 {
         return Value::error(ResultCode::InvalidArgs);
@@ -227,7 +227,7 @@ fn hamming_dist(s1: &str, s2: &str) -> i64 {
 
     res as i64
 }
-#[scalar(name = "fuzzy_jarowin")]
+#[scalar(name = "fuzzy_jarowin", argc = 2, deterministic)]
 fn jaronwin(args: &[Value]) {
     if args.len() != 2 {
         return Value::error(ResultCode::InvalidArgs);
@@ -326,7 +326,7 @@ fn jaro(s1: &str, s2: &str) -> f64 {
 }
 
 /// Computes and returns the Optimal String Alignment distance for two non NULL
-#[scalar(name = "fuzzy_osadist")]
+#[scalar(name = "fuzzy_osadist", argc = 2, deterministic)]
 fn osadist(args: &[Value]) {
     if args.len() != 2 {
         return Value::error(ResultCode::InvalidArgs);
@@ -409,7 +409,7 @@ fn optimal_string_alignment(s1: &str, s2: &str) -> usize {
     matrix[len1][len2]
 }
 
-#[scalar(name = "fuzzy_soundex")]
+#[scalar(name = "fuzzy_soundex", argc = 1, deterministic)]
 fn fuzzy_soundex(args: &[Value]) {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -422,7 +422,7 @@ fn fuzzy_soundex(args: &[Value]) {
     }
 }
 
-#[scalar(name = "fuzzy_phonetic")]
+#[scalar(name = "fuzzy_phonetic", argc = 1, deterministic)]
 fn fuzzy_phonetic(args: &[Value]) {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -435,7 +435,7 @@ fn fuzzy_phonetic(args: &[Value]) {
     }
 }
 
-#[scalar(name = "fuzzy_caver")]
+#[scalar(name = "fuzzy_caver", argc = 1, deterministic)]
 fn fuzzy_caver(args: &[Value]) {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -448,7 +448,7 @@ fn fuzzy_caver(args: &[Value]) {
     }
 }
 
-#[scalar(name = "fuzzy_rsoundex")]
+#[scalar(name = "fuzzy_rsoundex", argc = 1, deterministic)]
 pub fn fuzzy_rsoundex(args: &[Value]) {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -463,7 +463,7 @@ pub fn fuzzy_rsoundex(args: &[Value]) {
 
 //Convert a string that contains non-ASCII Roman characters into
 //pure ASCII.
-#[scalar(name = "fuzzy_translit")]
+#[scalar(name = "fuzzy_translit", argc = 1, deterministic)]
 fn fuzzy_translit(args: &[Value]) {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);
@@ -489,7 +489,7 @@ fn fuzzy_translit(args: &[Value]) {
 // This routine will return 998 if the input X contains characters from
 // two or more of the above scripts or 999 if X contains no characters
 // from any of the above scripts.
-#[scalar(name = "fuzzy_script")]
+#[scalar(name = "fuzzy_script", argc = 1, deterministic)]
 pub fn fuzzy_script(args: &[Value]) {
     if args.len() != 1 {
         return Value::error(ResultCode::InvalidArgs);

@@ -28,7 +28,7 @@ use crate::{
     Result,
 };
 use crate::{
-    function::{AccumulatorFunc, AggFunc, ExtFunc, WindowFunc},
+    function::{AccumulatorFunc, AggFunc, ExternalAggCall, WindowFunc},
     translate::expr::bind_and_rewrite_expr,
 };
 use crate::{
@@ -563,6 +563,49 @@ pub fn resolve_window_and_aggregate_functions(
                 let args_count = args.len();
                 let distinctness = Distinctness::from_ast(distinctness.as_ref());
 
+                // Application functions shadow built-ins of the same name and arity.
+                if let Some(f) = resolver
+                    .symbol_table
+                    .resolve_function(name.as_str(), args_count)
+                {
+                    if f.is_aggregate() {
+                        let func = AggFunc::External(ExternalAggCall {
+                            func: f,
+                            argc: args_count,
+                        });
+                        if let Some(over_clause) = filter_over.over_clause.as_ref() {
+                            link_with_window(
+                                windows.as_deref_mut(),
+                                named_windows,
+                                resolver,
+                                expr,
+                                AccumulatorFunc::Agg(func),
+                                over_clause,
+                                filter_over.filter_clause.as_deref(),
+                                distinctness,
+                            )?;
+                        } else {
+                            add_aggregate_if_not_exists(
+                                aggs,
+                                expr,
+                                args,
+                                distinctness,
+                                func,
+                                filter_over.filter_clause.as_deref().cloned(),
+                            )?;
+                            contains_aggregates = true;
+                        }
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                    if filter_over.over_clause.is_some() {
+                        crate::bail_parse_error!(
+                            "{}() may not be used as a window function",
+                            name.as_str()
+                        );
+                    }
+                    return Ok(WalkControl::Continue);
+                }
+
                 match Func::resolve_function(name.as_str(), args_count)? {
                     Some(Func::Agg(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
@@ -606,39 +649,8 @@ pub fn resolve_window_and_aggregate_functions(
                         }
                         return Ok(WalkControl::SkipChildren);
                     }
-                    None => {
-                        if let Some(f) = resolver
-                            .symbol_table
-                            .resolve_function(name.as_str(), args_count)
-                        {
-                            let func = AggFunc::External(f.func.clone().into());
-                            if let ExtFunc::Aggregate { .. } = f.as_ref().func {
-                                if let Some(over_clause) = filter_over.over_clause.as_ref() {
-                                    link_with_window(
-                                        windows.as_deref_mut(),
-                                        named_windows,
-                                        resolver,
-                                        expr,
-                                        AccumulatorFunc::Agg(func),
-                                        over_clause,
-                                        filter_over.filter_clause.as_deref(),
-                                        distinctness,
-                                    )?;
-                                } else {
-                                    add_aggregate_if_not_exists(
-                                        aggs,
-                                        expr,
-                                        args,
-                                        distinctness,
-                                        func,
-                                        filter_over.filter_clause.as_deref().cloned(),
-                                    )?;
-                                    contains_aggregates = true;
-                                }
-                                return Ok(WalkControl::SkipChildren);
-                            }
-                        }
-                    }
+                    // Translation reports an unknown name, with the argument count taken into account.
+                    None => {}
                     _ => {
                         if filter_over.over_clause.is_some() {
                             crate::bail_parse_error!(
@@ -650,6 +662,45 @@ pub fn resolve_window_and_aggregate_functions(
                 }
             }
             Expr::FunctionCallStar { name, filter_over } => {
+                if let Some(f) = resolver.symbol_table.resolve_function(name.as_str(), 0) {
+                    if f.is_aggregate() {
+                        let func = AggFunc::External(ExternalAggCall { func: f, argc: 0 });
+                        if let Some(over_clause) = filter_over.over_clause.as_ref() {
+                            link_with_window(
+                                windows.as_deref_mut(),
+                                named_windows,
+                                resolver,
+                                expr,
+                                AccumulatorFunc::Agg(func),
+                                over_clause,
+                                filter_over.filter_clause.as_deref(),
+                                Distinctness::NonDistinct,
+                            )?;
+                        } else {
+                            add_aggregate_if_not_exists(
+                                aggs,
+                                expr,
+                                &[],
+                                Distinctness::NonDistinct,
+                                func,
+                                filter_over.filter_clause.as_deref().cloned(),
+                            )?;
+                            contains_aggregates = true;
+                        }
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                    if filter_over.over_clause.is_some() {
+                        crate::bail_parse_error!(
+                            "{}() may not be used as a window function",
+                            name.as_str()
+                        );
+                    }
+                    crate::bail_parse_error!(
+                        "wrong number of arguments to function {}()",
+                        name.as_str()
+                    );
+                }
+
                 match Func::resolve_function(name.as_str(), 0)? {
                     Some(Func::Agg(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
@@ -712,36 +763,7 @@ pub fn resolve_window_and_aggregate_functions(
                         }
                     }
                     None => {
-                        if let Some(f) = resolver.symbol_table.resolve_function(name.as_str(), 0) {
-                            let func = AggFunc::External(f.func.clone().into());
-                            if let ExtFunc::Aggregate { .. } = f.as_ref().func {
-                                if let Some(over_clause) = filter_over.over_clause.as_ref() {
-                                    link_with_window(
-                                        windows.as_deref_mut(),
-                                        named_windows,
-                                        resolver,
-                                        expr,
-                                        AccumulatorFunc::Agg(func),
-                                        over_clause,
-                                        filter_over.filter_clause.as_deref(),
-                                        Distinctness::NonDistinct,
-                                    )?;
-                                } else {
-                                    add_aggregate_if_not_exists(
-                                        aggs,
-                                        expr,
-                                        &[],
-                                        Distinctness::NonDistinct,
-                                        func,
-                                        filter_over.filter_clause.as_deref().cloned(),
-                                    )?;
-                                    contains_aggregates = true;
-                                }
-                                return Ok(WalkControl::SkipChildren);
-                            }
-                        } else {
-                            crate::bail_parse_error!("no such function: {}", name.as_str());
-                        }
+                        return Err(resolver.no_such_function_error(name.as_str()));
                     }
                 }
             }
@@ -934,6 +956,11 @@ fn resolve_effective_frame(
                     | AggFunc::JsonbGroupArray
             )
         );
+    let supports_sliding = supports_sliding
+        || matches!(
+            func,
+            AccumulatorFunc::Agg(AggFunc::External(call)) if call.func.supports_window()
+        );
     // Anything but an UNBOUNDED PRECEDING start makes the frame shrink
     // from the left, firing xInverse.
     let moving_start = !matches!(
@@ -941,6 +968,14 @@ fn resolve_effective_frame(
         crate::translate::plan::FrameBoundary::UnboundedPreceding
     );
     if moving_start && frame.exclude.is_none() && !supports_sliding {
+        if let AccumulatorFunc::Agg(AggFunc::External(call)) = func {
+            if !call.func.supports_window() {
+                crate::bail_parse_error!(
+                    "{}() may not be used as a window function",
+                    call.func.name()
+                );
+            }
+        }
         crate::bail_parse_error!(
             "{}() does not yet support window frames with a moving start; \
              use a frame with UNBOUNDED PRECEDING start",
@@ -1290,6 +1325,7 @@ fn plan_cte(
                 explicit_columns,
                 Some(cte_definition.cte_id),
                 cte_definition.materialize_hint,
+                Some(resolver.symbol_table),
             )
         }
         Plan::Delete(_) | Plan::Update(_) => {
@@ -1409,6 +1445,7 @@ fn prepare_recursive_cte_plan(
         &initial_query,
         program.table_reference_counter.next(),
         explicit_columns,
+        Some(resolver.symbol_table),
     )?;
     let input_table_id = input_table.internal_id;
 
@@ -1655,6 +1692,7 @@ fn parse_from_clause_table(
                 None,  // No explicit columns for regular subqueries
                 None,  // Regular inline subqueries don't have a CTE identity
                 false, // No materialize hint for inline subqueries
+                Some(resolver.symbol_table),
             )?);
             Ok(())
         }
@@ -1800,6 +1838,7 @@ fn parse_table(
                     explicit_columns,
                     cte_id,
                     materialize_hint,
+                    Some(resolver.symbol_table),
                 )?;
                 if let Some(alias) = alias {
                     joined_table.identifier = alias;
@@ -1869,6 +1908,11 @@ fn parse_table(
     if let Some(view) = regular_view {
         // Views are essentially query aliases, so just Expand the view as a subquery
         view.process()?;
+        // A view body is inlined into this statement, so by emission time nothing remembers it came from a view.
+        if let Err(err) = resolver.check_schema_sql_select(&view.select_stmt) {
+            view.done();
+            return Err(err);
+        }
         let mut view_select = view.select_stmt.clone();
         if let ast::OneSelect::Select {
             ref mut columns, ..

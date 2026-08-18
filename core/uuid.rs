@@ -1,17 +1,14 @@
-use crate::ext::register_scalar_function;
 use turso_ext::{scalar, ExtensionApi, ResultCode, Value, ValueType};
 
 pub fn register_extension(ext_api: &mut ExtensionApi) {
-    // FIXME: Add macro magic to register functions automatically.
     unsafe {
-        register_scalar_function(ext_api.ctx, c"uuid4_str".as_ptr(), uuid4_str);
-        register_scalar_function(ext_api.ctx, c"gen_random_uuid".as_ptr(), uuid4_str);
-        register_scalar_function(ext_api.ctx, c"uuid4".as_ptr(), uuid4_blob);
-        register_scalar_function(ext_api.ctx, c"uuid7_str".as_ptr(), uuid7_str);
-        register_scalar_function(ext_api.ctx, c"uuid7".as_ptr(), uuid7);
-        register_scalar_function(ext_api.ctx, c"uuid7_timestamp_ms".as_ptr(), uuid7_ts);
-        register_scalar_function(ext_api.ctx, c"uuid_str".as_ptr(), uuid_str);
-        register_scalar_function(ext_api.ctx, c"uuid_blob".as_ptr(), uuid_blob);
+        register_uuid4_str(ext_api);
+        register_uuid4_blob(ext_api);
+        register_uuid7_str(ext_api);
+        register_uuid7(ext_api);
+        register_uuid7_ts(ext_api);
+        register_uuid_str(ext_api);
+        register_uuid_blob(ext_api);
     }
 }
 
@@ -107,7 +104,7 @@ fn uuid7(&self, args: &[Value]) -> Value {
     Value::from_blob(bytes.to_vec())
 }
 
-#[scalar(name = "uuid7_timestamp_ms")]
+#[scalar(name = "uuid7_timestamp_ms", deterministic)]
 fn uuid7_ts(args: &[Value]) -> Value {
     match args.first().map(|a| a.value_type()) {
         Some(ValueType::Blob) => {
@@ -137,7 +134,7 @@ fn uuid7_ts(args: &[Value]) -> Value {
     }
 }
 
-#[scalar(name = "uuid_str")]
+#[scalar(name = "uuid_str", deterministic)]
 fn uuid_str(args: &[Value]) -> Value {
     match args.first() {
         Some(arg) => match arg.to_blob() {
@@ -164,7 +161,7 @@ fn uuid_str(args: &[Value]) -> Value {
     }
 }
 
-#[scalar(name = "uuid_blob")]
+#[scalar(name = "uuid_blob", deterministic)]
 fn uuid_blob(&self, args: &[Value]) -> Value {
     match args.first() {
         Some(arg) => match arg.to_text() {

@@ -49,7 +49,7 @@ use crate::{
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use turso_parser::ast::{
     self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
 };
@@ -206,6 +206,10 @@ pub struct Resolver<'a> {
     /// that its own action program is already being built.
     pub(super) fk_action_compile_stack: FkActionCompileStack,
     unqualified_database_search_path: Option<Vec<String>>,
+    /// True while compiling SQL that came out of the schema (trigger, view, CHECK, DEFAULT, generated
+    /// column, index expression) -- SQLite's EP_FromDDL, used to reject DIRECTONLY functions there.
+    from_ddl: Cell<bool>,
+    trusted_schema: bool,
 }
 
 #[derive(Clone)]
@@ -294,6 +298,7 @@ impl<'a> Resolver<'a> {
         attached_databases: &'a RwLock<DatabaseCatalog>,
         symbol_table: &'a SymbolTable,
         enable_custom_types: bool,
+        trusted_schema: bool,
         dqs_dml: DoubleQuotedDml,
         dialect: Arc<dyn crate::dialect::Dialect>,
         unqualified_database_search_path: &Option<Vec<String>>,
@@ -320,6 +325,8 @@ impl<'a> Resolver<'a> {
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
             unqualified_database_search_path: unqualified_database_search_path.clone(),
+            from_ddl: Cell::new(false),
+            trusted_schema,
         }
     }
 
@@ -353,6 +360,8 @@ impl<'a> Resolver<'a> {
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
+            from_ddl: self.from_ddl.clone(),
+            trusted_schema: self.trusted_schema,
         }
     }
 
@@ -378,6 +387,8 @@ impl<'a> Resolver<'a> {
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
+            from_ddl: self.from_ddl.clone(),
+            trusted_schema: self.trusted_schema,
         }
     }
 
@@ -398,7 +409,10 @@ impl<'a> Resolver<'a> {
             Some(ctx) => {
                 let scope = SelfTableScope::new(ctx.clone());
                 let prev = self.self_table_scope.borrow_mut().replace(scope);
+                // A self-table expression (generated column, index expression) is schema SQL.
+                let prev_schema_sql = self.begin_schema_sql();
                 let result = f(program, Some(ctx));
+                self.end_schema_sql(prev_schema_sql);
                 *self.self_table_scope.borrow_mut() = prev;
                 result
             }
@@ -493,20 +507,80 @@ impl<'a> Resolver<'a> {
         });
     }
 
+    /// SQLite tells an unknown name apart from a known name with the wrong number of arguments.
+    pub fn no_such_function_error(&self, func_name: &str) -> LimboError {
+        if self.symbol_table.function_exists(func_name) {
+            LimboError::ParseError(format!(
+                "wrong number of arguments to function {func_name}()"
+            ))
+        } else {
+            LimboError::ParseError(format!("no such function: {func_name}"))
+        }
+    }
+
+    /// Application functions win over built-ins, as in `sqlite3FindFunction`: an application `f(x)`
+    /// or variadic `f(...)` shadows the built-in, but an application `f(x, y)` does not hide the
+    /// built-in `f(x)`.
     pub fn resolve_function(
         &self,
         func_name: &str,
         arg_count: usize,
     ) -> Result<Option<Func>, LimboError> {
-        // The dialect owns the function name surface of user SQL; extension
-        // functions resolve after it.
-        match self.dialect.resolve_function(func_name, arg_count)? {
-            Some(func) => Ok(Some(func)),
-            None => Ok(self
-                .symbol_table
-                .resolve_function(func_name, arg_count)
-                .map(Func::External)),
+        // SQLite rejects an over-long argument list before deciding whether the function exists.
+        if arg_count > crate::udf::MAX_FUNCTION_ARG as usize {
+            return Err(LimboError::ParseError(format!(
+                "too many arguments on function {func_name}"
+            )));
         }
+        if let Some(func) = self.symbol_table.resolve_function(func_name, arg_count) {
+            if self.from_ddl.get() {
+                crate::udf::check_usable_from_schema(
+                    func.name(),
+                    func.flags(),
+                    self.trusted_schema,
+                )?;
+            }
+            return Ok(Some(Func::External(func)));
+        }
+        self.dialect.resolve_function(func_name, arg_count)
+    }
+
+    /// Returns the previous value, which the caller must hand back to `end_schema_sql` on every path.
+    pub(crate) fn begin_schema_sql(&self) -> bool {
+        self.from_ddl.replace(true)
+    }
+
+    pub(crate) fn end_schema_sql(&self, previous: bool) {
+        self.from_ddl.set(previous);
+    }
+
+    /// For schema SQL that is compiled later than it is picked up (a view body becomes a subquery of
+    /// the calling statement), where `begin_schema_sql` cannot span the compilation.
+    pub(crate) fn check_schema_sql_expr(&self, expr: &ast::Expr) -> Result<()> {
+        crate::util::walk_expr_with_subqueries(expr, &mut |e| {
+            self.check_schema_sql_function_call(e)?;
+            Ok(WalkControl::Continue)
+        })
+    }
+
+    pub(crate) fn check_schema_sql_select(&self, select: &ast::Select) -> Result<()> {
+        crate::util::walk_select_expressions(select, &mut |e| {
+            self.check_schema_sql_function_call(e)?;
+            Ok(WalkControl::Continue)
+        })
+    }
+
+    fn check_schema_sql_function_call(&self, expr: &ast::Expr) -> Result<()> {
+        let (name, arg_count) = match expr {
+            ast::Expr::FunctionCall { name, args, .. } => (name.as_str(), args.len()),
+            ast::Expr::FunctionCallStar { name, .. } => (name.as_str(), 0),
+            _ => return Ok(()),
+        };
+        // An unregistered name fails later with "no such function".
+        let Some(func) = self.symbol_table.resolve_function(name, arg_count) else {
+            return Ok(());
+        };
+        crate::udf::check_usable_from_schema(func.name(), func.flags(), self.trusted_schema)
     }
 
     pub(crate) fn enable_expr_to_reg_cache(&mut self) {
@@ -2355,6 +2429,7 @@ pub(crate) fn emit_check_constraints<'a>(
 
     resolver.enable_expr_to_reg_cache();
 
+    let previous_schema_sql = resolver.begin_schema_sql();
     let result = emit_check_constraint_bytecode(
         program,
         check_constraints,
@@ -2366,6 +2441,7 @@ pub(crate) fn emit_check_constraints<'a>(
     );
 
     // Always restore resolver state, even on error.
+    resolver.end_schema_sql(previous_schema_sql);
     resolver.expr_to_reg_cache.truncate(initial_cache_size);
     resolver.expr_to_reg_cache_enabled = false;
 
