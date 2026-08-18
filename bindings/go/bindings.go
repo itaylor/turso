@@ -16,6 +16,7 @@ func InitLibrary(strategy turso_libs.LoadTursoLibraryConfig) {
 			panic(fmt.Errorf("unable to load turso library: %w", err))
 		}
 		registerTursoDb(library)
+		registerTursoFunctions(library)
 		registerTursoSync(library)
 	})
 }

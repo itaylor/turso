@@ -1,6 +1,7 @@
 #include "TursoHostObject.h"
 #include "TursoDatabaseHostObject.h"
 #include "TursoSyncDatabaseHostObject.h"
+#include "TursoUdf.h"
 
 #include <cstdio>   // For FILE, fopen, fread, fwrite, fclose, fseek, ftell, remove, rename
 #include <cstdlib>  // For additional standard library functions
@@ -147,6 +148,7 @@ namespace turso
         g_basePath = basePath ? basePath : "";
         g_runtime = &rt;
         g_callInvoker = invoker;
+        udfSetCallInvoker(invoker);
 
         // Create the module object
         jsi::Object module(rt);
@@ -731,6 +733,8 @@ namespace turso
 
     void invalidate()
     {
+        udfInvalidate();
+
         std::lock_guard<std::mutex> lock(g_loggerMutex);
         g_loggerFn.reset();
         g_callInvoker.reset();

@@ -1,5 +1,6 @@
 use tokio::fs;
-use turso::{Builder, EncryptionOpts, Error, Value};
+use turso::udf::{AggregateFunction, AggregateState, FunctionFlags};
+use turso::{Builder, EncryptionOpts, Error, Value, ValueRef};
 
 #[tokio::test]
 async fn test_rows_next() {
@@ -1968,4 +1969,358 @@ async fn test_typed_numeric_row_conversions() {
 
     assert_eq!(row.get::<f64>(4).unwrap(), -1.0);
     assert_eq!(row.get::<f64>(9).unwrap(), 9_007_199_254_740_993_i64 as f64);
+}
+
+#[tokio::test]
+async fn test_udf_scalar_closure() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.create_scalar_function(
+        "double",
+        1,
+        FunctionFlags::DETERMINISTIC,
+        |args: &[ValueRef<'_>]| {
+            let n = args[0].as_integer().copied().unwrap_or(0);
+            Ok(Value::Integer(n * 2))
+        },
+    )
+    .unwrap();
+
+    let mut rows = conn.query("SELECT double(21)", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get_value(0).unwrap(), Value::Integer(42));
+}
+
+struct Sum {
+    supports_window: bool,
+}
+
+struct SumState(i64);
+
+impl AggregateFunction for Sum {
+    fn init(&self) -> turso::Result<Box<dyn AggregateState>> {
+        Ok(Box::new(SumState(0)))
+    }
+
+    fn supports_window(&self) -> bool {
+        self.supports_window
+    }
+}
+
+impl AggregateState for SumState {
+    fn step(&mut self, args: &[ValueRef<'_>]) -> turso::Result<()> {
+        self.0 += args[0].as_integer().copied().unwrap_or(0);
+        Ok(())
+    }
+
+    fn finalize(self: Box<Self>) -> turso::Result<Value> {
+        Ok(Value::Integer(self.0))
+    }
+
+    fn value(&self) -> turso::Result<Value> {
+        Ok(Value::Integer(self.0))
+    }
+
+    fn inverse(&mut self, args: &[ValueRef<'_>]) -> turso::Result<()> {
+        self.0 -= args[0].as_integer().copied().unwrap_or(0);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_udf_aggregate() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.create_aggregate_function(
+        "my_sum",
+        1,
+        FunctionFlags::empty(),
+        Sum {
+            supports_window: false,
+        },
+    )
+    .unwrap();
+
+    conn.execute("CREATE TABLE t (n INTEGER)", ())
+        .await
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)", ())
+        .await
+        .unwrap();
+
+    let mut rows = conn.query("SELECT my_sum(n) FROM t", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get_value(0).unwrap(), Value::Integer(6));
+}
+
+#[tokio::test]
+async fn test_udf_window_moving_frame() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.create_aggregate_function(
+        "my_sum",
+        1,
+        FunctionFlags::empty(),
+        Sum {
+            supports_window: true,
+        },
+    )
+    .unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)", ())
+        .await
+        .unwrap();
+    conn.execute(
+        "INSERT INTO t (id, n) VALUES (1, 10), (2, 20), (3, 30), (4, 40)",
+        (),
+    )
+    .await
+    .unwrap();
+
+    let mut rows = conn
+        .query(
+            "SELECT my_sum(n) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY id",
+            (),
+        )
+        .await
+        .unwrap();
+
+    let mut results = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        results.push(row.get_value(0).unwrap());
+    }
+    assert_eq!(
+        results,
+        vec![
+            Value::Integer(10),
+            Value::Integer(30),
+            Value::Integer(50),
+            Value::Integer(70),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_udf_scalar_error_surfaces() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.create_scalar_function(
+        "boom",
+        0,
+        FunctionFlags::empty(),
+        |_args: &[ValueRef<'_>]| -> turso::Result<Value> {
+            Err(Error::Error("kaboom".to_string()))
+        },
+    )
+    .unwrap();
+
+    let mut rows = conn.query("SELECT boom()", ()).await.unwrap();
+    let err = rows.next().await.unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("kaboom"),
+        "expected error message to contain 'kaboom', got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn test_udf_remove_function() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.create_scalar_function("one", 0, FunctionFlags::empty(), |_: &[ValueRef<'_>]| {
+        Ok(Value::Integer(1))
+    })
+    .unwrap();
+
+    let mut rows = conn.query("SELECT one()", ()).await.unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        Value::Integer(1)
+    );
+
+    conn.remove_function("one", 0).unwrap();
+    // Removing a function that isn't registered is not an error.
+    conn.remove_function("one", 0).unwrap();
+
+    assert!(conn.query("SELECT one()", ()).await.is_err());
+}
+
+#[tokio::test]
+async fn test_udf_overload_by_argc() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.create_scalar_function(
+        "greet",
+        0,
+        FunctionFlags::empty(),
+        |_: &[ValueRef<'_>]| Ok(Value::Text("hello".to_string())),
+    )
+    .unwrap();
+    conn.create_scalar_function(
+        "greet",
+        1,
+        FunctionFlags::empty(),
+        |args: &[ValueRef<'_>]| {
+            let name = args[0]
+                .as_text()
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .unwrap_or_default();
+            Ok(Value::Text(format!("hello {name}")))
+        },
+    )
+    .unwrap();
+
+    let mut rows = conn.query("SELECT greet()", ()).await.unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        Value::Text("hello".to_string())
+    );
+
+    let mut rows = conn.query("SELECT greet('world')", ()).await.unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        Value::Text("hello world".to_string())
+    );
+}
+
+#[tokio::test]
+async fn test_udf_deterministic_flag_accepted() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.create_scalar_function(
+        "det_one",
+        0,
+        FunctionFlags::DETERMINISTIC,
+        |_: &[ValueRef<'_>]| Ok(Value::Integer(1)),
+    )
+    .unwrap();
+
+    let mut rows = conn.query("SELECT det_one()", ()).await.unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        Value::Integer(1)
+    );
+}
+
+#[tokio::test]
+async fn test_udf_database_scalar_function_seeds_new_connections() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+
+    db.create_scalar_function(
+        "db_one",
+        0,
+        FunctionFlags::empty(),
+        |_: &[ValueRef<'_>]| Ok(Value::Integer(1)),
+    )
+    .unwrap();
+
+    let conn_a = db.connect().unwrap();
+    let conn_b = db.connect().unwrap();
+
+    for conn in [&conn_a, &conn_b] {
+        let mut rows = conn.query("SELECT db_one()", ()).await.unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get_value(0).unwrap(),
+            Value::Integer(1)
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_udf_database_scalar_function_does_not_reach_earlier_connections() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let before = db.connect().unwrap();
+
+    db.create_scalar_function(
+        "db_two",
+        0,
+        FunctionFlags::empty(),
+        |_: &[ValueRef<'_>]| Ok(Value::Integer(2)),
+    )
+    .unwrap();
+
+    assert!(before.query("SELECT db_two()", ()).await.is_err());
+
+    let after = db.connect().unwrap();
+    let mut rows = after.query("SELECT db_two()", ()).await.unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        Value::Integer(2)
+    );
+}
+
+#[tokio::test]
+async fn test_udf_connection_registration_shadows_database_registration() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+
+    db.create_scalar_function(
+        "shadowed",
+        0,
+        FunctionFlags::empty(),
+        |_: &[ValueRef<'_>]| Ok(Value::Integer(1)),
+    )
+    .unwrap();
+
+    let shadowing = db.connect().unwrap();
+    shadowing
+        .create_scalar_function(
+            "shadowed",
+            0,
+            FunctionFlags::empty(),
+            |_: &[ValueRef<'_>]| Ok(Value::Integer(2)),
+        )
+        .unwrap();
+    let sibling = db.connect().unwrap();
+
+    let mut rows = shadowing.query("SELECT shadowed()", ()).await.unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        Value::Integer(2)
+    );
+
+    let mut rows = sibling.query("SELECT shadowed()", ()).await.unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        Value::Integer(1)
+    );
+}
+
+#[tokio::test]
+async fn test_udf_database_remove_function_only_affects_new_connections() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+
+    db.create_scalar_function(
+        "db_three",
+        0,
+        FunctionFlags::empty(),
+        |_: &[ValueRef<'_>]| Ok(Value::Integer(3)),
+    )
+    .unwrap();
+
+    let already_open = db.connect().unwrap();
+    let mut rows = already_open.query("SELECT db_three()", ()).await.unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        Value::Integer(3)
+    );
+
+    db.remove_function("db_three", 0).unwrap();
+    // Removing a function that isn't registered is not an error.
+    db.remove_function("db_three", 0).unwrap();
+
+    let mut rows = already_open.query("SELECT db_three()", ()).await.unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get_value(0).unwrap(),
+        Value::Integer(3)
+    );
+
+    let after_removal = db.connect().unwrap();
+    assert!(after_removal.query("SELECT db_three()", ()).await.is_err());
 }

@@ -227,7 +227,7 @@ All dialects share these overrides via `_TursoDialectMixin` and direct method im
 
 - `import_dbapi()` - Returns `turso`, `turso.sync`, or the async adapter for `turso.aio`
 - `create_connect_args()` - Parses URL to connection arguments
-- `on_connect()` - Returns `None` (skips REGEXP function setup that pysqlite does, since turso doesn't support `create_function`)
+- `on_connect()` - Registers the `REGEXP` function on each new connection, the way pysqlite's dialect does (the asyncio dialect still returns `None`: its `create_function` is a coroutine)
 - `get_isolation_level()` - Returns `SERIALIZABLE` (turso doesn't support `PRAGMA read_uncommitted`)
 - `set_isolation_level()` - No-op (isolation set at connection time via `isolation_level` param)
 - `get_pool_class()` - Returns `SingletonThreadPool` for sync `:memory:`, `QueuePool` for sync file databases, `StaticPool` for async `:memory:`, and `AsyncAdaptedQueuePool` for async file databases

@@ -47,6 +47,10 @@ private:
     jsi::Value getAutocommit(jsi::Runtime &rt);
     jsi::Value setBusyTimeout(jsi::Runtime &rt, const jsi::Value *args, size_t count);
     jsi::Value close(jsi::Runtime &rt);
+
+    jsi::Value registerScalarFunction(jsi::Runtime &rt, const jsi::Value *args, size_t count);
+    jsi::Value registerAggregateFunction(jsi::Runtime &rt, const jsi::Value *args, size_t count);
+    jsi::Value unregisterFunction(jsi::Runtime &rt, const jsi::Value *args, size_t count);
 };
 
 } // namespace turso

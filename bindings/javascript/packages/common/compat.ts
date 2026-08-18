@@ -1,6 +1,7 @@
 import { bindParams } from "./bind.js";
 import { SqliteError } from "./sqlite-error.js";
 import { NativeDatabase, NativeStatement, QueryOptions, STEP_IO, STEP_ROW, STEP_DONE, STEP_SLEEP } from "./types.js";
+import { AggregateOptions, FunctionOptions, aggregateRegistration, scalarRegistration } from "./udf.js";
 
 const convertibleErrorTypes = { TypeError };
 const CONVERTIBLE_ERROR_PREFIX = "[TURSO_CONVERT_TYPE]";
@@ -234,12 +235,36 @@ class Database {
     throw new Error("not implemented");
   }
 
-  function(name, options, fn) {
-    throw new Error("not implemented");
+  /**
+   * The callback runs synchronously while the calling statement steps, so it
+   * may query the database but not through the statement that invoked it.
+   */
+  function(name: string, options?: FunctionOptions | Function, fn?: Function): this {
+    const registration = scalarRegistration(name, options, fn);
+    try {
+      this.db.createScalarFunction(registration.name, registration.options, registration.fn);
+    } catch (err) {
+      throw convertError(err);
+    }
+    return this;
   }
 
-  aggregate(name, options) {
-    throw new Error("not implemented");
+  /** Providing an `inverse` callback also allows use as a window function. */
+  aggregate(name: string, options: AggregateOptions): this {
+    const registration = aggregateRegistration(name, options);
+    try {
+      this.db.createAggregateFunction(
+        registration.name,
+        registration.options,
+        registration.start,
+        registration.step,
+        registration.inverse,
+        registration.result,
+      );
+    } catch (err) {
+      throw convertError(err);
+    }
+    return this;
   }
 
   table(name, factory) {

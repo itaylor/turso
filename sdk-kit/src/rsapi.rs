@@ -65,6 +65,9 @@ impl Drop for SyncBusyGuard {
     }
 }
 
+/// Closure-based UDF traits, namespaced so they don't collide with the C-ABI
+/// [`ScalarFunction`] pointer type above.
+pub use crate::udf;
 pub use turso_core::types::FromValue;
 pub use turso_ext::{
     AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarFunction,
@@ -1080,6 +1083,41 @@ impl TursoDatabase {
         Ok(TursoConnection::new(&self.config, connection))
     }
 
+    /// Applies to connections opened after this call, not to ones already open.
+    pub fn create_scalar_function(
+        &self,
+        name: &str,
+        argc: i32,
+        flags: udf::FunctionFlags,
+        f: impl udf::ScalarFunction + 'static,
+    ) -> Result<(), TursoError> {
+        self.db_core()?
+            .create_scalar_function(name, argc, flags, f)
+            .map_err(TursoError::from)
+    }
+
+    /// Applies to connections opened after this call, not to ones already open.
+    pub fn create_aggregate_function(
+        &self,
+        name: &str,
+        argc: i32,
+        flags: udf::FunctionFlags,
+        f: impl udf::AggregateFunction + 'static,
+    ) -> Result<(), TursoError> {
+        self.db_core()?
+            .create_aggregate_function(name, argc, flags, f)
+            .map_err(TursoError::from)
+    }
+
+    /// Removes the function registered under `name` with exactly `argc`
+    /// arguments. Only connections opened after this call stop seeing it.
+    /// Removing one that was never registered is not an error, matching SQLite.
+    pub fn remove_function(&self, name: &str, argc: i32) -> Result<(), TursoError> {
+        self.db_core()?
+            .remove_function(name, argc)
+            .map_err(TursoError::from)
+    }
+
     /// helper method to get C raw container with TursoDatabase instance
     /// this method is used in the capi wrappers
     pub fn to_capi(self: Arc<Self>) -> *mut capi::c::turso_database_t {
@@ -1266,6 +1304,147 @@ impl TursoConnection {
         let result = unsafe { (api.unregister_function)(api.ctx, name.as_ptr()) };
         unsafe { self.connection._free_extension_ctx(api) };
         result_code_to_result(result, "unregister external function")
+    }
+
+    /// Replaces any existing function with the same name and argument count,
+    /// matching `sqlite3_create_function`.
+    pub fn create_scalar_function(
+        &self,
+        name: &str,
+        argc: i32,
+        flags: udf::FunctionFlags,
+        f: impl udf::ScalarFunction + 'static,
+    ) -> Result<(), TursoError> {
+        self.connection
+            .create_scalar_function(name, argc, flags, f)
+            .map_err(TursoError::from)
+    }
+
+    /// Usable with `OVER (...)` when the implementation's `supports_window()`
+    /// returns true. Replaces any existing function with the same name and
+    /// argument count, matching `sqlite3_create_function`.
+    pub fn create_aggregate_function(
+        &self,
+        name: &str,
+        argc: i32,
+        flags: udf::FunctionFlags,
+        f: impl udf::AggregateFunction + 'static,
+    ) -> Result<(), TursoError> {
+        self.connection
+            .create_aggregate_function(name, argc, flags, f)
+            .map_err(TursoError::from)
+    }
+
+    /// Removes only the `argc`-argument overload; use
+    /// [`Self::unregister_external_function`] to remove every arity at once.
+    /// Removing one that was never registered is not an error, matching SQLite.
+    pub fn remove_function(&self, name: &str, argc: i32) -> Result<(), TursoError> {
+        self.connection
+            .remove_function(name, argc)
+            .map_err(TursoError::from)
+    }
+
+    /// `value`/`inverse` are `xValue`/`xInverse`, making the aggregate usable
+    /// with `OVER (...)`. `flags` uses [`udf::FunctionFlags`] bit values
+    /// (e.g. `0x800` for `DETERMINISTIC`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_external_window_function(
+        &self,
+        name: String,
+        argc: i32,
+        flags: u32,
+        context: usize,
+        init: InitAggFunction,
+        step: StepFunction,
+        finalize: FinalizeFunction,
+        value: udf::WindowValueFunction,
+        inverse: udf::WindowInverseFunction,
+        context_destructor: Option<ContextDestructor>,
+        aggregate_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
+    ) -> Result<(), TursoError> {
+        let adapter = udf::ExtAggregateAdapter::new_window(
+            context,
+            init,
+            step,
+            finalize,
+            value,
+            inverse,
+            context_destructor,
+            aggregate_destructor,
+            value_destructor,
+        );
+        self.create_aggregate_function(
+            &name,
+            argc,
+            udf::FunctionFlags::from_bits_truncate(flags),
+            adapter,
+        )
+    }
+
+    /// Like [`Self::register_external_scalar_function`], but the callback
+    /// writes its result through a `*mut turso_value_t` instead of returning
+    /// it, for FFIs that cannot receive a struct returned by value. `flags`
+    /// uses [`udf::FunctionFlags`] bit values (e.g. `0x800` for `DETERMINISTIC`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_external_scalar_function_ptr(
+        &self,
+        name: String,
+        argc: i32,
+        flags: u32,
+        context: usize,
+        callback: udf::ScalarPtrFunction,
+        context_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
+    ) -> Result<(), TursoError> {
+        let adapter =
+            udf::ExtScalarPtrAdapter::new(context, callback, context_destructor, value_destructor);
+        self.create_scalar_function(
+            &name,
+            argc,
+            udf::FunctionFlags::from_bits_truncate(flags),
+            adapter,
+        )
+    }
+
+    /// `window` carries the `xValue`/`xInverse` pair: `Some` makes the
+    /// aggregate usable with `OVER (...)`, `None` leaves it a plain aggregate.
+    /// `flags` uses [`udf::FunctionFlags`] bit values (e.g. `0x800` for
+    /// `DETERMINISTIC`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_external_aggregate_function_ptr(
+        &self,
+        name: String,
+        argc: i32,
+        flags: u32,
+        context: usize,
+        init: InitAggFunction,
+        step: udf::AggregateStepPtrFunction,
+        finalize: udf::AggregateFinalPtrFunction,
+        window: Option<(
+            udf::AggregateValuePtrFunction,
+            udf::AggregateInversePtrFunction,
+        )>,
+        context_destructor: Option<ContextDestructor>,
+        aggregate_destructor: Option<ContextDestructor>,
+        value_destructor: Option<ValueDestructor>,
+    ) -> Result<(), TursoError> {
+        let adapter = udf::ExtAggregatePtrAdapter::new(
+            context,
+            init,
+            step,
+            finalize,
+            window,
+            context_destructor,
+            aggregate_destructor,
+            value_destructor,
+        );
+        self.create_aggregate_function(
+            &name,
+            argc,
+            udf::FunctionFlags::from_bits_truncate(flags),
+            adapter,
+        )
     }
 
     pub fn register_external_collation(
@@ -1815,8 +1994,8 @@ mod tests {
     use super::{c, CApiPageCodec};
     use crate::{
         rsapi::{
-            OpenFlags, TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode,
-            FINALIZED_ERR,
+            OpenFlags, TursoConnection, TursoDatabase, TursoDatabaseConfig, TursoError,
+            TursoStatusCode, FINALIZED_ERR,
         },
         IoBackend,
     };
@@ -2906,5 +3085,253 @@ mod tests {
         assert_eq!(stmt.n_change(), 0);
         assert_eq!(stmt.column_count(), 0);
         assert_eq!(stmt.parameters_count(), 0);
+    }
+
+    fn open_test_connection() -> Arc<TursoConnection> {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: IoBackend::Default,
+            io: None,
+            db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+        db.connect().unwrap()
+    }
+
+    fn as_integer(v: &turso_core::types::ValueRef<'_>) -> i64 {
+        match v {
+            turso_core::types::ValueRef::Numeric(turso_core::Numeric::Integer(i)) => *i,
+            other => panic!("expected an integer argument, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    pub fn test_create_scalar_function_closure() {
+        let conn = open_test_connection();
+
+        conn.create_scalar_function(
+            "double",
+            1,
+            crate::udf::FunctionFlags::DETERMINISTIC,
+            |_ctx: &mut crate::udf::FunctionContext<'_>,
+             args: &[turso_core::types::ValueRef<'_>]| {
+                Ok(Value::from_i64(as_integer(&args[0]) * 2))
+            },
+        )
+        .unwrap();
+
+        let mut stmt = conn.prepare_single("SELECT double(21)").unwrap();
+        assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
+        assert_eq!(stmt.row_value(0).unwrap(), Value::from_i64(42));
+    }
+
+    #[test]
+    pub fn test_remove_function_forgets_scalar() {
+        let conn = open_test_connection();
+        conn.create_scalar_function(
+            "one",
+            0,
+            crate::udf::FunctionFlags::empty(),
+            |_ctx: &mut crate::udf::FunctionContext<'_>,
+             _args: &[turso_core::types::ValueRef<'_>]| { Ok(Value::from_i64(1)) },
+        )
+        .unwrap();
+        assert!(conn.prepare_single("SELECT one()").is_ok());
+
+        conn.remove_function("one", 0).unwrap();
+        // Removing an already-removed function is not an error, matching SQLite.
+        conn.remove_function("one", 0).unwrap();
+        assert!(conn.prepare_single("SELECT one()").is_err());
+    }
+
+    fn open_test_database() -> Arc<TursoDatabase> {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: IoBackend::Default,
+            io: None,
+            db_file: None,
+            page_codec: None,
+            open_flags: OpenFlags::default(),
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+        db
+    }
+
+    #[test]
+    pub fn test_database_create_scalar_function_applies_to_connections_opened_after() {
+        let db = open_test_database();
+        let before = db.connect().unwrap();
+
+        db.create_scalar_function(
+            "db_one",
+            0,
+            crate::udf::FunctionFlags::empty(),
+            |_ctx: &mut crate::udf::FunctionContext<'_>,
+             _args: &[turso_core::types::ValueRef<'_>]| { Ok(Value::from_i64(1)) },
+        )
+        .unwrap();
+
+        assert!(before.prepare_single("SELECT db_one()").is_err());
+
+        let after = db.connect().unwrap();
+        assert!(after.prepare_single("SELECT db_one()").is_ok());
+    }
+
+    #[test]
+    pub fn test_database_remove_function_only_affects_new_connections() {
+        let db = open_test_database();
+        db.create_scalar_function(
+            "db_two",
+            0,
+            crate::udf::FunctionFlags::empty(),
+            |_ctx: &mut crate::udf::FunctionContext<'_>,
+             _args: &[turso_core::types::ValueRef<'_>]| { Ok(Value::from_i64(2)) },
+        )
+        .unwrap();
+
+        let already_open = db.connect().unwrap();
+        assert!(already_open.prepare_single("SELECT db_two()").is_ok());
+
+        db.remove_function("db_two", 0).unwrap();
+        // Removing an already-removed function is not an error, matching SQLite.
+        db.remove_function("db_two", 0).unwrap();
+
+        assert!(already_open.prepare_single("SELECT db_two()").is_ok());
+        let after_removal = db.connect().unwrap();
+        assert!(after_removal.prepare_single("SELECT db_two()").is_err());
+    }
+
+    struct SumAgg {
+        supports_window: bool,
+    }
+    struct SumAggState(i64);
+
+    impl crate::udf::AggregateFunction for SumAgg {
+        fn init(
+            &self,
+            _ctx: &mut crate::udf::FunctionContext<'_>,
+        ) -> turso_core::Result<Box<dyn crate::udf::AggregateState>> {
+            Ok(Box::new(SumAggState(0)))
+        }
+
+        fn supports_window(&self) -> bool {
+            self.supports_window
+        }
+    }
+
+    impl crate::udf::AggregateState for SumAggState {
+        fn step(
+            &mut self,
+            _ctx: &mut crate::udf::FunctionContext<'_>,
+            args: &[turso_core::types::ValueRef<'_>],
+        ) -> turso_core::Result<()> {
+            self.0 += as_integer(&args[0]);
+            Ok(())
+        }
+
+        fn finalize(
+            self: Box<Self>,
+            _ctx: &mut crate::udf::FunctionContext<'_>,
+        ) -> turso_core::Result<Value> {
+            Ok(Value::from_i64(self.0))
+        }
+
+        fn value(&self, _ctx: &mut crate::udf::FunctionContext<'_>) -> turso_core::Result<Value> {
+            Ok(Value::from_i64(self.0))
+        }
+
+        fn inverse(
+            &mut self,
+            _ctx: &mut crate::udf::FunctionContext<'_>,
+            args: &[turso_core::types::ValueRef<'_>],
+        ) -> turso_core::Result<()> {
+            self.0 -= as_integer(&args[0]);
+            Ok(())
+        }
+    }
+
+    #[test]
+    pub fn test_create_aggregate_function_groups_rows() {
+        let conn = open_test_connection();
+        conn.create_aggregate_function(
+            "my_sum",
+            1,
+            crate::udf::FunctionFlags::empty(),
+            SumAgg {
+                supports_window: false,
+            },
+        )
+        .unwrap();
+
+        conn.prepare_single("CREATE TABLE t (n INTEGER)")
+            .unwrap()
+            .execute(None)
+            .unwrap();
+        conn.prepare_single("INSERT INTO t VALUES (1), (2), (3)")
+            .unwrap()
+            .execute(None)
+            .unwrap();
+
+        let mut stmt = conn.prepare_single("SELECT my_sum(n) FROM t").unwrap();
+        assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
+        assert_eq!(stmt.row_value(0).unwrap(), Value::from_i64(6));
+    }
+
+    #[test]
+    pub fn test_create_aggregate_function_as_window_with_moving_frame() {
+        let conn = open_test_connection();
+        conn.create_aggregate_function(
+            "my_sum",
+            1,
+            crate::udf::FunctionFlags::empty(),
+            SumAgg {
+                supports_window: true,
+            },
+        )
+        .unwrap();
+
+        conn.prepare_single("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+            .unwrap()
+            .execute(None)
+            .unwrap();
+        conn.prepare_single("INSERT INTO t (id, n) VALUES (1, 10), (2, 20), (3, 30), (4, 40)")
+            .unwrap()
+            .execute(None)
+            .unwrap();
+
+        let mut stmt = conn
+            .prepare_single(
+                "SELECT my_sum(n) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) \
+                 FROM t ORDER BY id",
+            )
+            .unwrap();
+
+        let mut results = Vec::new();
+        loop {
+            match stmt.step(None).unwrap() {
+                TursoStatusCode::Row => results.push(stmt.row_value(0).unwrap()),
+                TursoStatusCode::Done => break,
+                other => panic!("unexpected status: {other:?}"),
+            }
+        }
+        assert_eq!(
+            results,
+            vec![
+                Value::from_i64(10),
+                Value::from_i64(30),
+                Value::from_i64(50),
+                Value::from_i64(70),
+            ]
+        );
     }
 }

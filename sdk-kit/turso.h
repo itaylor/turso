@@ -131,20 +131,41 @@ typedef struct
 /** Frees per-registration state supplied to scalar, aggregate, or collation callbacks. */
 typedef void (*turso_context_destructor_t)(uintptr_t context);
 
-/** Frees a value returned by a managed scalar or aggregate callback after Turso copies it. */
+/** Frees a value a UDF callback handed back. The callback allocates any heap payload (the buffer behind a TEXT or BLOB); Turso copies it out as soon as the call returns, then invokes this destructor exactly once. Pass NULL if no callback ever returns a heap payload. */
 typedef void (*turso_value_destructor_t)(turso_value_t *result);
 
-/** Scalar callback. argv points to argc immutable turso_value_t entries valid only for the call. */
+/** Scalar callback. argv points to argc immutable turso_value_t entries valid only for the call. See turso_value_destructor_t for result ownership. */
 typedef turso_value_t (*turso_scalar_function_t)(uintptr_t context, int32_t argc, const turso_value_t *argv, turso_context_destructor_t context_destructor, turso_value_destructor_t value_destructor);
 
 /** Aggregate initializer. Return value is passed unchanged to step/final/destructor callbacks. */
 typedef turso_agg_ctx_t *(*turso_aggregate_init_function_t)(uintptr_t context);
 
-/** Aggregate step callback. argv points to argc immutable turso_value_t entries valid only for the call. */
+/** Aggregate step callback. argv points to argc immutable turso_value_t entries valid only for the call. A non-error return is discarded; see turso_value_destructor_t for result ownership. */
 typedef turso_value_t (*turso_aggregate_step_function_t)(uintptr_t context, turso_agg_ctx_t *aggregate_context, int32_t argc, const turso_value_t *argv);
 
-/** Aggregate final callback. The aggregate_context is the value returned by the initializer. */
+/** Aggregate final callback. aggregate_context is the initializer's return value. See turso_value_destructor_t for result ownership. */
 typedef turso_value_t (*turso_aggregate_final_function_t)(uintptr_t context, turso_agg_ctx_t *aggregate_context);
+
+/** Window aggregate value callback (xValue). Reads the running total without destroying the accumulator. */
+typedef turso_value_t (*turso_aggregate_value_function_t)(uintptr_t context, turso_agg_ctx_t *aggregate_context);
+
+/** Window aggregate inverse callback (xInverse). Undoes an earlier step for a row that left the window frame. argv points to argc immutable turso_value_t entries valid only for the call; a non-error return is discarded. */
+typedef turso_value_t (*turso_aggregate_inverse_function_t)(uintptr_t context, turso_agg_ctx_t *aggregate_context, int32_t argc, const turso_value_t *argv);
+
+/** Scalar callback that writes its result through an out-parameter, for FFIs that cannot return a struct by value. *result arrives pre-set to NULL; ownership follows turso_scalar_function_t. */
+typedef void (*turso_scalar_function_ptr_t)(uintptr_t context, int32_t argc, const turso_value_t *argv, turso_value_t *result);
+
+/** Aggregate step callback with an out-parameter result. Leave *result at the NULL it arrives as to keep stepping, or set an Error value to fail the statement. */
+typedef void (*turso_aggregate_step_function_ptr_t)(uintptr_t context, turso_agg_ctx_t *aggregate_context, int32_t argc, const turso_value_t *argv, turso_value_t *result);
+
+/** Aggregate final callback with an out-parameter result. Ownership follows turso_scalar_function_ptr_t. */
+typedef void (*turso_aggregate_final_function_ptr_t)(uintptr_t context, turso_agg_ctx_t *aggregate_context, turso_value_t *result);
+
+/** Window aggregate value callback (xValue) with an out-parameter result. Ownership follows turso_scalar_function_ptr_t. */
+typedef void (*turso_aggregate_value_function_ptr_t)(uintptr_t context, turso_agg_ctx_t *aggregate_context, turso_value_t *result);
+
+/** Window aggregate inverse callback (xInverse) with an out-parameter result. Set *result to an Error value to fail the statement. */
+typedef void (*turso_aggregate_inverse_function_ptr_t)(uintptr_t context, turso_agg_ctx_t *aggregate_context, int32_t argc, const turso_value_t *argv, turso_value_t *result);
 
 /** Collation callback. Byte ranges are UTF-8 text valid only for the call. Return follows strcmp ordering. */
 typedef int32_t (*turso_collation_function_t)(uintptr_t context, const uint8_t *left_ptr, size_t left_len, const uint8_t *right_ptr, size_t right_len);
@@ -336,11 +357,12 @@ turso_status_code_t turso_connection_register_scalar_function(
     turso_value_destructor_t value_destructor,
     const char **error_opt_out);
 
-/** Register or replace a per-connection managed aggregate function. */
+/** Register or replace a per-connection managed aggregate function.flags uses SQLite bit values (e.g. 0x800 for DETERMINISTIC). */
 turso_status_code_t turso_connection_register_aggregate_function(
     const turso_connection_t *self,
     const char *name,
     int32_t argc,
+    uint32_t flags,
     uintptr_t context,
     turso_aggregate_init_function_t init,
     turso_aggregate_step_function_t step,
@@ -350,10 +372,146 @@ turso_status_code_t turso_connection_register_aggregate_function(
     turso_value_destructor_t value_destructor,
     const char **error_opt_out);
 
+/** Register or replace a per-connection managed window-capable aggregate function. flags uses SQLite bit values (e.g. 0x800 for DETERMINISTIC). */
+turso_status_code_t turso_connection_register_window_function(
+    const turso_connection_t *self,
+    const char *name,
+    int32_t argc,
+    uint32_t flags,
+    uintptr_t context,
+    turso_aggregate_init_function_t init,
+    turso_aggregate_step_function_t step,
+    turso_aggregate_final_function_t finalize,
+    turso_aggregate_value_function_t value,
+    turso_aggregate_inverse_function_t inverse,
+    turso_context_destructor_t context_destructor,
+    turso_context_destructor_t aggregate_destructor,
+    turso_value_destructor_t value_destructor,
+    const char **error_opt_out);
+
+/** Out-parameter variant of turso_connection_register_scalar_function. flags uses SQLite bit values (e.g. 0x800 for DETERMINISTIC). */
+turso_status_code_t turso_connection_register_scalar_function_ptr(
+    const turso_connection_t *self,
+    const char *name,
+    int32_t argc,
+    uint32_t flags,
+    uintptr_t context,
+    turso_scalar_function_ptr_t callback,
+    turso_context_destructor_t context_destructor,
+    turso_value_destructor_t value_destructor,
+    const char **error_opt_out);
+
+/** Out-parameter variant of turso_connection_register_aggregate_function. value and inverse must both be passed or both be NULL; with both, the aggregate can also run as a window function. flags uses SQLite bit values (e.g. 0x800 for DETERMINISTIC). */
+turso_status_code_t turso_connection_register_aggregate_function_ptr(
+    const turso_connection_t *self,
+    const char *name,
+    int32_t argc,
+    uint32_t flags,
+    uintptr_t context,
+    turso_aggregate_init_function_t init,
+    turso_aggregate_step_function_ptr_t step,
+    turso_aggregate_final_function_ptr_t finalize,
+    turso_aggregate_value_function_ptr_t value,
+    turso_aggregate_inverse_function_ptr_t inverse,
+    turso_context_destructor_t context_destructor,
+    turso_context_destructor_t aggregate_destructor,
+    turso_value_destructor_t value_destructor,
+    const char **error_opt_out);
+
 /** Unregister a per-connection managed scalar or aggregate function. */
 turso_status_code_t turso_connection_unregister_function(
     const turso_connection_t *self,
     const char *name,
+    const char **error_opt_out);
+
+/**
+ * Database-level user-defined function registration. SQLite has no equivalent.
+ *
+ * Like the turso_connection_register_* functions above, except every connection
+ * opened from the database *after* the call starts out with the function.
+ * Connections already open are unaffected, and a connection-level registration
+ * of the same name and argument count shadows the database-level one on that
+ * connection.
+ */
+
+/** Register or replace a database-level managed scalar function. */
+turso_status_code_t turso_database_register_scalar_function(
+    const turso_database_t *self,
+    const char *name,
+    int32_t argc,
+    bool deterministic,
+    uintptr_t context,
+    turso_scalar_function_t callback,
+    turso_context_destructor_t context_destructor,
+    turso_value_destructor_t value_destructor,
+    const char **error_opt_out);
+
+/** Register or replace a database-level managed aggregate function.flags uses SQLite bit values (e.g. 0x800 for DETERMINISTIC). */
+turso_status_code_t turso_database_register_aggregate_function(
+    const turso_database_t *self,
+    const char *name,
+    int32_t argc,
+    uint32_t flags,
+    uintptr_t context,
+    turso_aggregate_init_function_t init,
+    turso_aggregate_step_function_t step,
+    turso_aggregate_final_function_t finalize,
+    turso_context_destructor_t context_destructor,
+    turso_context_destructor_t aggregate_destructor,
+    turso_value_destructor_t value_destructor,
+    const char **error_opt_out);
+
+/** Register or replace a database-level managed window-capable aggregate function. flags uses SQLite bit values (e.g. 0x800 for DETERMINISTIC). */
+turso_status_code_t turso_database_register_window_function(
+    const turso_database_t *self,
+    const char *name,
+    int32_t argc,
+    uint32_t flags,
+    uintptr_t context,
+    turso_aggregate_init_function_t init,
+    turso_aggregate_step_function_t step,
+    turso_aggregate_final_function_t finalize,
+    turso_aggregate_value_function_t value,
+    turso_aggregate_inverse_function_t inverse,
+    turso_context_destructor_t context_destructor,
+    turso_context_destructor_t aggregate_destructor,
+    turso_value_destructor_t value_destructor,
+    const char **error_opt_out);
+
+/** Out-parameter variant of turso_database_register_scalar_function. flags uses SQLite bit values (e.g. 0x800 for DETERMINISTIC). */
+turso_status_code_t turso_database_register_scalar_function_ptr(
+    const turso_database_t *self,
+    const char *name,
+    int32_t argc,
+    uint32_t flags,
+    uintptr_t context,
+    turso_scalar_function_ptr_t callback,
+    turso_context_destructor_t context_destructor,
+    turso_value_destructor_t value_destructor,
+    const char **error_opt_out);
+
+/** Out-parameter variant of turso_database_register_aggregate_function. value and inverse must both be passed or both be NULL. flags uses SQLite bit values (e.g. 0x800 for DETERMINISTIC). */
+turso_status_code_t turso_database_register_aggregate_function_ptr(
+    const turso_database_t *self,
+    const char *name,
+    int32_t argc,
+    uint32_t flags,
+    uintptr_t context,
+    turso_aggregate_init_function_t init,
+    turso_aggregate_step_function_ptr_t step,
+    turso_aggregate_final_function_ptr_t finalize,
+    turso_aggregate_value_function_ptr_t value,
+    turso_aggregate_inverse_function_ptr_t inverse,
+    turso_context_destructor_t context_destructor,
+    turso_context_destructor_t aggregate_destructor,
+    turso_value_destructor_t value_destructor,
+    const char **error_opt_out);
+
+/** Removes the database-level function registered under `name` with exactly `argc` arguments. Only connections opened after this call stop seeing it. Removing a function that was never registered is not an error, matching SQLite. */
+turso_status_code_t turso_database_remove_function(
+    const turso_database_t *self,
+    const char *name,
+    int32_t argc,
     const char **error_opt_out);
 
 /** Register or replace a per-connection managed collation. */

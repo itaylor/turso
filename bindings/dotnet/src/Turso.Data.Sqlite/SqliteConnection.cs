@@ -107,6 +107,7 @@ public partial class SqliteConnection : DbConnection
             ApplyConnectionOptions();
             RegisterScalarFunctions();
             RegisterAggregateFunctions();
+            RegisterWindowFunctions();
             RegisterCollations();
             LoadPendingExtensions();
             OnStateChange(new StateChangeEventArgs(originalState, State));
@@ -325,6 +326,72 @@ public partial class SqliteConnection : DbConnection
     public virtual void CreateAggregate<TAccumulate, TResult>(string name, TAccumulate seed, Func<TAccumulate, object?[], TAccumulate>? func, Func<TAccumulate, TResult>? resultSelector, bool isDeterministic = false)
     {
         RegisterAggregateFunction(name, -1, isDeterministic, seed, func is null ? null : (accumulator, args) => InvokeSeededAggregateStep(func, accumulator, args), accumulator => InvokeResultSelector(resultSelector!, accumulator));
+    }
+
+    /// <summary>Registers a variadic window-capable aggregate function (SQLite's xStep/xInverse/xValue/xFinal). Pass <see langword="null"/> for <paramref name="step"/> to remove a previously registered function.</summary>
+    public virtual void CreateWindowFunction<TAccumulate>(
+        string name,
+        TAccumulate seed,
+        Func<TAccumulate, object?[], TAccumulate>? step,
+        Func<TAccumulate, object?[], TAccumulate>? inverse,
+        Func<TAccumulate, object?>? value,
+        Func<TAccumulate, object?>? result,
+        bool isDeterministic = false)
+    {
+        ArgumentNullException.ThrowIfNull(result);
+        RegisterWindowFunction(
+            name,
+            -1,
+            isDeterministic,
+            seed,
+            step is null ? null : (accumulator, args) => InvokeSeededAggregateStep(step, accumulator, args),
+            inverse is null ? null : (accumulator, args) => InvokeSeededAggregateStep(inverse, accumulator, args),
+            value is null ? null : accumulator => InvokeResultSelector(value, accumulator),
+            accumulator => InvokeResultSelector(result, accumulator));
+    }
+
+    /// <summary>Registers a single-argument window-capable aggregate function. See the <c>object?[]</c> overload for details.</summary>
+    public virtual void CreateWindowFunction<T1, TAccumulate>(
+        string name,
+        TAccumulate seed,
+        Func<TAccumulate, T1, TAccumulate>? step,
+        Func<TAccumulate, T1, TAccumulate>? inverse,
+        Func<TAccumulate, object?>? value,
+        Func<TAccumulate, object?>? result,
+        bool isDeterministic = false)
+    {
+        ArgumentNullException.ThrowIfNull(result);
+        RegisterWindowFunction(
+            name,
+            1,
+            isDeterministic,
+            seed,
+            step is null ? null : (accumulator, args) => InvokeSeededAggregateStep(name, step, accumulator, args),
+            inverse is null ? null : (accumulator, args) => InvokeSeededAggregateStep(name, inverse, accumulator, args),
+            value is null ? null : accumulator => InvokeResultSelector(value, accumulator),
+            accumulator => InvokeResultSelector(result, accumulator));
+    }
+
+    /// <summary>Registers a two-argument window-capable aggregate function. See the <c>object?[]</c> overload for details.</summary>
+    public virtual void CreateWindowFunction<T1, T2, TAccumulate>(
+        string name,
+        TAccumulate seed,
+        Func<TAccumulate, T1, T2, TAccumulate>? step,
+        Func<TAccumulate, T1, T2, TAccumulate>? inverse,
+        Func<TAccumulate, object?>? value,
+        Func<TAccumulate, object?>? result,
+        bool isDeterministic = false)
+    {
+        ArgumentNullException.ThrowIfNull(result);
+        RegisterWindowFunction(
+            name,
+            2,
+            isDeterministic,
+            seed,
+            step is null ? null : (accumulator, args) => InvokeSeededAggregateStep(name, step, accumulator, args),
+            inverse is null ? null : (accumulator, args) => InvokeSeededAggregateStep(name, inverse, accumulator, args),
+            value is null ? null : accumulator => InvokeResultSelector(value, accumulator),
+            accumulator => InvokeResultSelector(result, accumulator));
     }
 
     public virtual void EnableExtensions(bool enable = true)

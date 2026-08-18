@@ -7,6 +7,9 @@ namespace Turso.Raw.Public;
 
 public static class TursoBindings
 {
+    /// <summary>SQLITE_DETERMINISTIC, the bit value the engine's function flags share with SQLite.</summary>
+    private const uint SqliteDeterministicFlag = 0x800;
+
     public static TursoDatabaseHandle OpenDatabase(string path)
     {
         ArgumentNullException.ThrowIfNull(path);
@@ -89,16 +92,60 @@ public static class TursoBindings
         ArgumentNullException.ThrowIfNull(contextDestructor);
         ArgumentNullException.ThrowIfNull(aggregateDestructor);
         ArgumentNullException.ThrowIfNull(valueDestructor);
-        _ = deterministic;
 
         var status = TursoInterop.RegisterAggregateFunction(
             db,
             name,
             argc,
+            deterministic ? SqliteDeterministicFlag : 0u,
             context,
             init,
             step,
             finalize,
+            contextDestructor,
+            aggregateDestructor,
+            valueDestructor,
+            out var errorPtr);
+        ThrowIfError(status, errorPtr);
+    }
+
+    public static void RegisterWindowFunction(
+        TursoDatabaseHandle db,
+        string name,
+        int argc,
+        uint flags,
+        IntPtr context,
+        TursoAggregateInitCallback init,
+        TursoAggregateStepCallback step,
+        TursoAggregateFinalCallback finalize,
+        TursoAggregateValueCallback value,
+        TursoAggregateInverseCallback inverse,
+        TursoContextDestructorCallback contextDestructor,
+        TursoContextDestructorCallback aggregateDestructor,
+        TursoValueDestructorCallback valueDestructor)
+    {
+        db.ThrowIfInvalid();
+        ArgumentNullException.ThrowIfNull(name);
+        ArgumentNullException.ThrowIfNull(init);
+        ArgumentNullException.ThrowIfNull(step);
+        ArgumentNullException.ThrowIfNull(finalize);
+        ArgumentNullException.ThrowIfNull(value);
+        ArgumentNullException.ThrowIfNull(inverse);
+        ArgumentNullException.ThrowIfNull(contextDestructor);
+        ArgumentNullException.ThrowIfNull(aggregateDestructor);
+        ArgumentNullException.ThrowIfNull(valueDestructor);
+
+        var status = TursoInterop.RegisterWindowFunction(
+            db,
+            name,
+            argc,
+            flags,
+            context,
+            init,
+            step,
+            finalize,
+            value,
+            inverse,
             contextDestructor,
             aggregateDestructor,
             valueDestructor,

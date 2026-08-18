@@ -101,6 +101,9 @@ export declare class Database {
    * * `toggle` - Whether to use safe integers by default.
    */
   defaultSafeIntegers(toggle?: boolean | undefined | null): void
+  createScalarFunction(name: string, options: UdfOptions, func: unknown): void
+  /** `start` is the initial accumulator value, or a function making one per group. */
+  createAggregateFunction(name: string, options: UdfOptions, start: unknown, step: unknown, inverse?: unknown | undefined | null, result?: unknown | undefined | null): void
   /** Runs the I/O loop synchronously. */
   ioLoopSync(): void
   /** Runs the I/O loop asynchronously, returning a Promise. */
@@ -205,4 +208,15 @@ export interface TableColumn {
   column?: undefined
   table?: undefined
   database?: undefined
+}
+
+export interface UdfOptions {
+  /** Number of arguments, or -1 for a variadic function. */
+  argCount: number
+  /** The engine may call the function once and reuse the result. */
+  deterministic: boolean
+  /** Callable only from top-level SQL, not from triggers, views or CHECK. */
+  directOnly: boolean
+  /** Pass INTEGER arguments as BigInt; omit to follow `defaultSafeIntegers`. */
+  safeIntegers?: boolean
 }

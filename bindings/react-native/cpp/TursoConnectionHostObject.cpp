@@ -1,5 +1,6 @@
 #include "TursoConnectionHostObject.h"
 #include "TursoStatementHostObject.h"
+#include "TursoUdf.h"
 
 extern "C" {
 #include <turso.h>
@@ -75,6 +76,33 @@ jsi::Value TursoConnectionHostObject::get(jsi::Runtime &rt, const jsi::PropNameI
         );
     }
 
+    if (propName == "registerScalarFunction") {
+        return jsi::Function::createFromHostFunction(
+            rt, name, 4,
+            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return this->registerScalarFunction(rt, args, count);
+            }
+        );
+    }
+
+    if (propName == "registerAggregateFunction") {
+        return jsi::Function::createFromHostFunction(
+            rt, name, 7,
+            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return this->registerAggregateFunction(rt, args, count);
+            }
+        );
+    }
+
+    if (propName == "unregisterFunction") {
+        return jsi::Function::createFromHostFunction(
+            rt, name, 1,
+            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return this->unregisterFunction(rt, args, count);
+            }
+        );
+    }
+
     return jsi::Value::undefined();
 }
 
@@ -90,6 +118,9 @@ std::vector<jsi::PropNameID> TursoConnectionHostObject::getPropertyNames(jsi::Ru
     props.emplace_back(jsi::PropNameID::forAscii(rt, "getAutocommit"));
     props.emplace_back(jsi::PropNameID::forAscii(rt, "setBusyTimeout"));
     props.emplace_back(jsi::PropNameID::forAscii(rt, "close"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "registerScalarFunction"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "registerAggregateFunction"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "unregisterFunction"));
     return props;
 }
 
@@ -178,6 +209,80 @@ jsi::Value TursoConnectionHostObject::close(jsi::Runtime &rt) {
         throwError(rt, error);
     }
 
+    return jsi::Value::undefined();
+}
+
+namespace {
+
+std::shared_ptr<jsi::Function> requireFunction(
+    jsi::Runtime &rt, const jsi::Value &value, const char *what) {
+    if (!value.isObject() || !value.asObject(rt).isFunction(rt)) {
+        throw jsi::JSError(rt, std::string(what) + " must be a function");
+    }
+    return std::make_shared<jsi::Function>(value.asObject(rt).asFunction(rt));
+}
+
+/// null and undefined both mean "not given".
+std::shared_ptr<jsi::Function> optionalFunction(
+    jsi::Runtime &rt, const jsi::Value &value, const char *what) {
+    if (value.isNull() || value.isUndefined()) {
+        return nullptr;
+    }
+    return requireFunction(rt, value, what);
+}
+
+} // namespace
+
+jsi::Value TursoConnectionHostObject::registerScalarFunction(jsi::Runtime &rt, const jsi::Value *args, size_t count) {
+    if (!conn_) {
+        throw jsi::JSError(rt, "registerScalarFunction: connection is closed");
+    }
+
+    if (count < 4 || !args[0].isString() || !args[1].isNumber() || !args[2].isNumber()) {
+        throw jsi::JSError(rt, "registerScalarFunction: expected (name, argc, flags, fn)");
+    }
+
+    std::string name = args[0].asString(rt).utf8(rt);
+    int32_t argc = static_cast<int32_t>(args[1].asNumber());
+    uint32_t flags = static_cast<uint32_t>(args[2].asNumber());
+    auto fn = requireFunction(rt, args[3], "the implementation");
+
+    udfRegisterScalar(rt, conn_, name, argc, flags, std::move(fn));
+    return jsi::Value::undefined();
+}
+
+jsi::Value TursoConnectionHostObject::registerAggregateFunction(jsi::Runtime &rt, const jsi::Value *args, size_t count) {
+    if (!conn_) {
+        throw jsi::JSError(rt, "registerAggregateFunction: connection is closed");
+    }
+
+    if (count < 7 || !args[0].isString() || !args[1].isNumber() || !args[2].isNumber()) {
+        throw jsi::JSError(rt, "registerAggregateFunction: expected (name, argc, flags, start, step, inverse, result)");
+    }
+
+    std::string name = args[0].asString(rt).utf8(rt);
+    int32_t argc = static_cast<int32_t>(args[1].asNumber());
+    uint32_t flags = static_cast<uint32_t>(args[2].asNumber());
+    auto start = requireFunction(rt, args[3], "the \"start\" option");
+    auto step = requireFunction(rt, args[4], "the \"step\" option");
+    auto inverse = optionalFunction(rt, args[5], "the \"inverse\" option");
+    auto result = optionalFunction(rt, args[6], "the \"result\" option");
+
+    udfRegisterAggregate(rt, conn_, name, argc, flags, std::move(start), std::move(step),
+                         std::move(inverse), std::move(result));
+    return jsi::Value::undefined();
+}
+
+jsi::Value TursoConnectionHostObject::unregisterFunction(jsi::Runtime &rt, const jsi::Value *args, size_t count) {
+    if (!conn_) {
+        throw jsi::JSError(rt, "unregisterFunction: connection is closed");
+    }
+
+    if (count < 1 || !args[0].isString()) {
+        throw jsi::JSError(rt, "unregisterFunction: expected string argument (name)");
+    }
+
+    udfUnregister(rt, conn_, args[0].asString(rt).utf8(rt));
     return jsi::Value::undefined();
 }
 

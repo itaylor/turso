@@ -9,6 +9,7 @@ import pytest
 # Skip all tests if SQLAlchemy is not installed
 sqlalchemy = pytest.importorskip("sqlalchemy")
 
+import turso  # noqa: E402
 from sqlalchemy import Column, Integer, String, create_engine, text  # noqa: E402
 from sqlalchemy.engine import URL  # noqa: E402
 from sqlalchemy.orm import Session, declarative_base  # noqa: E402
@@ -769,10 +770,15 @@ class TestTursoDialectMixin:
 class TestTursoDialectMethods:
     """Test TursoDialect methods not covered by integration tests."""
 
-    def test_on_connect_returns_none(self):
-        """on_connect returns None — skips REGEXP setup."""
+    def test_on_connect_registers_regexp(self):
+        """on_connect registers REGEXP on the connection, like pysqlite does."""
         dialect = TursoDialect()
-        assert dialect.on_connect() is None
+        conn = turso.connect(":memory:")
+        try:
+            dialect.on_connect()(conn)
+            assert conn.execute("SELECT 'abc' REGEXP 'b', 'abc' REGEXP '^z'").fetchall() == [(1, 0)]
+        finally:
+            conn.close()
 
     def test_get_isolation_level_returns_serializable(self):
         """get_isolation_level returns SERIALIZABLE."""
@@ -814,10 +820,15 @@ class TestTursoDialectMethods:
 class TestTursoSyncDialectMethods:
     """Test TursoSyncDialect methods parallel to TursoDialect."""
 
-    def test_on_connect_returns_none(self):
-        """Sync on_connect also returns None."""
+    def test_on_connect_registers_regexp(self):
+        """The sync dialect registers REGEXP too."""
         dialect = TursoSyncDialect()
-        assert dialect.on_connect() is None
+        conn = turso.connect(":memory:")
+        try:
+            dialect.on_connect()(conn)
+            assert conn.execute("SELECT 'abc' REGEXP 'b'").fetchall() == [(1,)]
+        finally:
+            conn.close()
 
     def test_get_isolation_level_returns_serializable(self):
         """Sync get_isolation_level returns SERIALIZABLE."""

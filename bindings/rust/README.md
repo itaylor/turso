@@ -235,6 +235,100 @@ println!("Sent: {} bytes", stats.network_sent_bytes);
 println!("WAL size: {} bytes", stats.main_wal_size);
 ```
 
+### User-Defined Functions
+
+Register scalar and aggregate (optionally window-capable) functions on a
+connection, the way `sqlite3_create_function` does. Registration is
+per-connection, and a function shadows a built-in of the same name and
+argument count.
+
+```rust
+use turso::udf::FunctionFlags;
+use turso::{Builder, Value, ValueRef};
+
+let db = Builder::new_local(":memory:").build().await?;
+let conn = db.connect()?;
+
+conn.create_scalar_function(
+    "double",
+    1,
+    FunctionFlags::DETERMINISTIC,
+    |args: &[ValueRef<'_>]| {
+        let n = args[0].as_integer().copied().unwrap_or(0);
+        Ok(Value::Integer(n * 2))
+    },
+)?;
+
+let mut rows = conn.query("SELECT double(21)", ()).await?;
+let row = rows.next().await?.unwrap();
+assert_eq!(row.get_value(0)?, Value::Integer(42));
+```
+
+An aggregate is any type implementing `turso::udf::AggregateFunction` /
+`AggregateState`; implement `value`/`inverse` and return `true` from
+`supports_window()` to let it also run with `OVER (...)`:
+
+```rust
+use turso::udf::{AggregateFunction, AggregateState, FunctionFlags};
+
+struct Sum;
+struct SumState(i64);
+
+impl AggregateFunction for Sum {
+    fn init(&self) -> turso::Result<Box<dyn AggregateState>> {
+        Ok(Box::new(SumState(0)))
+    }
+}
+
+impl AggregateState for SumState {
+    fn step(&mut self, args: &[turso::ValueRef<'_>]) -> turso::Result<()> {
+        self.0 += args[0].as_integer().copied().unwrap_or(0);
+        Ok(())
+    }
+
+    fn finalize(self: Box<Self>) -> turso::Result<turso::Value> {
+        Ok(turso::Value::Integer(self.0))
+    }
+}
+
+conn.create_aggregate_function("my_sum", 1, FunctionFlags::empty(), Sum)?;
+```
+
+See the `turso::udf` module docs for the full API, including `remove_function`
+and the flags (`DETERMINISTIC`, `DIRECTONLY`, `INNOCUOUS`).
+
+#### Database-level registration
+
+`Database` has the same `create_scalar_function` / `create_aggregate_function`
+/ `remove_function` methods, but registering there seeds every connection
+opened with `connect()` *afterwards* instead of just one connection. This has
+no SQLite equivalent — it's a Turso convenience for cases where many
+connections need the same function and registering on each one individually
+would be repetitive:
+
+```rust
+let db = Builder::new_local(":memory:").build().await?;
+
+db.create_scalar_function(
+    "double",
+    1,
+    FunctionFlags::DETERMINISTIC,
+    |args: &[ValueRef<'_>]| {
+        let n = args[0].as_integer().copied().unwrap_or(0);
+        Ok(Value::Integer(n * 2))
+    },
+)?;
+
+// Every connection opened from here on sees `double`.
+let conn = db.connect()?;
+let mut rows = conn.query("SELECT double(21)", ()).await?;
+```
+
+A connection opened *before* the call, or already open, does not see the
+function — it already has its own copy of the function table. A
+connection-level registration of the same name and argument count shadows
+the database-level one, but only on that connection.
+
 ## License
 
 MIT

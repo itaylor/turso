@@ -102,6 +102,11 @@ class NotSupportedError(DatabaseError):
     pass
 
 
+def _user_function_error(text: str) -> Optional[str]:
+    """The fixed sqlite3 callback messages arrive unwrapped; anything else is None."""
+    return text if text.startswith("user-defined ") else None
+
+
 def _map_turso_exception(exc: Exception) -> Exception:
     """Maps Turso-specific exceptions to DB-API 2.0 exception hierarchy"""
     if isinstance(exc, Busy):
@@ -113,6 +118,11 @@ def _map_turso_exception(exc: Exception) -> Exception:
     if isinstance(exc, Constraint):
         return IntegrityError(str(exc))
     if isinstance(exc, TursoError):
+        message = _user_function_error(str(exc))
+        if message is not None:
+            mapped = OperationalError(message)
+            mapped.__cause__ = exc.__cause__
+            return mapped
         # Generic Turso error -> DatabaseError
         return DatabaseError(str(exc))
     if isinstance(exc, DatabaseFull):
@@ -122,6 +132,14 @@ def _map_turso_exception(exc: Exception) -> Exception:
     if isinstance(exc, Corrupt):
         return DatabaseError(str(exc))
     return exc
+
+
+def _map_registration_exception(exc: Exception) -> Exception:
+    """sqlite3 reports a rejected name or argument count as OperationalError."""
+    mapped = _map_turso_exception(exc)
+    if type(mapped) is DatabaseError:
+        return OperationalError(str(mapped))
+    return mapped
 
 
 # Internal helpers
@@ -463,6 +481,48 @@ class Connection:
             return self._conn.get_query_timeout()
         except Exception as exc:  # noqa: BLE001
             raise _map_turso_exception(exc)
+
+    def create_function(
+        self,
+        name: str,
+        narg: int,
+        func: Optional[Callable[..., Any]],
+        *,
+        deterministic: bool = False,
+    ) -> None:
+        """Register a callable as an SQL function; ``narg`` is -1 for any number of arguments, ``func=None`` removes it."""
+        if func is None:
+            self._remove_function(name, narg)
+            return
+        if not callable(func):
+            raise TypeError("parameter must be callable")
+        try:
+            self._conn.create_scalar_function(name, narg, func, deterministic)
+        except Exception as exc:  # noqa: BLE001
+            raise _map_registration_exception(exc)
+
+    def create_aggregate(self, name: str, n_arg: int, aggregate_class: Optional[type]) -> None:
+        """Register an aggregate class, instantiated once per group; ``None`` removes it."""
+        self._create_aggregate(name, n_arg, aggregate_class, window=False)
+
+    def create_window_function(self, name: str, num_params: int, aggregate_class: Optional[type]) -> None:
+        """Like :meth:`create_aggregate`, but the class must also have ``value()`` and ``inverse()``."""
+        self._create_aggregate(name, num_params, aggregate_class, window=True)
+
+    def _create_aggregate(self, name: str, narg: int, aggregate_class: Optional[type], *, window: bool) -> None:
+        if aggregate_class is None:
+            self._remove_function(name, narg)
+            return
+        try:
+            self._conn.create_aggregate_function(name, narg, aggregate_class, window)
+        except Exception as exc:  # noqa: BLE001
+            raise _map_registration_exception(exc)
+
+    def _remove_function(self, name: str, narg: int) -> None:
+        try:
+            self._conn.remove_function(name, narg)
+        except Exception as exc:  # noqa: BLE001
+            raise _map_registration_exception(exc)
 
     def _maybe_implicit_begin(self, sql: str) -> None:
         """

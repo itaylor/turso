@@ -39,6 +39,14 @@ export type {
   TursoType,
 } from './types';
 
+// User-defined function types
+export type {
+  AggregateOptions,
+  FunctionOptions,
+  UserFunction,
+  UserFunctionResult,
+} from './udf';
+
 // Re-export classes
 export { Database } from './Database';
 export { Statement } from './Statement';

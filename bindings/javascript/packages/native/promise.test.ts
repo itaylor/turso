@@ -525,3 +525,57 @@ test('transactionAsync() rejects callbacks that do not declare the handle', asyn
     expect(() => db.transactionAsync(async () => { })).toThrow(/Transaction handle/);
     expect(() => db.transactionAsync((async (...args: any[]) => { }) as any)).toThrow(/Transaction handle/);
 })
+
+test('user-defined scalar function', async () => {
+    const db = await connect(":memory:");
+    expect(await db.function('add2', (a, b) => a + b)).toBe(db);
+    const stmt = await db.prepare("SELECT add2(2, 3) AS v");
+    expect(await stmt.get()).toEqual({ v: 5 });
+
+    await db.function('count_args', { varargs: true }, (...args) => args.length);
+    expect(await (await db.prepare("SELECT count_args(1, 2) AS v")).get()).toEqual({ v: 2 });
+
+    await db.function('kind', { safeIntegers: true }, (x) => typeof x);
+    expect(await (await db.prepare("SELECT kind(5) AS v")).get()).toEqual({ v: 'bigint' });
+})
+
+test('a throwing user-defined function rejects the statement with the error it threw', async () => {
+    const db = await connect(":memory:");
+    await db.function('boom', () => { throw new RangeError("kaboom"); });
+    const stmt = await db.prepare("SELECT boom()");
+    await expect(stmt.get()).rejects.toThrow(RangeError);
+    await expect(stmt.get()).rejects.toThrow(/kaboom/);
+})
+
+test('user-defined function argument validation', async () => {
+    const db = await connect(":memory:");
+    await expect((db as any).function('x')).rejects.toThrow(TypeError);
+    await expect((db as any).function(42, () => 1)).rejects.toThrow(TypeError);
+    await expect((db as any).aggregate('x', {})).rejects.toThrow(/Missing required option "step"/);
+})
+
+test('user-defined aggregate and window function', async () => {
+    const db = await connect(":memory:");
+    await db.exec("CREATE TABLE t(g, x)");
+    await db.exec("INSERT INTO t VALUES ('a', 1), ('a', 2), ('b', 3)");
+
+    expect(await db.aggregate('mysum', { start: 0, step: (total, x) => total + x })).toBe(db);
+    expect(await (await db.prepare("SELECT mysum(x) AS v FROM t")).get()).toEqual({ v: 6 });
+    expect(await (await db.prepare("SELECT g, mysum(x) AS v FROM t GROUP BY g ORDER BY g")).all())
+        .toEqual([{ g: 'a', v: 3 }, { g: 'b', v: 3 }]);
+
+    await db.aggregate('wsum', {
+        start: 0,
+        step: (total, x) => total + x,
+        inverse: (total, x) => total - x,
+        result: (total) => total,
+    });
+    const rows = await (await db.prepare(
+        "SELECT x, wsum(x) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS v FROM t ORDER BY x",
+    )).all();
+    expect(rows).toEqual([{ x: 1, v: 1 }, { x: 2, v: 3 }, { x: 3, v: 5 }]);
+
+    await db.aggregate('nosum', { start: 0, step: (total, x) => total + x });
+    expect(() => db.prepare("SELECT nosum(x) OVER () FROM t"))
+        .toThrow(/nosum\(\) may not be used as a window function/);
+})

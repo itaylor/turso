@@ -2,6 +2,7 @@ import { AsyncLock } from "./async-lock.js";
 import { bindParams } from "./bind.js";
 import { SqliteError } from "./sqlite-error.js";
 import { NativeDatabase, NativeStatement, QueryOptions, STEP_IO, STEP_ROW, STEP_DONE, STEP_SLEEP, DatabaseOpts } from "./types.js";
+import { AggregateOptions, FunctionOptions, aggregateRegistration, scalarRegistration } from "./udf.js";
 
 const convertibleErrorTypes = { TypeError };
 const CONVERTIBLE_ERROR_PREFIX = "[TURSO_CONVERT_TYPE]";
@@ -574,12 +575,44 @@ class Database {
     throw new Error("not implemented");
   }
 
-  function(name, options, fn) {
-    throw new Error("not implemented");
+  /**
+   * The callback runs synchronously while the calling statement steps, so it
+   * cannot `await` or use any method of this class.
+   */
+  async function(name: string, options?: FunctionOptions | Function, fn?: Function): Promise<this> {
+    const registration = scalarRegistration(name, options, fn);
+    await this.connect();
+    await this.execLock.acquire();
+    try {
+      this.db.createScalarFunction(registration.name, registration.options, registration.fn);
+    } catch (err) {
+      throw convertError(err);
+    } finally {
+      this.execLock.release();
+    }
+    return this;
   }
 
-  aggregate(name, options) {
-    throw new Error("not implemented");
+  /** Providing an `inverse` callback also allows use as a window function. */
+  async aggregate(name: string, options: AggregateOptions): Promise<this> {
+    const registration = aggregateRegistration(name, options);
+    await this.connect();
+    await this.execLock.acquire();
+    try {
+      this.db.createAggregateFunction(
+        registration.name,
+        registration.options,
+        registration.start,
+        registration.step,
+        registration.inverse,
+        registration.result,
+      );
+    } catch (err) {
+      throw convertError(err);
+    } finally {
+      this.execLock.release();
+    }
+    return this;
   }
 
   table(name, factory) {

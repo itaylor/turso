@@ -1,0 +1,255 @@
+@database :memory:
+@requires-file udf "exercises the standard udf_* test set registered on the connection by the rust backend"
+
+# The standard `udf_*` set, registered by `register_udf_functions` in
+# testing/sqltest/src/backends/rust.rs, which is where each function's
+# behavior is described. Only the rust backend advertises the `udf`
+# capability, so other backends skip this file.
+
+# --------------------------------------------------------------- scalars
+
+test udf-add-basic {
+    SELECT udf_add(2, 3);
+}
+expect {
+    5
+}
+
+test udf-add-null-propagates {
+    SELECT udf_add(NULL, 3);
+    SELECT udf_add(2, NULL);
+}
+expect {
+
+
+}
+
+test udf-concat-variadic {
+    SELECT udf_concat('a', 'b', 'c');
+    SELECT udf_concat();
+    SELECT udf_concat('x', NULL, 'y');
+}
+expect {
+    abc
+
+    xy
+}
+
+test udf-add-wrong-arity {
+    SELECT udf_add(1);
+}
+expect error {
+    wrong number of arguments to function udf_add\(\)
+}
+
+test unknown-function-name {
+    SELECT no_such_udf(1);
+}
+expect error {
+    no such function: no_such_udf
+}
+
+test udf-fail-errors {
+    SELECT udf_fail(1);
+}
+expect error {
+    udf_fail called
+}
+
+# -------------------------------------------------------------- aggregates
+
+test udf-sum-group-by {
+    CREATE TABLE t(g TEXT, x INTEGER);
+    INSERT INTO t VALUES ('a', 1), ('a', 2), ('b', 10);
+    SELECT g, udf_sum(x) FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    a|3
+    b|10
+}
+
+test udf-sum-empty-input {
+    CREATE TABLE t(x INTEGER);
+    SELECT udf_sum(x) FROM t;
+}
+expect {
+    0
+}
+
+test udf-count0-basic {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT udf_count0() FROM t;
+}
+expect {
+    3
+}
+
+# ----------------------------------------------------------------- windows
+
+test udf-wsum-cumulative {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT x, udf_wsum(x) OVER (ORDER BY x) FROM t ORDER BY x;
+}
+expect {
+    1|1
+    2|3
+    3|6
+}
+
+test udf-wsum-moving-frame {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT x, udf_wsum(x) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY x;
+}
+expect {
+    1|1
+    2|3
+    3|5
+}
+
+test udf-wsum-over-empty-frame-spec {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT x, udf_wsum(x) OVER () FROM t ORDER BY x;
+}
+expect {
+    1|6
+    2|6
+    3|6
+}
+
+test udf-sum-rejected-as-window-function {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT x, udf_sum(x) OVER () FROM t;
+}
+expect error {
+    udf_sum\(\) may not be used as a window function
+}
+
+# ------------------------------------------------ determinism / schema safety
+
+test deterministic-index-expression-ok {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (2), (3);
+    CREATE INDEX i ON t(udf_add(x, 1));
+    SELECT x FROM t WHERE udf_add(x, 1) = 4;
+}
+expect {
+    3
+}
+
+test nondeterministic-index-expression-rejected {
+    CREATE TABLE t(x);
+    CREATE INDEX i ON t(udf_nondet(x));
+}
+expect error {
+    non-deterministic functions prohibited in index expressions
+}
+
+test deterministic-generated-column-ok {
+    CREATE TABLE t(a INTEGER, b AS (udf_add(a, 1)));
+    INSERT INTO t(a) VALUES (1), (2);
+    SELECT a, b FROM t ORDER BY a;
+}
+expect {
+    1|2
+    2|3
+}
+
+test nondeterministic-generated-column-rejected {
+    CREATE TABLE t(a INTEGER, b AS (udf_nondet(a)));
+}
+expect error {
+    non-deterministic functions prohibited in generated columns
+}
+
+test deterministic-partial-index-ok {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (2), (5);
+    CREATE INDEX i ON t(x) WHERE udf_add(x, 0) > 4;
+    SELECT x FROM t WHERE udf_add(x, 0) > 4;
+}
+expect {
+    5
+}
+
+test nondeterministic-partial-index-rejected {
+    CREATE TABLE t(x);
+    CREATE INDEX i ON t(x) WHERE udf_nondet(x) > 0;
+}
+expect error {
+    non-deterministic functions prohibited in partial index WHERE clauses
+}
+
+test nondeterministic-check-allowed {
+    CREATE TABLE t(x, CHECK (udf_nondet(x) IS NOT NULL));
+    INSERT INTO t VALUES (1);
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+# ----------------------------------------------------- DIRECTONLY / INNOCUOUS
+
+test directonly-works-directly {
+    SELECT udf_direct(5);
+}
+expect {
+    5
+}
+
+test directonly-fails-in-view {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (2);
+    CREATE VIEW v AS SELECT udf_direct(x) AS d FROM t;
+    SELECT * FROM v;
+}
+expect error {
+    unsafe use of udf_direct\(\)
+}
+
+test directonly-fails-in-trigger {
+    CREATE TABLE t(x);
+    CREATE TABLE log(m);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES (udf_direct(NEW.x)); END;
+    INSERT INTO t VALUES (1);
+}
+expect error {
+    unsafe use of udf_direct\(\)
+}
+
+test trusted-schema-off-innocuous-allowed {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (2);
+    CREATE VIEW vi AS SELECT udf_innocuous(x) AS d FROM t;
+    PRAGMA trusted_schema=OFF;
+    SELECT d FROM vi ORDER BY d;
+}
+expect {
+    1
+    2
+}
+
+test trusted-schema-off-plain-rejected {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (2);
+    CREATE VIEW vp AS SELECT udf_plain(x) AS d FROM t;
+    PRAGMA trusted_schema=OFF;
+    SELECT d FROM vp;
+}
+expect error {
+    unsafe use of udf_plain\(\)
+}
+
+# --------------------------------------------------------- PRAGMA function_list
+
+test function-list-includes-udf-add {
+    PRAGMA function_list;
+}
+expect pattern {
+    udf_add\|0\|s\|utf8\|2\|2048
+}

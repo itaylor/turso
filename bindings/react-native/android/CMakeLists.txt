@@ -15,6 +15,7 @@ set(TURSO_SOURCES
     ../cpp/TursoDatabaseHostObject.cpp
     ../cpp/TursoConnectionHostObject.cpp
     ../cpp/TursoStatementHostObject.cpp
+    ../cpp/TursoUdf.cpp
     ../cpp/TursoSyncDatabaseHostObject.cpp
     ../cpp/TursoSyncOperationHostObject.cpp
     ../cpp/TursoSyncIoItemHostObject.cpp

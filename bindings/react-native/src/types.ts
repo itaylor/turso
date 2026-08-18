@@ -30,6 +30,27 @@ export interface NativeConnection {
   getAutocommit(): boolean;
   setBusyTimeout(timeoutMs: number): void;
   close(): void;
+
+  // The callbacks run synchronously while the calling statement steps.
+  /** `argc` is the argument count, or -1 for any number. */
+  registerScalarFunction(
+    name: string,
+    argc: number,
+    flags: number,
+    fn: Function
+  ): void;
+  /** `inverse` allows use with `OVER`; it and `result` may be null. */
+  registerAggregateFunction(
+    name: string,
+    argc: number,
+    flags: number,
+    start: Function,
+    step: Function,
+    inverse: Function | null,
+    result: Function | null
+  ): void;
+  /** Removes every registration of `name`, whatever its argument count. */
+  unregisterFunction(name: string): void;
 }
 
 /**

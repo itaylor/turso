@@ -348,3 +348,26 @@ test('hash-join-wasm', { timeout: 60_000 }, async () => {
     expect(await (await db.prepare("SELECT length(a) as a, length(b) as b FROM (SELECT a.v as a, b.v as b FROM a INNER JOIN b ON a.k = b.k)")).all()).toEqual(new Array(1024).fill({ a: 100 * 1024, b: 100 * 1024 }));
     await db.close();
 })
+
+test('user-defined scalar function', async () => {
+    const db = await connect(':memory:');
+    await db.function('add2', (a, b) => a + b);
+    expect(await (await db.prepare("SELECT add2(2, 3) AS v")).get()).toEqual({ v: 5 });
+    await db.close();
+})
+
+test('user-defined aggregate function', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE t(x)');
+    await db.exec('INSERT INTO t VALUES (1), (2), (3)');
+    await db.aggregate('mysum', {
+        start: 0,
+        step: (total, x) => total + x,
+        inverse: (total, x) => total - x,
+    });
+    expect(await (await db.prepare("SELECT mysum(x) AS v FROM t")).get()).toEqual({ v: 6 });
+    expect(await (await db.prepare(
+        "SELECT x, mysum(x) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS v FROM t ORDER BY x",
+    )).all()).toEqual([{ x: 1, v: 1 }, { x: 2, v: 3 }, { x: 3, v: 5 }]);
+    await db.close();
+})

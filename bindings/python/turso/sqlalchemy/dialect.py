@@ -9,6 +9,7 @@ This module provides SQLAlchemy dialects:
 from __future__ import annotations
 
 import logging
+import re
 import warnings
 from typing import TYPE_CHECKING, Any, Dict, List
 
@@ -35,7 +36,6 @@ class _TursoDialectMixin:
     The methods below override the parent where the underlying
     capability differs in turso:
     - sqlite_temp_master (temp tables/views) is not supported
-    - create_function (used by pysqlite's REGEXP setup) is not supported
     - isolation level is set at connect time, not via PRAGMA
     """
 
@@ -56,8 +56,17 @@ class _TursoDialectMixin:
         return []
 
     def on_connect(self):
-        """Skip pysqlite's REGEXP function setup (turso doesn't support create_function)."""
-        return None
+        """Register the REGEXP function on each new connection, like pysqlite does."""
+
+        def regexp(pattern, value):
+            if value is None:
+                return None
+            return re.search(pattern, value) is not None
+
+        def connect(dbapi_connection):
+            dbapi_connection.create_function("regexp", 2, regexp, deterministic=True)
+
+        return connect
 
     def get_isolation_level(self, dbapi_connection):
         """Turso doesn't support PRAGMA read_uncommitted; always report SERIALIZABLE."""
@@ -254,6 +263,10 @@ class AioTursoDialect(_TursoDialectMixin, SQLiteDialect_aiosqlite):
     supports_statement_cache = True
     # Disable native_datetime since turso handles datetime differently
     supports_native_datetime = False
+
+    def on_connect(self):
+        """No REGEXP setup: ``turso.aio``'s ``create_function`` is a coroutine and ``on_connect`` is sync."""
+        return None
 
     @classmethod
     def import_dbapi(cls):

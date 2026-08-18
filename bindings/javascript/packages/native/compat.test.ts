@@ -184,3 +184,211 @@ test('encryption', () => {
         unlinkSync(path);
     }
 })
+
+test('user-defined scalar function', () => {
+    const db = new Database(":memory:");
+    expect(db.function('add2', (a, b) => a + b)).toBe(db);
+    expect(db.prepare("SELECT add2(2, 3) AS v").get()).toEqual({ v: 5 });
+
+    expect(() => db.prepare("SELECT add2(1)").get()).toThrow(/wrong number of arguments to function add2/);
+
+    db.function('count_args', { varargs: true }, (...args) => args.length);
+    expect(db.prepare("SELECT count_args() AS v").get()).toEqual({ v: 0 });
+    expect(db.prepare("SELECT count_args(1, 2, 3) AS v").get()).toEqual({ v: 3 });
+})
+
+test('user-defined function argument types', () => {
+    const db = new Database(":memory:");
+    db.function('describe', (x) => `${typeof x}:${x}`);
+    expect(db.prepare("SELECT describe(NULL) AS v").get()).toEqual({ v: 'object:null' });
+    expect(db.prepare("SELECT describe(7) AS v").get()).toEqual({ v: 'number:7' });
+    expect(db.prepare("SELECT describe(1.5) AS v").get()).toEqual({ v: 'number:1.5' });
+    expect(db.prepare("SELECT describe('hi') AS v").get()).toEqual({ v: 'string:hi' });
+
+    db.function('blob_length', (x) => x.length);
+    expect(db.prepare("SELECT blob_length(x'102030') AS v").get()).toEqual({ v: 3 });
+})
+
+test('user-defined function return types', () => {
+    const db = new Database(":memory:");
+    const returns = {
+        null: null,
+        undefined: undefined,
+        text: 'hi',
+        integer: 42,
+        real: 1.5,
+        bigint: 10n,
+        blob: Buffer.from([1, 2]),
+        boolean: true,
+    };
+    db.function('ret', (kind) => returns[kind]);
+
+    expect(db.prepare("SELECT typeof(ret('null')) AS t, ret('null') AS v").get()).toEqual({ t: 'null', v: null });
+    expect(db.prepare("SELECT typeof(ret('undefined')) AS t, ret('undefined') AS v").get()).toEqual({ t: 'null', v: null });
+    expect(db.prepare("SELECT typeof(ret('text')) AS t, ret('text') AS v").get()).toEqual({ t: 'text', v: 'hi' });
+    expect(db.prepare("SELECT typeof(ret('integer')) AS t, ret('integer') AS v").get()).toEqual({ t: 'integer', v: 42 });
+    expect(db.prepare("SELECT typeof(ret('real')) AS t, ret('real') AS v").get()).toEqual({ t: 'real', v: 1.5 });
+    expect(db.prepare("SELECT typeof(ret('bigint')) AS t, ret('bigint') AS v").get()).toEqual({ t: 'integer', v: 10 });
+    expect(db.prepare("SELECT typeof(ret('blob')) AS t, ret('blob') AS v").get()).toEqual({ t: 'blob', v: Buffer.from([1, 2]) });
+    expect(db.prepare("SELECT typeof(ret('boolean')) AS t, ret('boolean') AS v").get()).toEqual({ t: 'integer', v: 1 });
+})
+
+test('a user-defined function returning a value SQL has no type for throws a TypeError', () => {
+    const db = new Database(":memory:");
+    db.function('bad', () => ({ a: 1 }));
+    expect(() => db.prepare("SELECT bad()").get()).toThrow(TypeError);
+    expect(() => db.prepare("SELECT bad()").get()).toThrow(/user-defined function bad\(\) returned an invalid value/);
+})
+
+test('a throwing user-defined function fails the statement with the error it threw', () => {
+    const db = new Database(":memory:");
+    db.function('boom', () => { throw new RangeError("kaboom"); });
+    expect(() => db.prepare("SELECT boom()").get()).toThrow(RangeError);
+    expect(() => db.prepare("SELECT boom()").get()).toThrow(/kaboom/);
+    expect(db.prepare("SELECT 1 AS v").get()).toEqual({ v: 1 });
+})
+
+test('user-defined function options', () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(x)");
+    db.exec("INSERT INTO t VALUES (1), (2), (3)");
+
+    let deterministicCalls = 0;
+    db.function('det', { deterministic: true }, (x) => { deterministicCalls++; return x; });
+    db.prepare("SELECT * FROM t WHERE x = det(2)").all();
+    expect(deterministicCalls).toBe(1);
+
+    let plainCalls = 0;
+    db.function('plain', (x) => { plainCalls++; return x; });
+    db.prepare("SELECT * FROM t WHERE x = plain(2)").all();
+    expect(plainCalls).toBe(3);
+
+    // directOnly: fine from top-level SQL, refused from schema SQL.
+    db.function('direct', { directOnly: true }, () => 1);
+    expect(db.prepare("SELECT direct() AS v").get()).toEqual({ v: 1 });
+    db.exec("CREATE TABLE d(x CHECK (direct() = 1))");
+    expect(() => db.exec("INSERT INTO d VALUES (1)")).toThrow(/unsafe use of direct\(\)/);
+})
+
+test('closing the database from inside a user-defined function fails cleanly', () => {
+    const db = new Database(":memory:");
+    db.function('closer', () => { db.close(); return 1; });
+    expect(() => db.prepare("SELECT closer() AS v").get()).toThrow(/busy executing a query/);
+    expect(db.prepare("SELECT 1 AS v").get()).toEqual({ v: 1 });
+    db.close();
+})
+
+test('user-defined function safeIntegers', () => {
+    const db = new Database(":memory:");
+    db.function('kind', (x) => typeof x);
+    db.function('safe_kind', { safeIntegers: true }, (x) => typeof x);
+    db.function('unsafe_kind', { safeIntegers: false }, (x) => typeof x);
+
+    expect(db.prepare("SELECT kind(5) AS v").get()).toEqual({ v: 'number' });
+    expect(db.prepare("SELECT safe_kind(5) AS v").get()).toEqual({ v: 'bigint' });
+
+    db.defaultSafeIntegers(true);
+    expect(db.prepare("SELECT kind(5) AS v").get()).toEqual({ v: 'bigint' });
+    expect(db.prepare("SELECT unsafe_kind(5) AS v").get()).toEqual({ v: 'number' });
+})
+
+test('user-defined function argument validation', () => {
+    const db = new Database(":memory:");
+    expect(() => (db as any).function(42, () => 1)).toThrow(TypeError);
+    expect(() => (db as any).function('')).toThrow(TypeError);
+    expect(() => (db as any).function('x')).toThrow(TypeError);
+    expect(() => (db as any).function('x', {}, 'not a function')).toThrow(TypeError);
+    expect(() => (db as any).function('x', 'not options', () => 1)).toThrow(TypeError);
+    expect(() => (db as any).function('x', (...args) => args.length)).not.toThrow();
+})
+
+test('a user-defined function shadows a built-in of the same name', () => {
+    const db = new Database(":memory:");
+    expect(db.prepare("SELECT abs(-1) AS v").get()).toEqual({ v: 1 });
+    db.function('abs', (x) => 'shadowed');
+    expect(db.prepare("SELECT abs(-1) AS v").get()).toEqual({ v: 'shadowed' });
+})
+
+test('a user-defined function can query the database', () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(x)");
+    db.exec("INSERT INTO t VALUES (1), (2), (3)");
+    db.function('row_count', () => db.prepare("SELECT COUNT(*) AS c FROM t").get().c);
+    expect(db.prepare("SELECT row_count() AS v").get()).toEqual({ v: 3 });
+})
+
+test('a user-defined function cannot re-enter the statement that called it', () => {
+    const db = new Database(":memory:");
+    let stmt;
+    db.function('reenter', () => {
+        try {
+            stmt.get();
+            return 'ran';
+        } catch (err) {
+            return String(err.message);
+        }
+    });
+    stmt = db.prepare("SELECT reenter() AS v");
+    expect(stmt.get()).toEqual({ v: 'statement is already running' });
+})
+
+test('user-defined aggregate', () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(x)");
+    db.exec("INSERT INTO t VALUES (1), (2), (3)");
+
+    expect(db.aggregate('mysum', { start: 0, step: (total, x) => total + x })).toBe(db);
+    expect(db.prepare("SELECT mysum(x) AS v FROM t").get()).toEqual({ v: 6 });
+
+    expect(db.prepare("SELECT mysum(x) AS v FROM t WHERE x > 100").get()).toEqual({ v: 0 });
+
+    db.aggregate('keep', { start: 7, step: (total, x) => { } });
+    expect(db.prepare("SELECT keep(x) AS v FROM t").get()).toEqual({ v: 7 });
+})
+
+test('user-defined aggregate start option can be a function', () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(g, x)");
+    db.exec("INSERT INTO t VALUES ('a', 1), ('a', 2), ('b', 3)");
+    db.aggregate('collect', {
+        start: () => [],
+        step: (total, x) => { total.push(x); return total; },
+        result: (total) => total.join(','),
+    });
+    expect(db.prepare("SELECT g, collect(x) AS v FROM t GROUP BY g ORDER BY g").all())
+        .toEqual([{ g: 'a', v: '1,2' }, { g: 'b', v: '3' }]);
+})
+
+test('user-defined aggregate works as a window function when it has an inverse', () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(x)");
+    db.exec("INSERT INTO t VALUES (1), (2), (3), (4)");
+    db.aggregate('wsum', {
+        start: 0,
+        step: (total, x) => total + x,
+        inverse: (total, x) => total - x,
+    });
+    const rows = db.prepare(
+        "SELECT x, wsum(x) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS v FROM t ORDER BY x",
+    ).all();
+    expect(rows).toEqual([{ x: 1, v: 1 }, { x: 2, v: 3 }, { x: 3, v: 5 }, { x: 4, v: 7 }]);
+})
+
+test('user-defined aggregate without an inverse cannot be a window function', () => {
+    const db = new Database(":memory:");
+    db.exec("CREATE TABLE t(x)");
+    db.exec("INSERT INTO t VALUES (1), (2)");
+    db.aggregate('nosum', { start: 0, step: (total, x) => total + x });
+    expect(() => db.prepare("SELECT nosum(x) OVER () FROM t").all())
+        .toThrow(/nosum\(\) may not be used as a window function/);
+})
+
+test('user-defined aggregate argument validation', () => {
+    const db = new Database(":memory:");
+    expect(() => (db as any).aggregate('x', {})).toThrow(/Missing required option "step"/);
+    expect(() => (db as any).aggregate('x', { step: 'nope' })).toThrow(/Expected the "step" option to be a function/);
+    expect(() => (db as any).aggregate('x', { step: (t, x) => t, inverse: 5 })).toThrow(/Expected the "inverse" option to be a function/);
+    expect(() => (db as any).aggregate('x', { step: (t, x) => t, result: 5 })).toThrow(/Expected the "result" option to be a function/);
+    expect(() => (db as any).aggregate('', { step: (t, x) => t })).toThrow(TypeError);
+    expect(() => (db as any).aggregate(5, { step: (t, x) => t })).toThrow(TypeError);
+})
