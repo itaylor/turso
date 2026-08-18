@@ -3676,13 +3676,14 @@ impl BTreeTable {
                     CollationSeq::Binary => sql.push_str(" COLLATE BINARY"),
                     CollationSeq::NoCase => sql.push_str(" COLLATE NOCASE"),
                     CollationSeq::Rtrim => sql.push_str(" COLLATE RTRIM"),
-                    CollationSeq::Locale(_) => {
+                    // Dropping the clause would silently change the column's collation on the next
+                    // schema read, and with it the order of any index over it.
+                    CollationSeq::Locale(_) | CollationSeq::Custom(_) => {
                         sql.push_str(" COLLATE ");
                         sql.push_str(&quote_ident(&collation.name()));
                     }
-                    CollationSeq::Unset | CollationSeq::Custom(_) => {
+                    CollationSeq::Unset => {
                         // Unset should not be reachable -- ignore it
-                        // Custom collation is not allowed in schema definitions
                     }
                 };
             }
@@ -4450,12 +4451,7 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
 fn constraint_column_collation(expr: &Expr) -> Result<(&Expr, Option<CollationSeq>)> {
     match expr {
         Expr::Collate(inner, collation_name) => {
-            let collation_seq = CollationSeq::new(collation_name.as_str())?;
-            if collation_seq.is_custom() {
-                crate::bail_parse_error!(
-                    "custom collations are not supported in schema definitions"
-                );
-            }
+            let collation_seq = CollationSeq::from_schema_sql(collation_name.as_str());
             Ok((inner.as_ref(), Some(collation_seq)))
         }
         _ => Ok((expr, None)),
@@ -4786,13 +4782,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             })?;
                         }
                         ast::ColumnConstraint::Collate { ref collation_name } => {
-                            let collation_seq = CollationSeq::new(collation_name.as_str())?;
-                            if collation_seq.is_custom() {
-                                crate::bail_parse_error!(
-                                    "custom collations are not supported in schema definitions"
-                                );
-                            }
-                            collation = Some(collation_seq);
+                            collation =
+                                Some(CollationSeq::from_schema_sql(collation_name.as_str()));
                         }
                         ast::ColumnConstraint::ForeignKey {
                             clause,
@@ -5499,13 +5490,7 @@ impl TryFrom<&ColumnDefinition> for Column {
                     );
                 }
                 ast::ColumnConstraint::Collate { collation_name } => {
-                    let collation_seq = CollationSeq::new(collation_name.as_str())?;
-                    if collation_seq.is_custom() {
-                        crate::bail_parse_error!(
-                            "custom collations are not supported in schema definitions"
-                        );
-                    }
-                    collation.replace(collation_seq);
+                    collation.replace(CollationSeq::from_schema_sql(collation_name.as_str()));
                 }
                 ast::ColumnConstraint::Generated { expr, .. } => {
                     generated = Some(expr.clone());
@@ -7366,6 +7351,7 @@ mod column_info {
     use crate::schema::{ColDef, Type};
     use crate::vdbe::affinity::Affinity;
     use crate::vdbe::CollationSeq;
+    use std::num::NonZeroU32;
 
     // flags
     const F_PRIMARY_KEY: u32 = 1;
@@ -7391,7 +7377,12 @@ mod column_info {
 
     /// ColumnInfo packs information on a [Column] into a single `u32`.
     #[derive(Clone, Debug)]
-    pub struct ColumnInfo(u32);
+    pub struct ColumnInfo {
+        raw: u32,
+        /// A custom collation's `u32` id does not fit the 12 collation bits in `raw`, so it lives here
+        /// and takes precedence over them.
+        custom_collation: Option<NonZeroU32>,
+    }
 
     pub struct NewColumnInfoParams<'a> {
         pub ty: Type,
@@ -7405,8 +7396,11 @@ mod column_info {
             let mut raw: u32 = 0;
 
             raw |= (params.ty as u32) << TYPE_SHIFT;
-            if let Some(c) = params.collation {
-                raw |= (u32::from(c.to_bits()) << COLL_SHIFT) & COLL_MASK;
+            let mut custom_collation = None;
+            match params.collation {
+                Some(CollationSeq::Custom(id)) => custom_collation = NonZeroU32::new(id),
+                Some(c) => raw |= (u32::from(c.to_bits()) << COLL_SHIFT) & COLL_MASK,
+                None => {}
             }
             if params.coldef.primary_key {
                 raw |= F_PRIMARY_KEY
@@ -7424,17 +7418,20 @@ mod column_info {
                 raw |= F_HIDDEN
             }
 
-            Self(raw)
+            Self {
+                raw,
+                custom_collation,
+            }
         }
 
         #[inline]
         pub fn primary_key(&self) -> bool {
-            self.0 & F_PRIMARY_KEY != 0
+            self.raw & F_PRIMARY_KEY != 0
         }
 
         #[inline]
         pub fn is_rowid_alias(&self) -> bool {
-            self.0 & F_ROWID_ALIAS != 0
+            self.raw & F_ROWID_ALIAS != 0
         }
 
         #[inline]
@@ -7444,7 +7441,7 @@ mod column_info {
 
         #[inline]
         pub fn notnull(&self) -> bool {
-            self.0 & F_NOTNULL != 0
+            self.raw & F_NOTNULL != 0
         }
 
         #[inline]
@@ -7454,7 +7451,7 @@ mod column_info {
 
         #[inline]
         pub fn unique(&self) -> bool {
-            self.0 & F_UNIQUE != 0
+            self.raw & F_UNIQUE != 0
         }
 
         #[inline]
@@ -7465,15 +7462,15 @@ mod column_info {
         #[inline]
         fn set_flag(&mut self, mask: u32, val: bool) {
             if val {
-                self.0 |= mask
+                self.raw |= mask
             } else {
-                self.0 &= !mask
+                self.raw &= !mask
             }
         }
 
         #[inline]
         pub fn hidden(&self) -> bool {
-            self.0 & F_HIDDEN != 0
+            self.raw & F_HIDDEN != 0
         }
 
         #[inline]
@@ -7483,34 +7480,37 @@ mod column_info {
 
         #[inline]
         pub fn is_array(&self) -> bool {
-            (self.0 & ARRAY_DIM_MASK) != 0
+            (self.raw & ARRAY_DIM_MASK) != 0
         }
 
         #[inline]
         pub fn array_dimensions(&self) -> u32 {
-            (self.0 & ARRAY_DIM_MASK) >> ARRAY_DIM_SHIFT
+            (self.raw & ARRAY_DIM_MASK) >> ARRAY_DIM_SHIFT
         }
 
         #[inline]
         pub fn set_array_dimensions(&mut self, dims: u32) {
             assert!(dims <= 7, "array dimensions must be <= 7");
-            self.0 = (self.0 & !ARRAY_DIM_MASK) | (dims << ARRAY_DIM_SHIFT);
+            self.raw = (self.raw & !ARRAY_DIM_MASK) | (dims << ARRAY_DIM_SHIFT);
         }
 
         #[inline]
         pub fn ty(&self) -> Type {
-            let v = ((self.0 & TYPE_MASK) >> TYPE_SHIFT) as u8;
+            let v = ((self.raw & TYPE_MASK) >> TYPE_SHIFT) as u8;
             Type::from_bits(v)
         }
 
         #[inline]
         pub fn set_ty(&mut self, ty: Type) {
-            self.0 = (self.0 & !TYPE_MASK) | (((ty as u32) << TYPE_SHIFT) & TYPE_MASK);
+            self.raw = (self.raw & !TYPE_MASK) | (((ty as u32) << TYPE_SHIFT) & TYPE_MASK);
         }
 
         #[inline]
         pub fn collation(&self) -> CollationSeq {
-            let v = ((self.0 & COLL_MASK) >> COLL_SHIFT) as u16;
+            if let Some(id) = self.custom_collation {
+                return CollationSeq::Custom(id.get());
+            }
+            let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u16;
             if v == CollationSeq::Unset.to_bits() {
                 CollationSeq::Binary
             } else {
@@ -7520,28 +7520,34 @@ mod column_info {
 
         #[inline]
         pub fn has_explicit_collation(&self) -> bool {
-            let v = ((self.0 & COLL_MASK) >> COLL_SHIFT) as u16;
+            if self.custom_collation.is_some() {
+                return true;
+            }
+            let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u16;
             v != CollationSeq::Unset.to_bits()
         }
 
         #[inline]
         pub fn set_collation(&mut self, c: Option<CollationSeq>) {
-            self.0 &= !COLL_MASK;
-            if let Some(c) = c {
-                self.0 |= ((c.to_bits() as u32) << COLL_SHIFT) & COLL_MASK;
+            self.raw &= !COLL_MASK;
+            self.custom_collation = None;
+            match c {
+                Some(CollationSeq::Custom(id)) => self.custom_collation = NonZeroU32::new(id),
+                Some(c) => self.raw |= ((c.to_bits() as u32) << COLL_SHIFT) & COLL_MASK,
+                None => {}
             }
         }
 
         #[inline]
         pub fn affinity(&self) -> Option<Affinity> {
-            let v = (self.0 & BASE_AFF_MASK) >> BASE_AFF_SHIFT;
+            let v = (self.raw & BASE_AFF_MASK) >> BASE_AFF_SHIFT;
             Affinity::from_repr(v)
         }
 
         #[inline]
         pub fn override_affinity(&mut self, affinity: Affinity) {
             let v: u32 = affinity as u32;
-            self.0 = (self.0 & !BASE_AFF_MASK) | ((v << BASE_AFF_SHIFT) & BASE_AFF_MASK);
+            self.raw = (self.raw & !BASE_AFF_MASK) | ((v << BASE_AFF_SHIFT) & BASE_AFF_MASK);
         }
     }
 }

@@ -2311,12 +2311,91 @@ impl<'a> Ord for ValueRef<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct KeyInfo {
     pub sort_order: SortOrder,
     pub collation: CollationSeq,
     pub nulls_order: Option<turso_parser::ast::NullsOrder>,
+    /// Resolved comparator for a `CollationSeq::Custom`, which is only a name token. Resolving it when the
+    /// `KeyInfo` is built turns "collation not registered here" into an error before any key is written.
+    /// `Some` iff `collation` is `Custom`.
+    pub custom_collation: Option<Arc<crate::function::ExternalCollation>>,
 }
+
+impl KeyInfo {
+    pub const fn new(
+        sort_order: SortOrder,
+        collation: CollationSeq,
+        nulls_order: Option<turso_parser::ast::NullsOrder>,
+    ) -> Self {
+        Self {
+            sort_order,
+            collation,
+            nulls_order,
+            custom_collation: None,
+        }
+    }
+
+    #[inline]
+    pub fn compare_text(&self, lhs: &str, rhs: &str) -> Ordering {
+        match &self.custom_collation {
+            Some(external) => crate::Connection::custom_collation_compare(external, lhs, rhs),
+            None => {
+                crate::turso_assert!(
+                    !self.collation.is_custom(),
+                    "custom collation reached a key comparison without its comparator",
+                    { "collation": self.collation.name() }
+                );
+                self.collation.compare_strings(lhs, rhs)
+            }
+        }
+    }
+}
+
+/// Where a key comparison finds the callback for a custom collation.
+#[derive(Clone, Copy)]
+pub enum KeyCollations<'a> {
+    Connection(&'a crate::Connection),
+    Symbols(&'a crate::connection::SymbolTable),
+    /// Internal keys (DBSP, FTS, index methods, MVCC recovery) with no connection to ask; a custom collation
+    /// here is an error rather than a silent BINARY comparison.
+    BuiltinOnly,
+}
+
+impl KeyCollations<'_> {
+    /// Errors rather than falling back to BINARY: keys compared with the wrong collation leave an index mis-ordered.
+    pub fn resolve(
+        &self,
+        collation: CollationSeq,
+    ) -> crate::Result<Option<Arc<crate::function::ExternalCollation>>> {
+        if !collation.is_custom() {
+            return Ok(None);
+        }
+        match self {
+            Self::Connection(conn) => conn.get_external_collation(collation).map(Some),
+            Self::Symbols(syms) => syms.get_external_collation(collation).map(Some),
+            Self::BuiltinOnly => Err(crate::LimboError::ParseError(format!(
+                "no such collation sequence: {}",
+                collation.name()
+            ))),
+        }
+    }
+}
+
+impl PartialEq for KeyInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.sort_order == other.sort_order
+            && self.collation == other.collation
+            && self.nulls_order == other.nulls_order
+            && match (&self.custom_collation, &other.custom_collation) {
+                (None, None) => true,
+                (Some(lhs), Some(rhs)) => Arc::ptr_eq(lhs, rhs),
+                _ => false,
+            }
+    }
+}
+
+impl Eq for KeyInfo {}
 
 #[cfg(not(nightly))]
 pub type IndexKeyInfo = Vec<KeyInfo>;
@@ -2413,40 +2492,43 @@ impl IndexInfo {
         })
     }
 
-    pub fn new_from_index(index: &Index) -> Result<Self, TryReserveError> {
-        Self::new_from_index_in(index, TursoAllocator)
+    pub fn new_from_index(index: &Index, collations: KeyCollations<'_>) -> crate::Result<Self> {
+        Self::new_from_index_in(index, TursoAllocator, collations)
     }
 
     pub fn new_from_index_in<A: ConcurrentAllocator>(
         index: &Index,
         alloc: A,
-    ) -> Result<Self, TryReserveError> {
+        collations: KeyCollations<'_>,
+    ) -> crate::Result<Self> {
         // A backing_btree stores the index method's complete opaque key. Unlike
         // an ordinary secondary index, it must not append the base-table rowid.
         // MVCC's commit-time conflict validation handles these
         // `has_rowid == false` records by treating the whole key as the
         // uniqueness prefix (see `check_index_for_conflicts`).
         let has_rowid = index.has_rowid && !index.is_backing_btree_index();
-        let key_info = index
-            .columns
-            .iter()
-            .map(|c| KeyInfo {
-                sort_order: c.order,
-                collation: c.collation.unwrap_or_default(),
-                nulls_order: c.nulls_order,
-            })
-            .chain(has_rowid.then_some(KeyInfo {
-                sort_order: SortOrder::Asc,
-                collation: CollationSeq::Binary,
-                nulls_order: None,
-            }));
-        Self::new_in(
+        let mut key_info = <std::vec::Vec<KeyInfo> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
+            index.columns.len() + (has_rowid as usize),
+        )?;
+        for column in &index.columns {
+            let collation = column.collation.unwrap_or_default();
+            key_info.push(KeyInfo {
+                sort_order: column.order,
+                collation,
+                nulls_order: column.nulls_order,
+                custom_collation: collations.resolve(collation)?,
+            });
+        }
+        if has_rowid {
+            key_info.push(KeyInfo::new(SortOrder::Asc, CollationSeq::Binary, None));
+        }
+        Ok(Self::new_in(
             key_info,
             has_rowid,
             index.columns.len() + (has_rowid as usize),
             index.unique,
             alloc,
-        )
+        )?)
     }
 }
 
@@ -2528,7 +2610,11 @@ where
 }
 
 pub fn cmp_in_column(a: &ValueRef, b: &ValueRef, key: &KeyInfo) -> Ordering {
-    cmp_with_sort(compare_immutable_single(a, b, key.collation), a, b, key)
+    let cmp = match (a, b) {
+        (ValueRef::Text(left), ValueRef::Text(right)) => key.compare_text(left, right),
+        _ => a.cmp(b),
+    };
+    cmp_with_sort(cmp, a, b, key)
 }
 
 /// Outputs a modified [Ordering] that takes into account the sort order and the NULLS order.
@@ -2813,8 +2899,7 @@ where
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     };
 
-    let collation = index_info.key_info[0].collation;
-    let comparison = collation.compare_strings(&lhs_text, &rhs_text);
+    let comparison = index_info.key_info[0].compare_text(&lhs_text, &rhs_text);
 
     let final_comparison = match index_info.key_info[0].sort_order {
         SortOrder::Asc => comparison,
@@ -2940,7 +3025,7 @@ where
         let key_info = &index_info.key_info[field_idx];
         let comparison = match (&lhs_value, rhs_value) {
             (ValueRef::Text(lhs_text), ValueRef::Text(rhs_text)) => {
-                key_info.collation.compare_strings(lhs_text, rhs_text)
+                key_info.compare_text(lhs_text, rhs_text)
             }
             _ => lhs_value.cmp(rhs_value),
         };
@@ -3914,6 +3999,7 @@ mod tests {
                     sort_order,
                     collation,
                     nulls_order: None,
+                    custom_collation: None,
                 }),
             false,
             num_cols,

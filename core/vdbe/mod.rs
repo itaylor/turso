@@ -907,6 +907,9 @@ pub struct ProgramState {
     has_stmt_transaction: bool,
     pub n_change: AtomicI64,
     pub n_total_change: AtomicI64,
+    /// Set by `Insn::CollSeq` for the `Insn::Function` right after it (min/max/nullif). `op_function`
+    /// takes it first thing so it can never leak into a later call.
+    pub(crate) pending_collation: Option<CollationSeq>,
 }
 
 impl std::fmt::Debug for Program {
@@ -982,6 +985,7 @@ impl ProgramState {
             halt_in_progress: false,
             pending_cdc_info: None,
             subprogram_stmt_cache: HashMap::default(),
+            pending_collation: None,
         }
     }
 

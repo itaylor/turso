@@ -1,0 +1,407 @@
+@database :memory:
+
+# COLLATION PROPAGATION RULES
+# A column's implicit collation survives only through CAST, unary `+`, and
+# parentheses; any other operator or function call falls back to BINARY. An
+# explicit COLLATE propagates out of any expression it is nested in.
+
+setup collate_propagation_schema {
+    CREATE TABLE t(x INTEGER PRIMARY KEY, d TEXT COLLATE NOCASE, c TEXT COLLATE RTRIM);
+    INSERT INTO t VALUES (1, 'abc', 'abc');
+    INSERT INTO t VALUES (2, 'ABC', 'abc ');
+    INSERT INTO t VALUES (3, 'Abc', 'abc  ');
+    INSERT INTO t VALUES (4, 'abc', 'ABC');
+}
+
+# -----------------------------------------------------------------------
+# GROUP BY
+# -----------------------------------------------------------------------
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_groupby_column_is_nocase {
+    SELECT count(*) FROM t GROUP BY d ORDER BY 1;
+}
+expect {
+    4
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_groupby_concat_is_binary {
+    SELECT count(*) FROM t GROUP BY (d || '') ORDER BY 1;
+}
+expect {
+    1
+    1
+    2
+}
+
+# -----------------------------------------------------------------------
+# ORDER BY
+# -----------------------------------------------------------------------
+# `x` is appended as a tiebreaker so ties sort in insertion order.
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_orderby_column_is_nocase {
+    SELECT x FROM t ORDER BY d, x;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_orderby_concat_is_binary {
+    SELECT x FROM t ORDER BY d || '', x;
+}
+expect {
+    2
+    3
+    1
+    4
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_orderby_cast_stays_nocase {
+    SELECT x FROM t ORDER BY CAST(d AS TEXT), x;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_orderby_unary_plus_stays_nocase {
+    SELECT x FROM t ORDER BY +d, x;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_orderby_parens_stays_nocase {
+    SELECT x FROM t ORDER BY (d), x;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_orderby_function_call_is_binary {
+    SELECT x FROM t ORDER BY lower(d), x;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+# -----------------------------------------------------------------------
+# WHERE
+# -----------------------------------------------------------------------
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_where_column_is_nocase {
+    SELECT x FROM t WHERE d = 'ABC' ORDER BY x;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_where_concat_is_binary {
+    SELECT x FROM t WHERE d || '' = 'ABC' ORDER BY x;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_where_explicit_collate_through_concat {
+    SELECT x FROM t WHERE (d COLLATE BINARY) || '' = 'ABC' ORDER BY x;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_where_rtrim_column_is_rtrim {
+    SELECT x FROM t WHERE c = 'abc' ORDER BY x;
+}
+expect {
+    1
+    2
+    3
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_where_rtrim_concat_is_binary {
+    SELECT x FROM t WHERE c || '' = 'abc' ORDER BY x;
+}
+expect {
+    1
+}
+
+# -----------------------------------------------------------------------
+# MIN / MAX (aggregates use their argument's own collation)
+# -----------------------------------------------------------------------
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_min_column_is_nocase {
+    SELECT min(d) FROM t;
+}
+expect {
+    abc
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_max_column_is_nocase {
+    SELECT max(d) FROM t;
+}
+expect {
+    abc
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_min_concat_is_binary {
+    SELECT min(d || '') FROM t;
+}
+expect {
+    ABC
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_max_concat_is_binary {
+    SELECT max(d || '') FROM t;
+}
+expect {
+    abc
+}
+
+# -----------------------------------------------------------------------
+# DISTINCT
+# -----------------------------------------------------------------------
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_distinct_column_is_nocase {
+    SELECT count(*) FROM (SELECT DISTINCT d FROM t);
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_distinct_concat_is_binary {
+    SELECT count(*) FROM (SELECT DISTINCT d || '' FROM t);
+}
+expect {
+    3
+}
+
+# -----------------------------------------------------------------------
+# Expression index: an indexed expression that breaks the chain gets BINARY,
+# and the optimizer must honor that when it uses the index.
+# -----------------------------------------------------------------------
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_expression_index_is_binary {
+    CREATE INDEX i_dconcat ON t(d || '');
+    SELECT x FROM t WHERE (d || '') = 'ABC' ORDER BY x;
+}
+expect {
+    2
+}
+
+# -----------------------------------------------------------------------
+# Function calls
+# -----------------------------------------------------------------------
+# A function call is not "a column name", so its result compares with BINARY.
+# An explicit COLLATE inside the arguments still propagates out.
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_where_function_call_is_binary {
+    SELECT count(*) FROM t WHERE lower(d) = 'ABC';
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_where_function_call_explicit_collate_propagates {
+    SELECT count(*) FROM t WHERE lower(d COLLATE NOCASE) = 'ABC';
+}
+expect {
+    4
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_where_function_call_rtrim_column_is_binary {
+    SELECT x FROM t WHERE ltrim(c) = 'abc' ORDER BY x;
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_where_function_call_rtrim_explicit_collate_propagates {
+    SELECT x FROM t WHERE ltrim(c COLLATE RTRIM) = 'abc' ORDER BY x;
+}
+expect {
+    1
+    2
+    3
+}
+
+# The rule does not depend on which side of the comparison the call is on.
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_where_function_call_on_the_right_is_binary {
+    SELECT count(*) FROM t WHERE 'ABC' = lower(d);
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_where_coalesce_is_binary {
+    SELECT x FROM t WHERE coalesce(d, '') = 'ABC' ORDER BY x;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_where_iif_is_binary {
+    SELECT x FROM t WHERE iif(1, d, '') = 'ABC' ORDER BY x;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_where_substr_is_binary {
+    SELECT x FROM t WHERE substr(c, 1, 4) = 'abc ' ORDER BY x;
+}
+expect {
+    2
+    3
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_groupby_function_call_is_binary {
+    SELECT count(*) FROM t GROUP BY lower(d) ORDER BY 1;
+}
+expect {
+    4
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_distinct_function_call_is_binary {
+    SELECT count(*) FROM (SELECT DISTINCT ltrim(c) FROM t);
+}
+expect {
+    4
+}
+
+# min()/max() use their argument's collation, but their result is BINARY.
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_min_result_compares_as_binary {
+    SELECT min(d) = 'ABC' FROM t;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_max_result_compares_as_binary {
+    SELECT max(d) = 'abc' FROM t;
+}
+expect {
+    1
+}
+
+# -----------------------------------------------------------------------
+# CASE and scalar subqueries
+# -----------------------------------------------------------------------
+# Neither is a column name, so the result compares with BINARY.
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_where_case_is_binary {
+    SELECT x FROM t WHERE (CASE WHEN 1 THEN d END) = 'ABC' ORDER BY x;
+}
+expect {
+    2
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_where_case_explicit_collate_propagates {
+    SELECT count(*) FROM t WHERE (CASE WHEN 1 THEN d COLLATE NOCASE END) = 'ABC';
+}
+expect {
+    4
+}
+
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_where_scalar_subquery_is_binary {
+    SELECT x FROM t WHERE (SELECT d FROM t AS u WHERE u.x = t.x) = 'ABC' ORDER BY x;
+}
+expect {
+    2
+}
+
+# A plain column reference still compares with the column's NOCASE.
+@cross-check-integrity
+@setup collate_propagation_schema
+test collate_propagation_where_in_list_still_uses_column_collation {
+    SELECT count(*) FROM t WHERE d IN ('ABC');
+}
+expect {
+    4
+}

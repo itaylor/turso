@@ -31,7 +31,10 @@ use crate::{
     },
     Result,
 };
-use crate::{translate::plan::ResultSetColumn, types::KeyInfo};
+use crate::{
+    translate::plan::ResultSetColumn,
+    types::{KeyCollations, KeyInfo},
+};
 
 /// Labels needed for various jumps in GROUP BY handling.
 #[derive(Debug)]
@@ -666,26 +669,21 @@ pub fn group_by_process_single_group(
         GroupByRowSource::MainLoop { start_reg_src, .. } => *start_reg_src,
     };
 
-    let mut compare_key_info = group_by
-        .exprs
-        .iter()
-        .map(|_| KeyInfo {
-            sort_order: SortOrder::Asc,
-            collation: CollationSeq::default(),
-            nulls_order: None,
-        })
-        .collect::<Vec<_>>();
-    for (i, c) in compare_key_info
-        .iter_mut()
-        .enumerate()
-        .take(group_by.exprs.len())
-    {
-        let maybe_collation = get_collseq_from_expr_with_symbols(
-            &group_by.exprs[i],
+    let mut compare_key_info = Vec::with_capacity(group_by.exprs.len());
+    for expr in group_by.exprs.iter() {
+        let collation = get_collseq_from_expr_with_symbols(
+            expr,
             &plan.table_references,
             Some(t_ctx.resolver.symbol_table),
-        )?;
-        c.collation = maybe_collation.unwrap_or_default();
+        )?
+        .unwrap_or_default();
+        compare_key_info.push(KeyInfo {
+            sort_order: SortOrder::Asc,
+            collation,
+            nulls_order: None,
+            custom_collation: KeyCollations::Symbols(t_ctx.resolver.symbol_table)
+                .resolve(collation)?,
+        });
     }
 
     // Compare the group by columns to the previous group by columns to see if we are at a new group or not

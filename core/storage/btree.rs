@@ -35,8 +35,8 @@ use crate::{
     translate::plan::IterationDirection,
     turso_assert,
     types::{
-        find_compare, get_tie_breaker_from_seek_op, IOCompletions, IndexInfo, RecordCompare,
-        SeekResult,
+        find_compare, get_tie_breaker_from_seek_op, IOCompletions, IndexInfo, KeyCollations,
+        RecordCompare, SeekResult,
     },
     util::IOExt,
     vdbe::Register,
@@ -1146,33 +1146,58 @@ impl BTreeCursor {
         root_page: i64,
         table: &BTreeTable,
         num_columns: usize,
-    ) -> Self {
+        collations: KeyCollations<'_>,
+    ) -> Result<Self> {
         let mut cursor = Self::new(pager, root_page, num_columns);
-        let key_info = table.primary_key_columns.iter().map(|(col_name, order)| {
+        let mut key_info = <std::vec::Vec<crate::types::KeyInfo> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
+            table.primary_key_columns.len(),
+        )?;
+        for (col_name, order) in table.primary_key_columns.iter() {
             let (_, column) = table
                 .get_column(col_name)
                 .expect("WITHOUT ROWID primary key column should exist");
-            crate::types::KeyInfo {
+            let collation = column.collation_opt().unwrap_or_default();
+            key_info.push(crate::types::KeyInfo {
                 sort_order: *order,
-                collation: column.collation_opt().unwrap_or_default(),
+                collation,
                 nulls_order: None,
-            }
-        });
-        cursor.index_info = Some(Arc::new(
-            IndexInfo::new(key_info, false, table.primary_key_columns.len(), true)
-                .expect(crate::alloc::ALLOC_ERR_MSG),
-        ));
-        cursor
+                custom_collation: collations.resolve(collation)?,
+            });
+        }
+        cursor.index_info = Some(Arc::new(IndexInfo::new(
+            key_info,
+            false,
+            table.primary_key_columns.len(),
+            true,
+        )?));
+        Ok(cursor)
     }
 
+    /// For keys that only use built-in collations: every index Turso builds for itself (DBSP, FTS, MVCC).
     pub fn new_index(
         pager: Arc<Pager>,
         root_page: i64,
         index: &Index,
         num_columns: usize,
     ) -> Result<Self> {
+        Self::new_index_with_collations(
+            pager,
+            root_page,
+            index,
+            num_columns,
+            KeyCollations::BuiltinOnly,
+        )
+    }
+
+    pub fn new_index_with_collations(
+        pager: Arc<Pager>,
+        root_page: i64,
+        index: &Index,
+        num_columns: usize,
+        collations: KeyCollations<'_>,
+    ) -> Result<Self> {
         let mut cursor = Self::new(pager, root_page, num_columns);
-        cursor.index_info = Some(Arc::new(IndexInfo::new_from_index(index)?));
+        cursor.index_info = Some(Arc::new(IndexInfo::new_from_index(index, collations)?));
         Ok(cursor)
     }
 

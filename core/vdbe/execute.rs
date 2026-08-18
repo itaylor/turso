@@ -26,7 +26,8 @@ use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
     compare_immutable, compare_immutable_single, compare_records_generic, AsValueRef, Extendable,
-    IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
+    IOCompletions, IOResult, ImmutableRecord, IndexInfo, KeyCollations, KeyInfo, SeekResult, Text,
+    ValueIterator,
 };
 use crate::util::{
     escape_sql_string_literal, normalize_ident, rename_identifiers,
@@ -41,7 +42,8 @@ use crate::vdbe::affinity::{
     apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
 };
 use crate::vdbe::hash_table::{
-    HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
+    key_collation, HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert,
+    DEFAULT_MEM_BUDGET,
 };
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::metrics::HashJoinMetrics;
@@ -377,6 +379,21 @@ where
         }
     }
     Ok(compare_immutable_single(lhs, rhs, collation))
+}
+
+/// Text vs text honors the collation an `Insn::CollSeq` chose; every other pairing keeps the plain
+/// `Value` ordering, which collation does not affect.
+fn compare_for_min_max_nullif(
+    program: &Program,
+    a: &Value,
+    b: &Value,
+    collation: CollationSeq,
+) -> Result<std::cmp::Ordering> {
+    if matches!((a, b), (Value::Text(_), Value::Text(_))) {
+        compare_with_program_collation(program, a, b, collation)
+    } else {
+        Ok(a.cmp(b))
+    }
 }
 
 fn comparison_matches_order(op: ComparisonOp, order: std::cmp::Ordering) -> bool {
@@ -1341,7 +1358,8 @@ pub fn op_open_read(
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                     table.as_ref(),
                     num_columns,
-                ))
+                    KeyCollations::Connection(&program.connection),
+                )?)
             };
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
             cursors
@@ -1350,16 +1368,18 @@ pub fn op_open_read(
                 .replace(Cursor::new_btree(cursor));
         }
         CursorType::BTreeIndex(index) => {
-            let btree_cursor = Box::new(BTreeCursor::new_index(
+            let collations = KeyCollations::Connection(&program.connection);
+            let btree_cursor = Box::new(BTreeCursor::new_index_with_collations(
                 pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 index.as_ref(),
                 num_columns,
+                collations,
             )?);
             let index_info = Arc::new(if let Some(mv_store) = mv_store.as_ref() {
-                IndexInfo::new_from_index_in(index, mv_store.allocator())?
+                IndexInfo::new_from_index_in(index, mv_store.allocator(), collations)?
             } else {
-                IndexInfo::new_from_index(index)?
+                IndexInfo::new_from_index(index, collations)?
             });
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
@@ -6855,6 +6875,18 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
     Ok(())
 }
 
+/// The payload only has room for the 16-bit collation encoding, and a custom collation could not be
+/// resolved back from it at finalize time, so refuse it here rather than silently sorting by BINARY.
+fn ordered_set_collation_bits(collation: CollationSeq) -> Result<u16> {
+    if collation.is_custom() {
+        return Err(LimboError::ParseError(format!(
+            "custom collation {} is not supported by ordered-set aggregates",
+            collation.name()
+        )));
+    }
+    Ok(collation.to_bits())
+}
+
 /// Process a single input row and update the aggregate state in the payload.
 ///
 /// This is the core aggregation logic shared between both aggregation strategies:
@@ -7201,7 +7233,7 @@ fn update_agg_payload(
         AggFunc::Mode => {
             // Record the value's collation (constant per group) for finalize-time sorting, then
             // buffer the value. Ordered-set aggregates ignore NULL inputs.
-            payload[0] = Value::from_i64(collation.to_bits() as i64);
+            payload[0] = Value::from_i64(ordered_set_collation_bits(collation)? as i64);
             if !matches!(arg, Value::Null) {
                 let count = payload[1].as_int().unwrap_or(0) as usize;
                 payload[1] = Value::from_i64((count + 1) as i64);
@@ -7209,7 +7241,7 @@ fn update_agg_payload(
             }
         }
         AggFunc::PercentileCont | AggFunc::PercentileDisc => {
-            payload[0] = Value::from_i64(collation.to_bits() as i64);
+            payload[0] = Value::from_i64(ordered_set_collation_bits(collation)? as i64);
             // The fraction is a per-group constant; record it on every step.
             if let Some(fraction) = maybe_arg2 {
                 payload[2].try_clone_from(fraction)?;
@@ -7410,9 +7442,8 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
 /// Most frequent value of an ordered set (`mode() WITHIN GROUP (ORDER BY x)`).
 /// Ties are broken by the smallest value, matching PostgreSQL (the first value the
 /// ascending ordering would return).
-/// Compares two ordered-set values, honoring `collation` for text (built-in and locale
-/// collations are resolved without a connection; extension `Custom` collations fall back
-/// to BINARY, matching other connection-less comparison paths).
+/// Compares two ordered-set values, honoring `collation` for text. Custom collations are rejected at
+/// step time by `ordered_set_collation_bits`.
 fn ordered_set_compare(a: &Value, b: &Value, collation: CollationSeq) -> std::cmp::Ordering {
     match (a, b) {
         (Value::Text(lhs), Value::Text(rhs)) => {
@@ -8684,23 +8715,25 @@ pub fn op_sorter_open(
     }
     let mut sort_comparators =
         crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())?;
+    let mut custom_collations =
+        crate::alloc::Vec::try_with_capacity_ext(order_collations_nulls.len())?;
+    let key_collations = KeyCollations::Connection(&program.connection);
     for (idx, (_, coll, _)) in order_collations_nulls.iter().enumerate() {
+        let custom = key_collations.resolve(coll.unwrap_or_default())?;
         let comparator = match comparators.get(idx).and_then(|c| c.as_ref()) {
             Some(comparator) => Some(make_sort_comparator(comparator)?),
-            None => match coll {
-                Some(collation) if collation.is_custom() => {
-                    Some(program.connection.make_collation_comparator(*collation)?)
-                }
-                _ => None,
-            },
+            None => custom
+                .clone()
+                .map(crate::Connection::external_collation_comparator),
         };
-        // Preallocated for every ORDER BY term above, so this push cannot grow the vector.
         sort_comparators.push(comparator);
+        custom_collations.push(custom);
     }
     let temp_store = program.connection.get_temp_store();
     let cursor = Sorter::new(
         &order,
         collations,
+        custom_collations,
         nulls_orders,
         sort_comparators,
         max_buffer_size_bytes,
@@ -9075,6 +9108,19 @@ fn parse_schema_sql_for_alter(
     dialect.parse(sql).map(|(cmd, _)| cmd)
 }
 
+/// SQLite's OP_CollSeq: stashes the collation for the `Insn::Function` right after it.
+pub fn op_coll_seq(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(CollSeq { collation }, insn);
+    state.pending_collation = Some(*collation);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_function(
     program: &Program,
     state: &mut ProgramState,
@@ -9091,6 +9137,8 @@ pub fn op_function(
         insn
     );
     let arg_count = func.arg_count;
+    // Take it before any branch below can return early, so it never leaks into a later Function call.
+    let pending_collation = state.pending_collation.take();
 
     match &func.func {
         #[cfg(feature = "json")]
@@ -9764,21 +9812,77 @@ pub fn op_function(
             }
             ScalarFunc::Min => {
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                state.registers[*dest]
-                    .set_value(Value::exec_min(reg_values.iter().map(|v| v.get_value())));
+                let collation = pending_collation.unwrap_or(CollationSeq::Binary);
+                // Ties are asymmetric, like func.c's minmaxFunc: for min() a later equal argument replaces the
+                // running best, for max() the first one seen is kept.
+                let mut best: Option<&Value> = None;
+                let mut has_null = false;
+                for reg in reg_values.iter() {
+                    let val = reg.get_value();
+                    if matches!(val, Value::Null) {
+                        has_null = true;
+                        break;
+                    }
+                    best = Some(match best {
+                        None => val,
+                        Some(cur) => {
+                            if compare_for_min_max_nullif(program, cur, val, collation)?
+                                != std::cmp::Ordering::Less
+                            {
+                                val
+                            } else {
+                                cur
+                            }
+                        }
+                    });
+                }
+                let result = if has_null {
+                    Value::Null
+                } else {
+                    best.cloned().unwrap_or(Value::Null)
+                };
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Max => {
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
-                state.registers[*dest]
-                    .set_value(Value::exec_max(reg_values.iter().map(|v| v.get_value())));
+                let collation = pending_collation.unwrap_or(CollationSeq::Binary);
+                let mut best: Option<&Value> = None;
+                let mut has_null = false;
+                for reg in reg_values.iter() {
+                    let val = reg.get_value();
+                    if matches!(val, Value::Null) {
+                        has_null = true;
+                        break;
+                    }
+                    best = Some(match best {
+                        None => val,
+                        Some(cur) => {
+                            if compare_for_min_max_nullif(program, val, cur, collation)?
+                                == std::cmp::Ordering::Greater
+                            {
+                                val
+                            } else {
+                                cur
+                            }
+                        }
+                    });
+                }
+                let result = if has_null {
+                    Value::Null
+                } else {
+                    best.cloned().unwrap_or(Value::Null)
+                };
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Nullif => {
                 let first_value = &state.registers[*start_reg];
                 let second_value = &state.registers[*start_reg + 1];
-                state.registers[*dest].set_value(Value::exec_nullif(
-                    first_value.get_value(),
-                    second_value.get_value(),
-                ));
+                let collation = pending_collation.unwrap_or(CollationSeq::Binary);
+                let (a, b) = (first_value.get_value(), second_value.get_value());
+                let equal = compare_for_min_max_nullif(program, a, b, collation)?
+                    == std::cmp::Ordering::Equal;
+                let result = if equal { Value::Null } else { a.clone() };
+                state.registers[*dest].set_value(result);
             }
             ScalarFunc::Substr | ScalarFunc::Substring => {
                 let str_value = &state.registers[*start_reg];
@@ -13091,19 +13195,21 @@ pub fn op_open_write(
         };
         if let Some(index) = maybe_index {
             let num_columns = index.columns.len();
+            let collations = KeyCollations::Connection(&program.connection);
             let btree_cursor = btree_cursor_with_yield_context(
-                Box::new(BTreeCursor::new_index(
+                Box::new(BTreeCursor::new_index_with_collations(
                     pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                     index.as_ref(),
                     num_columns,
+                    collations,
                 )?),
                 &program.connection,
             );
             let index_info = Arc::new(if let Some(mv_store) = mv_store.as_ref() {
-                IndexInfo::new_from_index_in(index, mv_store.allocator())?
+                IndexInfo::new_from_index_in(index, mv_store.allocator(), collations)?
             } else {
-                IndexInfo::new_from_index(index)?
+                IndexInfo::new_from_index(index, collations)?
             });
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
@@ -13135,7 +13241,8 @@ pub fn op_open_write(
                             maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                             table_rc.as_ref(),
                             num_columns,
-                        )),
+                            KeyCollations::Connection(&program.connection),
+                        )?),
                         &program.connection,
                     )
                 }
@@ -15447,7 +15554,13 @@ pub fn op_open_ephemeral(
             };
 
             let cursor = if let CursorType::BTreeIndex(index) = cursor_type {
-                BTreeCursor::new_index(pager.clone(), root_page, index, num_columns)
+                BTreeCursor::new_index_with_collations(
+                    pager.clone(),
+                    root_page,
+                    index,
+                    num_columns,
+                    KeyCollations::Connection(&program.connection),
+                )
             } else {
                 Ok(BTreeCursor::new_table(
                     pager.clone(),
@@ -15573,7 +15686,8 @@ pub fn op_open_dup(
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                     table.as_ref(),
                     table.columns().len(),
-                ))
+                    KeyCollations::Connection(&program.connection),
+                )?)
             };
             let cursor: Box<dyn CursorTrait> = if !is_ephemeral {
                 if let Some(tx_id) = program.connection.get_mv_tx_id() {
@@ -16983,6 +17097,23 @@ pub fn op_fk_check(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Hash tables have no connection of their own, so custom collation callbacks are resolved up front,
+/// which also reports an unregistered collation as "no such collation sequence".
+fn resolve_key_collations(
+    program: &Program,
+    collations: &[CollationSeq],
+) -> Result<crate::alloc::Vec<KeyInfo>> {
+    let key_collations = KeyCollations::Connection(&program.connection);
+    let mut resolved = crate::alloc::Vec::try_with_capacity_ext(collations.len())?;
+    for collation in collations {
+        resolved.push(KeyInfo {
+            custom_collation: key_collations.resolve(*collation)?,
+            ..key_collation(*collation)
+        });
+    }
+    Ok(resolved)
+}
+
 pub fn op_hash_build(
     program: &Program,
     state: &mut ProgramState,
@@ -17027,7 +17158,7 @@ pub fn op_hash_build(
             initial_buckets: 1024,
             mem_budget,
             num_keys: data.num_keys,
-            collations: data.collations.try_to_vec()?,
+            collations: resolve_key_collations(program, &data.collations)?,
             temp_store,
             track_matched: data.track_matched,
             partition_count: None,
@@ -17133,7 +17264,7 @@ pub fn op_hash_distinct(
             initial_buckets: 1024,
             mem_budget,
             num_keys: data.num_keys,
-            collations: data.collations.try_to_vec()?,
+            collations: resolve_key_collations(program, &data.collations)?,
             temp_store,
             track_matched: false,
             partition_count: None,
@@ -18954,7 +19085,7 @@ mod tests {
             initial_buckets: 4,
             mem_budget: 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![key_collation(CollationSeq::Binary)],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             ..Default::default()

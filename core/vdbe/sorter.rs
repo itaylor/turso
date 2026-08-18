@@ -204,6 +204,7 @@ impl Sorter {
     pub fn new(
         order: &[SortOrder],
         collations: Vec<CollationSeq>,
+        custom_collations: Vec<Option<Arc<crate::function::ExternalCollation>>>,
         nulls_orders: Vec<Option<turso_parser::ast::NullsOrder>>,
         comparators: Vec<Option<SortComparator>>,
         max_buffer_size_bytes: usize,
@@ -212,14 +213,17 @@ impl Sorter {
         temp_store: crate::TempStore,
     ) -> Result<Self> {
         turso_assert_eq!(order.len(), collations.len());
+        turso_assert_eq!(order.len(), custom_collations.len());
         let index_key_info = order
             .iter()
             .zip(collations)
+            .zip(custom_collations)
             .zip(nulls_orders)
-            .map(|((order, collation), nulls)| KeyInfo {
+            .map(|(((order, collation), custom_collation), nulls)| KeyInfo {
                 sort_order: *order,
                 collation,
                 nulls_order: nulls,
+                custom_collation,
             })
             .try_collect()?;
         let this = Self {
@@ -1200,6 +1204,7 @@ mod tests {
                 SortOrder::Desc
             },
             collation: CollationSeq::Binary,
+            custom_collation: None,
             nulls_order: match rng.next_u64() % 3 {
                 0 => None,
                 1 => Some(NullsOrder::First),
@@ -1275,6 +1280,7 @@ mod tests {
             let mut sorter = Sorter::new(
                 &[SortOrder::Asc],
                 try_vec![CollationSeq::Binary].unwrap(),
+                try_vec![None].unwrap(),
                 try_vec![None].unwrap(),
                 try_vec![None].unwrap(),
                 256,
@@ -1373,6 +1379,7 @@ mod tests {
         let mut sorter = Sorter::new(
             &[SortOrder::Asc, second_order],
             try_vec![CollationSeq::Binary, CollationSeq::Binary].unwrap(),
+            try_vec![None, None].unwrap(),
             try_vec![None, second_nulls].unwrap(),
             try_vec![None, None].unwrap(),
             1 << 20,
@@ -1414,6 +1421,7 @@ mod tests {
         let mut sorter = Sorter::new(
             &[SortOrder::Asc, SortOrder::Asc],
             try_vec![CollationSeq::Binary, CollationSeq::Binary].unwrap(),
+            try_vec![None, None].unwrap(),
             try_vec![None, None].unwrap(),
             try_vec![None, None].unwrap(),
             // Tiny buffer so the sorter spills to multiple chunk files.
@@ -1465,6 +1473,7 @@ mod tests {
         let mut sorter = Sorter::new(
             &[SortOrder::Asc, SortOrder::Asc],
             try_vec![CollationSeq::Binary, CollationSeq::Binary].unwrap(),
+            try_vec![None, None].unwrap(),
             try_vec![None, Some(turso_parser::ast::NullsOrder::Last)].unwrap(),
             try_vec![None, None].unwrap(),
             256,

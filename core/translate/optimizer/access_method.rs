@@ -11,8 +11,8 @@ use crate::schema::Schema;
 use crate::stats::AnalyzeStats;
 use crate::translate::expr::{as_binary_components, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
-    convert_to_vtab_constraint, expr_uses_custom_collation, ordered_ephemeral_key_columns,
-    partial_index, partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
+    convert_to_vtab_constraint, ordered_ephemeral_key_columns, partial_index,
+    partial_index_predicate_terms, BinaryExprSide, Constraint, ConstraintOperator,
     RangeConstraintRef,
 };
 use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEstimate};
@@ -1365,14 +1365,6 @@ pub fn try_hash_join_access_method(
     // no equality (e.g. `a.x < b.x`) we still build a single-bucket hash join and
     // let the predicate apply as a residual, rather than rejecting the query.
     if join_keys.is_empty() && hash_join_type != HashJoinType::FullOuter {
-        return Ok(None);
-    }
-    // Custom-collated equality depends on a connection-owned callback, so the
-    // hash join planner cannot derive a stable hash/equality pair here.
-    if join_keys.iter().any(|join_key| {
-        expr_uses_custom_collation(join_key.get_build_expr(where_clause))
-            || expr_uses_custom_collation(join_key.get_probe_expr(where_clause))
-    }) {
         return Ok(None);
     }
 

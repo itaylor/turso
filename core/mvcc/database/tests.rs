@@ -303,6 +303,7 @@ fn index_key_payload_allocation_uses_passed_allocator() {
                 sort_order: turso_parser::ast::SortOrder::Asc,
                 collation: crate::translate::collate::CollationSeq::Binary,
                 nulls_order: None,
+                custom_collation: None,
             }],
             false,
             1,
@@ -7104,6 +7105,7 @@ fn test_index_finger_no_spurious_dep_on_stepped_over_key() {
                 sort_order: turso_parser::ast::SortOrder::Asc,
                 collation: crate::translate::collate::CollationSeq::Binary,
                 nulls_order: None,
+                custom_collation: None,
             }],
             false,
             1,
@@ -9107,7 +9109,9 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         pager.as_ref(),
     )
     .unwrap();
-    let index_info = Arc::new(IndexInfo::new_from_index(&index).unwrap());
+    let index_info = Arc::new(
+        IndexInfo::new_from_index(&index, crate::types::KeyCollations::BuiltinOnly).unwrap(),
+    );
     let record = ImmutableRecord::from_values(
         &[Value::from_i64(interior_key), Value::from_i64(interior_key)],
         2,

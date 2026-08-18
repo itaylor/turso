@@ -1304,6 +1304,11 @@ pub enum Insn {
         func: FuncCtx,      // P4
     },
 
+    /// SQLite's OP_CollSeq: the collation the following `Function` (min/max/nullif) compares text with.
+    CollSeq {
+        collation: CollationSeq,
+    },
+
     /// Cast register P1 to affinity P2 and store in register P1
     Cast {
         reg: usize,
@@ -2246,6 +2251,7 @@ impl InsnVariants {
             InsnVariants::RowSetRead => execute::op_rowset_read,
             InsnVariants::RowSetTest => execute::op_rowset_test,
             InsnVariants::Function => execute::op_function,
+            InsnVariants::CollSeq => execute::op_coll_seq,
             InsnVariants::Cast => execute::op_cast,
             InsnVariants::InitCoroutine => execute::op_init_coroutine,
             InsnVariants::EndCoroutine => execute::op_end_coroutine,

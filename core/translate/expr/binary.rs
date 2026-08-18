@@ -100,7 +100,9 @@ pub(super) fn emit_binary_expr_scalar(
                 Some(resolver),
             )?,
         }
-        if op.is_comparison() {
+        // A column's implicit collation never survives a binary operator; only an explicit COLLATE
+        // (from_collate == true) propagates to the parent, and comparisons consume it here.
+        if op.is_comparison() || !matches!(program.curr_collation_ctx(), Some((_, true))) {
             program.reset_collation();
         }
         Ok(target_register)
@@ -169,12 +171,10 @@ pub(super) fn emit_binary_expr_scalar(
                 Some(resolver),
             )?,
         }
-        // Only reset collation for comparison operators, which consume it.
-        // Non-comparison operators (Concat, Add, etc.) must propagate the
-        // collation to the parent expression so that e.g.
+        // Comparisons consume the collation. Non-comparison operators still propagate an explicit COLLATE, so
         //   (name COLLATE NOCASE || '') <> 'admin'
-        // correctly applies NOCASE to the Ne comparison.
-        if op.is_comparison() {
+        // applies NOCASE to the Ne comparison; a column's implicit collation (from_collate == false) is dropped.
+        if op.is_comparison() || !matches!(collation_ctx, Some((_, true))) {
             program.reset_collation();
         }
         Ok(target_register)
