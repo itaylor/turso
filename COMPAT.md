@@ -279,7 +279,7 @@ avoid this window.
 | PRAGMA temp_store                | ✅ Yes        |                                              |
 | PRAGMA temp_store_directory      | Not Needed | deprecated in SQLite                         |
 | PRAGMA threads                   | ❌ No         |                                              |
-| PRAGMA trusted_schema            | ❌ No         |                                              |
+| PRAGMA trusted_schema            | ✅ Yes        | ON by default, like SQLite. Governs whether a non-`INNOCUOUS` user-defined function may be called from schema SQL (triggers, views, CHECK, DEFAULT, generated columns, index expressions) |
 | PRAGMA user_version              | ✅ Yes        |                                              |
 | PRAGMA vdbe_addoptrace           | ❌ No         |                                              |
 | PRAGMA vdbe_debug                | ❌ No         |                                              |
@@ -319,7 +319,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | ... OVER (...)            | 🚧 Partial | Supported for aggregate functions and ROW_NUMBER() |
 | (expr)                    | ✅ Yes     |                                          |
 | CAST (expr AS type)       | ✅ Yes     |                                          |
-| COLLATE                   | 🚧 Partial | Custom collations not supported. **Bug:** unknown collation names are silently treated as the default instead of erroring (SQLite errors with "no such collation sequence"). |
+| COLLATE                   | 🚧 Partial | Custom collations are per-connection — registered with `sqlite3_create_collation` or `turso_connection_register_collation` — and work in expressions, `ORDER BY`, aggregates and the schema (`CREATE TABLE t(x COLLATE c)`, `CREATE INDEX ... COLLATE c`), matching SQLite: creating fails with "no such collation sequence" if the name is not registered, a connection that lacks it still loads the schema, and any statement that must compare with it fails rather than falling back to BINARY. `SELECT DISTINCT`, `count(DISTINCT x)`, hash joins and FULL OUTER JOIN over a custom-collated value compare through the collation callback too (the hash table hashes only the value type for such a column, so every text lands in one bucket and the callback decides equality). |
 | (NOT) LIKE                | ✅ Yes     |                                          |
 | (NOT) GLOB                | ✅ Yes     |                                          |
 | (NOT) REGEXP              | ✅ Yes     |                                          |
@@ -599,7 +599,7 @@ Modifiers:
 | sqlite3_bind_blob            | ✅ Yes     |         |
 | sqlite3_bind_blob64          | ❌ No      |         |
 | sqlite3_bind_value           | ❌ No      |         |
-| sqlite3_bind_pointer         | ❌ No      |         |
+| sqlite3_bind_pointer         | ✅ Yes     | The parameter is a NULL carrying the pointer; `sqlite3_value_pointer` reads it back under the same type name. The destructor runs once on rebind, `sqlite3_clear_bindings` or finalize |
 | sqlite3_bind_zeroblob        | ❌ No      |         |
 | sqlite3_bind_zeroblob64      | ❌ No      |         |
 | sqlite3_clear_bindings       | ✅ Yes     |         |
@@ -637,18 +637,18 @@ Modifiers:
 | sqlite3_value_int64    | ✅ Yes     |         |
 | sqlite3_value_double   | ✅ Yes     |         |
 | sqlite3_value_text     | ✅ Yes     |         |
-| sqlite3_value_text16   | ❌ No      |         |
+| sqlite3_value_text16   | ✅ Yes     |         |
 | sqlite3_value_blob     | ✅ Yes     |         |
 | sqlite3_value_bytes    | ✅ Yes     |         |
-| sqlite3_value_bytes16  | ❌ No      |         |
+| sqlite3_value_bytes16  | ✅ Yes     |         |
 | sqlite3_value_dup      | ✅ Yes     |         |
 | sqlite3_value_free     | ✅ Yes     |         |
-| sqlite3_value_nochange | ❌ No      |         |
-| sqlite3_value_frombind | ❌ No      |         |
-| sqlite3_value_subtype  | ❌ No      |         |
-| sqlite3_value_pointer  | ❌ No      |         |
-| sqlite3_value_encoding | ❌ No      |         |
-| sqlite3_value_numeric_type | ❌ No  |         |
+| sqlite3_value_nochange | 🚧 Partial | Always reports 0 (unchanged); only meaningful inside a virtual table's `xUpdate`, which Turso doesn't have |
+| sqlite3_value_frombind | 🚧 Partial | Always reports 0; Turso's engine doesn't mark which registers came from a bound parameter |
+| sqlite3_value_subtype  | ✅ Yes     | Any byte a function attached to a value of any type; 0 for literals, columns and bound parameters |
+| sqlite3_value_pointer  | ✅ Yes     | Returns the pointer only for a pointer value with exactly this type name |
+| sqlite3_value_encoding | 🚧 Partial | Always reports `SQLITE_UTF8`; Turso stores text as UTF-8 only |
+| sqlite3_value_numeric_type | ✅ Yes |         |
 
 ### Error Handling
 
@@ -708,47 +708,71 @@ Modifiers:
 
 ### User-Defined Functions
 
+`turso_core` has a native, closure-based UDF API (`Connection::create_scalar_function` /
+`create_aggregate_function` / `remove_function`, `core/udf.rs`) with SQLite's registration,
+overloading-by-arity, shadowing and error-message rules; every sqlite3 C-API entry below is a thin
+adapter over it. Redefining or deleting a function that this handle already registered while one
+of its statements is running (stepped, not yet reset or finalized) fails with `SQLITE_BUSY` and
+SQLite's message, exactly like SQLite; the check only knows the functions this handle registered,
+so replacing a built-in mid-statement is allowed where SQLite refuses. Turso also adds
+`Database::create_scalar_function` / `create_aggregate_function` / `remove_function` (core, the
+Rust crate, sdk-kit's `turso_database_register_*` C ABI, and a Go connector option), which have no
+SQLite equivalent: they seed the function table that every *later* connection copies at connect
+time, and leave connections that are already open alone. A materialized view may not name a
+user-defined function, or a built-in the connection has replaced — its DBSP circuit is compiled
+once per database, not per connection.
+
+**Subtypes** and **pointer values** work as in SQLite. A function can stamp any byte on a result of
+any type (NULL, integer, real, text, blob) and the next function in the same statement reads it
+back; the byte survives a register copy and a scalar subquery, and is dropped when the value is
+stored in a table or crosses a subquery/CTE boundary. A pointer value (`sqlite3_result_pointer` /
+`sqlite3_bind_pointer` / `sqlite3_value_pointer`) is a NULL (`typeof()` = `'null'`) that carries
+the pointer and its type name to the next function only; storing it stores NULL. The destructor
+runs exactly once, when the last register or parameter holding the pointer is overwritten, rebound,
+cleared or finalized. Only `sqlite3_value_dup` differs: the copy keeps the subtype but not the
+pointer, because it outlives the call.
+
 | Interface                    | Status  | Comment |
 |------------------------------|---------|---------|
-| sqlite3_create_function      | ❌ No      |         |
-| sqlite3_create_function_v2   | ❌ No      | Stub    |
-| sqlite3_create_function16    | ❌ No      |         |
-| sqlite3_create_window_function | ❌ No    | Stub    |
-| sqlite3_aggregate_context    | ❌ No      | Stub    |
-| sqlite3_user_data            | ❌ No      | Stub    |
+| sqlite3_create_function      | ✅ Yes     |         |
+| sqlite3_create_function_v2   | ✅ Yes     |         |
+| sqlite3_create_function16    | ✅ Yes     |         |
+| sqlite3_create_window_function | ✅ Yes   |         |
+| sqlite3_aggregate_context    | ✅ Yes     | Zero-filled, size fixed by the first call, owned by the adapter's state and freed after finalize |
+| sqlite3_user_data            | ✅ Yes     |         |
 | sqlite3_context_db_handle    | ✅ Yes     |         |
-| sqlite3_get_auxdata          | ❌ No      |         |
-| sqlite3_set_auxdata          | ❌ No      |         |
-| sqlite3_result_null          | ❌ No      | Stub    |
-| sqlite3_result_int           | ❌ No      |         |
-| sqlite3_result_int64         | ❌ No      | Stub    |
-| sqlite3_result_double        | ❌ No      | Stub    |
-| sqlite3_result_text          | ❌ No      | Stub    |
-| sqlite3_result_text16        | ❌ No      |         |
-| sqlite3_result_text64        | ❌ No      |         |
-| sqlite3_result_blob          | ❌ No      | Stub    |
-| sqlite3_result_blob64        | ❌ No      |         |
-| sqlite3_result_value         | ❌ No      |         |
-| sqlite3_result_pointer       | ❌ No      |         |
-| sqlite3_result_zeroblob      | ❌ No      |         |
-| sqlite3_result_zeroblob64    | ❌ No      |         |
-| sqlite3_result_error         | ❌ No      | Stub    |
-| sqlite3_result_error16       | ❌ No      |         |
-| sqlite3_result_error_code    | ❌ No      |         |
-| sqlite3_result_error_nomem   | ❌ No      | Stub    |
-| sqlite3_result_error_toobig  | ❌ No      | Stub    |
-| sqlite3_result_subtype       | ❌ No      |         |
+| sqlite3_get_auxdata          | ✅ Yes     | Kept only for constant arguments, matching SQLite |
+| sqlite3_set_auxdata          | ✅ Yes     |         |
+| sqlite3_result_null          | ✅ Yes     |         |
+| sqlite3_result_int           | ✅ Yes     |         |
+| sqlite3_result_int64         | ✅ Yes     |         |
+| sqlite3_result_double        | ✅ Yes     |         |
+| sqlite3_result_text          | ✅ Yes     | Custom destructor runs immediately after the copy, not lazily |
+| sqlite3_result_text16        | ✅ Yes     |         |
+| sqlite3_result_text64        | ✅ Yes     |         |
+| sqlite3_result_blob          | ✅ Yes     | Custom destructor runs immediately after the copy, not lazily |
+| sqlite3_result_blob64        | ✅ Yes     |         |
+| sqlite3_result_value         | ✅ Yes     |         |
+| sqlite3_result_pointer       | ✅ Yes     | A NULL that carries the pointer to the next function; `typeof()` is `'null'`; storing it stores NULL; the destructor runs exactly once when the last register holding it is released |
+| sqlite3_result_zeroblob      | ✅ Yes     |         |
+| sqlite3_result_zeroblob64    | ✅ Yes     |         |
+| sqlite3_result_error         | ✅ Yes     |         |
+| sqlite3_result_error16       | ✅ Yes     |         |
+| sqlite3_result_error_code    | ✅ Yes     |         |
+| sqlite3_result_error_nomem   | ✅ Yes     |         |
+| sqlite3_result_error_toobig  | ✅ Yes     |         |
+| sqlite3_result_subtype       | ✅ Yes     | Any byte on a result of any type; a later `sqlite3_result_*` call clears it, as in SQLite |
 
 ### Collation Functions
 
 | Interface                   | Status  | Comment |
 |-----------------------------|---------|---------|
-| sqlite3_create_collation    | ❌ No      |         |
-| sqlite3_create_collation_v2 | ❌ No      | Stub    |
-| sqlite3_create_collation16  | ❌ No      |         |
-| sqlite3_collation_needed    | ❌ No      |         |
-| sqlite3_collation_needed16  | ❌ No      |         |
-| sqlite3_stricmp             | ❌ No      | Stub    |
+| sqlite3_create_collation    | ✅ Yes     | See `sqlite3_create_collation_v2` |
+| sqlite3_create_collation_v2 | ✅ Yes     | Per-connection collation usable in `ORDER BY`, comparisons, `DISTINCT`, joins, aggregates and the schema. One entry per (name, encoding): UTF-8 is preferred, then UTF-16BE, then UTF-16LE; a NULL `xCompare` deletes one encoding's entry; redefining or deleting while a statement runs is `SQLITE_BUSY` |
+| sqlite3_create_collation16  | ✅ Yes     | UTF-16 name; a collation registered as UTF-16 gets its strings re-encoded, since Turso stores text as UTF-8 |
+| sqlite3_collation_needed    | ✅ Yes     | Turso resolves collations while preparing, so the callback runs from inside `sqlite3_prepare` and the prepare is retried once it has had its turn |
+| sqlite3_collation_needed16  | ✅ Yes     | The same, with the name given as UTF-16 |
+| sqlite3_stricmp             | ✅ Yes     |         |
 | sqlite3_strnicmp            | ❌ No      |         |
 
 ### Backup API
@@ -816,7 +840,7 @@ Modifiers:
 | sqlite3_create_module_v2 | ❌ No      |         |
 | sqlite3_drop_modules     | ❌ No      |         |
 | sqlite3_declare_vtab     | ❌ No      |         |
-| sqlite3_overload_function| ❌ No      |         |
+| sqlite3_overload_function| ✅ Yes     | Registers a placeholder so the name parses, matching SQLite's `sqlite3InvalidFunction`; calling it (unless a real function of that name/arity is already registered) errors |
 | sqlite3_vtab_config      | ❌ No      |         |
 | sqlite3_vtab_on_conflict | ❌ No      |         |
 | sqlite3_vtab_nochange    | ❌ No      |         |

@@ -62,6 +62,24 @@ fn test_something() {
 }
 ```
 
+### UDFs in .sqltest
+
+A `.sqltest` file can require `@requires-file udf "<reason>"` (or `@requires
+udf "<reason>"` on a single test) to use the standard `udf_*` test set:
+`udf_add(a, b)` (deterministic, NULL-propagating add), `udf_concat(...)`
+(variadic, deterministic text concat), `udf_nondet(x)` (non-deterministic,
+adds a call counter), `udf_direct(x)`/`udf_innocuous(x)`/`udf_plain(x)`
+(identity functions carrying `DIRECTONLY`/`INNOCUOUS`/no flags), `udf_fail(x)`
+(always errors with `udf_fail called`), and the aggregates `udf_sum(x)`
+(plain), `udf_wsum(x)` (window-capable) and `udf_count0()` (zero-argument).
+Only the rust backend registers them (right after connecting, in
+`testing/sqltest/src/backends/rust.rs`), so files (or tests) that require
+`udf` are skipped on the CLI, JS and PG backends — there is no way to call
+`Connection::create_scalar_function` against a `tursodb` subprocess or those
+other bindings' test harnesses. See
+`sqlite/conformance/turso-sqltests/udf.sqltest` for the full behavior of each
+function and example usage.
+
 ## Key Rules
 
 - Every functional change needs a test

@@ -39,6 +39,7 @@ Welcome to Turso database manual!
       - [`sqlite3_column`](#sqlite3_column)
     - [WAL manipulation](#wal-manipulation)
       - [`libsql_wal_frame_count`](#libsql_wal_frame_count)
+  - [User-Defined Functions](#user-defined-functions)
   - [Journal Mode](#journal-mode)
   - [Encryption](#encryption)
   - [Vector search](#vector-search)
@@ -580,6 +581,128 @@ in the `p_frame_count` parameter.
   connection.
 * The `p_frame_count` must be a valid pointer to a `u32` that will store the
 * number of frames in the WAL file.
+
+## User-Defined Functions
+
+Turso lets an application register its own SQL functions on a connection,
+the same way SQLite's `sqlite3_create_function` does.
+
+### Concepts
+
+* **Scalar functions** take some arguments and return one value per call,
+  e.g. `SELECT my_upper(name) FROM users`.
+* **Aggregate functions** fold many rows into one value, e.g.
+  `SELECT my_sum(amount) FROM orders`. An aggregate that also implements a
+  "remove a row" step can run as a **window function** too
+  (`OVER (...)`); one without it fails to compile with `X() may not be
+  used as a window function`.
+* **Flags**, passed at registration, mirror SQLite's:
+  * `DETERMINISTIC` — the same arguments always produce the same result.
+    Required to use the function in an index expression, a generated
+    column, or a partial index's `WHERE` clause.
+  * `DIRECTONLY` — only callable from top-level SQL, never from schema SQL
+    (a trigger body, a view body, `CHECK`, `DEFAULT`, a generated column,
+    or an index expression). Calling it from there fails with
+    `unsafe use of X()`.
+  * `INNOCUOUS` — safe to call from schema SQL even when
+    `PRAGMA trusted_schema` is `OFF` (the default is `ON`). A function that
+    is neither `INNOCUOUS` nor `DIRECTONLY` is only rejected from schema SQL
+    when `trusted_schema` is off.
+* **Registration is per-connection.** A function registered on one
+  connection is invisible to another, and disappears when the connection
+  closes.
+* **Database-level registration.** `Database::create_scalar_function` /
+  `create_aggregate_function` / `remove_function` seed the function table
+  every *later* connection copies at connect time; a connection that is
+  already open is unaffected, and a connection-level registration of the
+  same name and argument count shadows the database-level one on that
+  connection only. This has no SQLite equivalent — it's a Turso convenience.
+  It is exposed in `turso_core` (`Database::*`), the `turso` Rust crate
+  (`Database::create_scalar_function`/`create_aggregate_function`/
+  `remove_function`), and sdk-kit's C ABI
+  (`turso_database_register_scalar_function` and friends, mirroring the
+  `turso_connection_register_*` functions with a `turso_database_t*` in
+  place of the connection). Go exposes the same idea differently, as a
+  `turso.WithFunctions` connector option that registers on every pooled
+  connection (see below) rather than a database handle, since its driver
+  opens a fresh database per connection. Python, JavaScript, .NET, React
+  Native and Java have no user-visible database object that outlives a
+  connection, so database-level registration does not apply there.
+* **Shadowing.** A registered function wins over a built-in of the same
+  name and argument count, so `create_scalar_function("abs", 1, ...)`
+  replaces the built-in `abs(x)`; a built-in of a different arity is still
+  reachable.
+* Redefining a function while a statement is running is allowed in the
+  native and binding APIs: the running statement keeps using the definition
+  it started with, and only new statements see the replacement. The sqlite3
+  C API keeps SQLite's rule instead and returns `SQLITE_BUSY` there.
+* **Subtypes and pointer values.** Inside a function, `FunctionContext`
+  gives SQLite's value extras: `set_result_subtype(byte)` stamps any byte
+  on a result of any type and `arg_subtype(i)` reads the byte a previous
+  function stamped on an argument (JSON functions stamp 74, `'J'`);
+  `set_result_pointer(object, type_name)` returns a NULL that carries an
+  `Arc<dyn Any>` to the next function, `arg_pointer(i, type_name)` reads it
+  back, and `Statement::bind_pointer` binds one as a parameter. Both travel
+  only within one statement: they survive a register copy and a scalar
+  subquery, and are dropped when the value is stored in a table or crosses
+  a subquery/CTE boundary. Text results can also carry the byte inline via
+  `Value::text_with_subtype`.
+* **Collations and functions.** The scalar forms `min(a, b, ...)`,
+  `max(a, b, ...)` and `nullif(a, b)` compare with the collation of their
+  first argument that has one (SQLite's rule), custom collations included;
+  `SELECT DISTINCT`, `count(DISTINCT x)` and hash joins also compare through
+  a custom collation's callback.
+
+### Rust (`turso` crate)
+
+```rust
+use turso::udf::FunctionFlags;
+use turso::{Builder, Value, ValueRef};
+
+let db = Builder::new_local(":memory:").build().await?;
+let conn = db.connect()?;
+
+conn.create_scalar_function(
+    "double",
+    1,
+    FunctionFlags::DETERMINISTIC,
+    |args: &[ValueRef<'_>]| {
+        let n = args[0].as_integer().copied().unwrap_or(0);
+        Ok(Value::Integer(n * 2))
+    },
+)?;
+
+let mut rows = conn.query("SELECT double(21)", ()).await?;
+let row = rows.next().await?.unwrap();
+assert_eq!(row.get_value(0)?, Value::Integer(42));
+```
+
+See [`bindings/rust/README.md`](../bindings/rust/README.md) and the
+`turso::udf` module docs for the aggregate/window API, including
+`Database::create_scalar_function` for database-level registration.
+
+### Other bindings
+
+* **sqlite3 C API** — `sqlite3_create_function`, `_v2`, `_16`,
+  `sqlite3_create_window_function`, `sqlite3_result_*`/`sqlite3_value_*`,
+  and friends; see [SQLite C API](#sqlite-c-api) above and `COMPAT.md`.
+* **Python** — `Connection.create_function`, `create_aggregate`,
+  `create_window_function`; see
+  [`bindings/python/README.md`](../bindings/python/README.md).
+* **JavaScript** — `db.function(name, [options], fn)` and
+  `db.aggregate(name, options)`; see
+  [`docs/javascript-api-reference.md`](javascript-api-reference.md).
+* **Java** — `TursoConnection.createFunction`/`createAggregate`/
+  `createWindowFunction`; see
+  [`bindings/java/README.md`](../bindings/java/README.md).
+* **Go** — the `turso.Functions` interface reached via `sql.Conn.Raw` for a
+  single connection, or `turso.WithFunctions` on a `turso.NewConnector` to
+  register on every connection a pool opens; see
+  [`bindings/go/README.md`](../bindings/go/README.md).
+* **.NET** — `SqliteConnection.CreateFunction`/`CreateAggregate`/
+  `CreateWindowFunction`.
+* **React Native** — `db.function`/`db.aggregate`/`db.removeFunction`; see
+  [`bindings/react-native/README.md`](../bindings/react-native/README.md).
 
 ## Journal Mode
 
