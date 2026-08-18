@@ -178,6 +178,8 @@ class AsyncAdapt_turso_dbapi(AsyncAdapt_dbapi_module):
         self.turso_aio = turso_aio_module
         self.turso = turso_module
         self.paramstyle = "qmark"
+        # SQLAlchemy >= 2.0.46 reads this to decide whether terminate() can force-close.
+        self.has_stop = hasattr(turso_aio_module.Connection, "stop")
         self._init_dbapi_attributes()
 
     def _init_dbapi_attributes(self) -> None:
