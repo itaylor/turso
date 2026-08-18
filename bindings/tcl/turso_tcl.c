@@ -841,13 +841,13 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
             sql_n_args,
             0, /* SQLITE_UTF8 */
             (void *)func_data,
-            (void (*)(void))tcl_scalar_bridge,
+            (void (*)(sqlite3_context*,int,sqlite3_value**))tcl_scalar_bridge,
             NULL, NULL,
-            (void (*)(void))tcl_func_destroy
+            tcl_func_destroy
         );
 
         if (rc != SQLITE_OK) {
-            tcl_func_destroy(func_data);
+            /* A failed create already ran func_data's destructor. */
             Tcl_SetResult(interp,
                 (char *)sqlite3_errmsg(tdb->db), TCL_VOLATILE);
             return TCL_ERROR;
