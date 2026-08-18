@@ -4,6 +4,7 @@ use crate::schema::{
 };
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
+use crate::translate::expr::WalkControl;
 use crate::translate::{
     emitter::Resolver,
     schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
@@ -54,6 +55,30 @@ fn validate_materialized(
     Ok(())
 }
 
+/// A materialized view is compiled once into a DBSP circuit in the database-wide `Schema` and
+/// rebuilt from stored SQL by any connection, while user-defined functions are per-connection. So a
+/// UDF anywhere in the view body is rejected up front -- including one that shadows a built-in,
+/// which the circuit would otherwise silently compute with the built-in.
+fn reject_user_defined_functions(select: &ast::Select, resolver: &Resolver) -> Result<()> {
+    crate::util::walk_select_expressions(select, &mut |expr: &ast::Expr| {
+        let (name, arg_count) = match expr {
+            ast::Expr::FunctionCall { name, args, .. } => (name.as_str(), args.len()),
+            ast::Expr::FunctionCallStar { name, .. } => (name.as_str(), 0),
+            _ => return Ok(WalkControl::Continue),
+        };
+        if resolver
+            .symbol_table
+            .resolve_function(name, arg_count)
+            .is_some()
+        {
+            bail_parse_error!(
+                "user-defined functions are not supported in materialized views: {name}()"
+            );
+        }
+        Ok(WalkControl::Continue)
+    })
+}
+
 pub fn translate_create_materialized_view(
     view_name: &ast::QualifiedName,
     resolver: &Resolver,
@@ -84,6 +109,8 @@ pub fn translate_create_materialized_view(
 
     // Check for cross-database table references first
     crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
+
+    reject_user_defined_functions(select_stmt, resolver)?;
 
     let view_column_schema = resolver.with_schema(database_id, |s| {
         IncrementalView::validate_and_extract_columns(select_stmt, s)

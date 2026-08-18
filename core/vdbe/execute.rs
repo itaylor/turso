@@ -63,7 +63,9 @@ use crate::{
     get_cursor, info, is_attached_db,
     storage::wal::CheckpointResult,
     turso_assert,
-    types::{AggContext, Cursor, ExternalAggState, SeekKey, SeekOp, SumAggState, Value, ValueType},
+    types::{
+        AggContext, Cursor, ExternalAggHandle, SeekKey, SeekOp, SumAggState, Value, ValueType,
+    },
     util::{cast_real_to_integer, checked_cast_text_to_numeric},
     vdbe::{
         builder::CursorType,
@@ -79,7 +81,7 @@ use crate::{
         SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_TRIGGER,
         SQLITE_ERROR, SQLITE_FULL,
     },
-    function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
+    function::{AggFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
     functions::{
         datetime::{
             exec_date, exec_datetime_full, exec_julianday, exec_strftime, exec_time, exec_unixepoch,
@@ -88,6 +90,7 @@ use crate::{
     },
     stats::StatAccum,
     translate::emitter::TransactionMode,
+    udf::FunctionContext,
 };
 use branches::{mark_unlikely, unlikely};
 use either::Either;
@@ -6455,16 +6458,10 @@ pub fn op_decr_jump_zero(
     if !target_pc.is_offset() {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
     }
-    match &mut state.registers[*reg] {
-        Register::Value(Value::Numeric(Numeric::Integer(n))) => {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                state.pc = target_pc.as_offset_int();
-            } else {
-                state.pc += 1;
-            }
-        }
-        Register::Value(_) | Register::Record(_) => {
+    let counter = match &mut state.registers[*reg] {
+        Register::Value(value) => value,
+        Register::Tagged(tagged) => &mut tagged.value,
+        Register::Record(_) => {
             bail_constraint_error!("datatype mismatch");
         }
         Register::Aggregate(_) => {
@@ -6472,6 +6469,19 @@ pub fn op_decr_jump_zero(
             return Err(LimboError::InternalError(
                 "DecrJumpZero: unexpected aggregate register".into(),
             ));
+        }
+    };
+    match counter {
+        Value::Numeric(Numeric::Integer(n)) => {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                state.pc = target_pc.as_offset_int();
+            } else {
+                state.pc += 1;
+            }
+        }
+        _ => {
+            bail_constraint_error!("datatype mismatch");
         }
     }
     Ok(InsnFunctionStepResult::Step)
@@ -7825,7 +7835,7 @@ fn op_window_inverse(
 }
 
 pub fn op_agg_inverse(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -7849,6 +7859,24 @@ pub fn op_agg_inverse(
     // Run xInverse to undo a prior xStep when a row leaves the frame
     // from the left. min/max are handled separately using SQLite's
     // sorted-index strategy.
+    if let AggFunc::External(call) = func {
+        let handle = external_agg_handle(state, *acc_reg)?;
+        let args = borrow_args(state, *col, call.argc);
+        let arg_tags = borrow_arg_tags(state, *col, call.argc);
+        let mut ctx = FunctionContext::new(&program.connection)
+            .with_args(&args)
+            .with_arg_tags(&arg_tags);
+        let mut guard = handle.lock();
+        let Some(agg_state) = guard.as_mut() else {
+            return Err(LimboError::InternalError(
+                "external aggregate inverted after it was finalized".to_string(),
+            ));
+        };
+        agg_state.inverse(&mut ctx, &args)?;
+        drop(guard);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     let arg = state.registers[*col].get_value().clone();
     let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
         return Err(LimboError::InternalError(format!(
@@ -8116,7 +8144,7 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             unreachable!("planner should reject moving-start frame over non-invertible {func}");
         }
         AggFunc::External(_) => {
-            unreachable!("planner rejects moving-start frames over external aggregates");
+            unreachable!("external aggregates are inverted through their own state, not a payload");
         }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupObject
@@ -8150,6 +8178,71 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
     Ok(())
 }
 
+fn borrow_arg_tags(
+    state: &ProgramState,
+    start: usize,
+    count: usize,
+) -> Vec<Option<&crate::udf::ValueTag>> {
+    state.registers[start..start + count]
+        .iter()
+        .map(|reg| reg.tag())
+        .collect()
+}
+
+fn store_function_result(
+    dest: &mut Register,
+    mut value: Value,
+    result_tag: Option<crate::udf::ValueTag>,
+) {
+    let Some(tag) = result_tag else {
+        dest.set_value(value);
+        return;
+    };
+    if tag.is_pointer() {
+        // sqlite3_result_pointer overrides the returned value: a pointer value is a NULL.
+        value = Value::Null;
+    } else if let Value::Text(text) = &mut value {
+        // Keep the inline TEXT subtype in sync so `Value::subtype()` and the JSON functions agree with the tag.
+        text.subtype = crate::types::TextSubtype::new(tag.subtype());
+    }
+    dest.set_tagged(value, tag);
+}
+
+fn borrow_args(
+    state: &ProgramState,
+    start: usize,
+    count: usize,
+) -> Vec<crate::types::ValueRef<'_>> {
+    state.registers[start..start + count]
+        .iter()
+        .map(|reg| reg.get_value().as_ref())
+        .collect()
+}
+
+fn init_external_agg(
+    program: &Program,
+    func: &Arc<crate::function::ExternalFunc>,
+) -> Result<ExternalAggHandle> {
+    let Some(agg) = func.as_aggregate() else {
+        return Err(LimboError::InternalError(format!(
+            "scalar function {} used in aggregate context",
+            func.name()
+        )));
+    };
+    let mut ctx = FunctionContext::new(&program.connection);
+    Ok(ExternalAggHandle::new(agg.init(&mut ctx)?))
+}
+
+/// Cloned out so the caller can borrow other registers while stepping it.
+fn external_agg_handle(state: &ProgramState, acc_reg: usize) -> Result<ExternalAggHandle> {
+    match &state.registers[acc_reg] {
+        Register::Aggregate(AggContext::External(handle)) => Ok(handle.clone()),
+        other => Err(LimboError::InternalError(format!(
+            "expected an external aggregate accumulator in register {acc_reg}, found {other:?}"
+        ))),
+    }
+}
+
 pub fn op_agg_step(
     program: &Program,
     state: &mut ProgramState,
@@ -8174,27 +8267,9 @@ pub fn op_agg_step(
     // Initialize aggregate state if not already done
     if let Register::Value(Value::Null) = state.registers[*acc_reg] {
         state.registers[*acc_reg] = match func {
-            AggFunc::External(ext_func) => match ext_func.as_ref() {
-                ExtFunc::Aggregate {
-                    context,
-                    init,
-                    step,
-                    finalize,
-                    argc,
-                    aggregate_destructor,
-                    value_destructor,
-                    ..
-                } => Register::Aggregate(AggContext::External(ExternalAggState {
-                    context: *context,
-                    state: unsafe { (init)(*context) },
-                    argc: (*argc).max(0) as usize,
-                    step_fn: *step,
-                    finalize_fn: *finalize,
-                    aggregate_destructor: *aggregate_destructor,
-                    value_destructor: *value_destructor,
-                })),
-                _ => unreachable!("scalar function called in aggregate context"),
-            },
+            AggFunc::External(call) => Register::Aggregate(AggContext::External(
+                init_external_agg(program, &call.func)?,
+            )),
             _ => {
                 // Built-in aggregates use flat payload
                 let mut payload = crate::alloc::vec![];
@@ -8219,50 +8294,25 @@ pub fn op_agg_step(
 
     // Step the aggregate
     match func {
-        AggFunc::External(_) => {
-            // External aggregates use FFI and need special handling
-            let (context, step_fn, state_ptr, argc, aggregate_destructor, value_destructor) = {
-                let Register::Aggregate(agg) = &state.registers[*acc_reg] else {
-                    unreachable!();
+        AggFunc::External(call) => {
+            let handle = external_agg_handle(state, *acc_reg)?;
+            let args = borrow_args(state, *col, call.argc);
+            let arg_tags = borrow_arg_tags(state, *col, call.argc);
+            let mut ctx = FunctionContext::new(&program.connection)
+                .with_args(&args)
+                .with_arg_tags(&arg_tags);
+            let result = {
+                let mut guard = handle.lock();
+                let Some(agg_state) = guard.as_mut() else {
+                    return Err(LimboError::InternalError(
+                        "external aggregate stepped after it was finalized".to_string(),
+                    ));
                 };
-                let AggContext::External(agg_state) = agg else {
-                    unreachable!();
-                };
-                (
-                    agg_state.context,
-                    agg_state.step_fn,
-                    agg_state.state,
-                    agg_state.argc,
-                    agg_state.aggregate_destructor,
-                    agg_state.value_destructor,
-                )
+                agg_state.step(&mut ctx, &args)
             };
-            let mut ext_values = Vec::with_capacity(argc);
-            if argc != 0 {
-                let register_slice = &state.registers[*col..*col + argc];
-                for ov in register_slice.iter() {
-                    ext_values.push(ov.get_value().to_ffi());
-                }
-            }
-            let argv_ptr = if ext_values.is_empty() {
-                std::ptr::null()
-            } else {
-                ext_values.as_ptr()
-            };
-            let mut result = unsafe { step_fn(context, state_ptr, argc as i32, argv_ptr) };
-            let value = Value::from_ffi_ref(&result);
-            if let Some(value_destructor) = value_destructor {
-                unsafe { value_destructor(&mut result) };
-            } else {
-                unsafe { result.__free_internal_type() };
-            }
-            for ext_value in ext_values {
-                unsafe { ext_value.__free_internal_type() };
-            }
-            if let Err(err) = value {
-                if let Some(aggregate_destructor) = aggregate_destructor {
-                    unsafe { aggregate_destructor(state_ptr as usize) };
-                }
+            if let Err(err) = result {
+                // A failed step ends the aggregate.
+                handle.clear();
                 state.registers[*acc_reg].set_value(Value::Null);
                 return Err(err);
             }
@@ -8316,18 +8366,19 @@ pub fn op_agg_step(
 }
 
 pub fn op_agg_final(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    let (acc_reg, dest_reg, func) = match insn {
-        Insn::AggFinal { register, func } => (*register, *register, func),
+    // AggFinal consumes the accumulator; AggValue reads a running window frame without disturbing it.
+    let (acc_reg, dest_reg, func, consume) = match insn {
+        Insn::AggFinal { register, func } => (*register, *register, func, true),
         Insn::AggValue {
             acc_reg,
             dest_reg,
             func,
-        } => (*acc_reg, *dest_reg, func),
+        } => (*acc_reg, *dest_reg, func, false),
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
 
@@ -8338,17 +8389,35 @@ pub fn op_agg_final(
 
     match &state.registers[acc_reg] {
         Register::Aggregate(agg) => {
+            let mut result_tag = None;
             let value = match agg {
-                AggContext::External(_) => {
-                    // External aggregates use FFI finalization
-                    agg.compute_external()?
+                AggContext::External(handle) => {
+                    let mut ctx = FunctionContext::new(&program.connection);
+                    let value = if consume {
+                        let Some(agg_state) = handle.take() else {
+                            return Err(LimboError::InternalError(
+                                "external aggregate finalized twice".to_string(),
+                            ));
+                        };
+                        agg_state.finalize(&mut ctx)?
+                    } else {
+                        let guard = handle.lock();
+                        let Some(agg_state) = guard.as_ref() else {
+                            return Err(LimboError::InternalError(
+                                "external aggregate read after it was finalized".to_string(),
+                            ));
+                        };
+                        agg_state.value(&mut ctx)?
+                    };
+                    result_tag = ctx.take_result_tag();
+                    value
                 }
                 AggContext::Builtin(payload) => {
                     // Built-in aggregates use shared finalization
                     finalize_agg_payload(func, payload)?
                 }
             };
-            state.registers[dest_reg].set_value(value);
+            store_function_result(&mut state.registers[dest_reg], value, result_tag);
         }
         Register::Value(Value::Null) => {
             // No row was stepped: write the empty-set default explicitly.
@@ -8380,32 +8449,16 @@ pub fn op_agg_final(
                     state.registers[dest_reg]
                         .set_blob(json::jsonb::Jsonb::make_empty_obj(1)?.data())?;
                 }
-                AggFunc::External(ext_func) => {
-                    let value = match ext_func.as_ref() {
-                        ExtFunc::Aggregate {
-                            context,
-                            init,
-                            finalize,
-                            aggregate_destructor,
-                            value_destructor,
-                            ..
-                        } => {
-                            let aggregate_context = unsafe { init(*context) };
-                            let mut result = unsafe { finalize(*context, aggregate_context) };
-                            let value = Value::from_ffi_ref(&result);
-                            if let Some(value_destructor) = value_destructor {
-                                unsafe { value_destructor(&mut result) };
-                            } else {
-                                unsafe { result.__free_internal_type() };
-                            }
-                            if let Some(aggregate_destructor) = aggregate_destructor {
-                                unsafe { aggregate_destructor(aggregate_context as usize) };
-                            }
-                            value?
-                        }
-                        _ => unreachable!("scalar function called in aggregate context"),
+                AggFunc::External(call) => {
+                    // No row was stepped, but finalize runs exactly once per group.
+                    let handle = init_external_agg(program, &call.func)?;
+                    let Some(agg_state) = handle.take() else {
+                        unreachable!("a fresh accumulator always holds a state");
                     };
-                    state.registers[dest_reg].set_value(value);
+                    let mut ctx = FunctionContext::new(&program.connection);
+                    let value = agg_state.finalize(&mut ctx)?;
+                    let result_tag = ctx.take_result_tag();
+                    store_function_result(&mut state.registers[dest_reg], value, result_tag);
                 }
                 _ => {
                     state.registers[dest_reg].set_value(Value::Null);
@@ -8875,7 +8928,7 @@ pub fn op_function(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Function {
-            constant_mask: _,
+            constant_mask,
             func,
             start_reg,
             dest,
@@ -10543,48 +10596,38 @@ pub fn op_function(
                 }
             }
         }
-        crate::function::Func::External(f) => match f.func {
-            ExtFunc::Scalar {
-                context,
-                callback,
-                context_destructor,
-                value_destructor,
-                ..
-            } => {
-                let mut ext_values = Vec::with_capacity(arg_count);
-                if arg_count != 0 {
-                    let register_slice = &state.registers[*start_reg..*start_reg + arg_count];
-                    for ov in register_slice.iter() {
-                        ext_values.push(ov.get_value().to_ffi());
-                    }
-                }
-                let argv_ptr = if ext_values.is_empty() {
-                    std::ptr::null()
-                } else {
-                    ext_values.as_ptr()
-                };
-                let mut result = unsafe {
-                    callback(
-                        context,
-                        arg_count as i32,
-                        argv_ptr,
-                        context_destructor,
-                        value_destructor,
-                    )
-                };
-                let value = Value::from_ffi_ref(&result);
-                if let Some(value_destructor) = value_destructor {
-                    unsafe { value_destructor(&mut result) };
-                } else {
-                    unsafe { result.__free_internal_type() };
-                }
-                for ext_value in ext_values {
-                    unsafe { ext_value.__free_internal_type() };
-                }
-                state.registers[*dest].set_value(value?);
-            }
-            _ => unreachable!("aggregate called in scalar context"),
-        },
+        crate::function::Func::External(f) => {
+            let Some(scalar) = f.as_scalar() else {
+                // Translation rejects this, so the plan and the registry disagree.
+                return Err(LimboError::InternalError(format!(
+                    "misuse of aggregate function {}()",
+                    f.name()
+                )));
+            };
+            // Aux data is keyed by instruction, so two call sites of one function keep independent slots.
+            let insn_pc = state.pc;
+            let start = *start_reg;
+            let (result, result_tag) = {
+                let (registers, auxdata) = state.registers_and_auxdata();
+                let args: Vec<crate::types::ValueRef<'_>> = registers[start..start + arg_count]
+                    .iter()
+                    .map(|reg| reg.get_value().as_ref())
+                    .collect();
+                let arg_tags: Vec<Option<&crate::udf::ValueTag>> = registers
+                    [start..start + arg_count]
+                    .iter()
+                    .map(|reg| reg.tag())
+                    .collect();
+                let mut ctx = FunctionContext::new(&program.connection)
+                    .with_args(&args)
+                    .with_arg_tags(&arg_tags)
+                    .with_auxdata(auxdata, insn_pc);
+                let result = scalar.call(&mut ctx, &args);
+                (result, ctx.take_result_tag())
+            };
+            state.drop_non_constant_auxdata(insn_pc, *constant_mask);
+            store_function_result(&mut state.registers[*dest], result?, result_tag);
+        }
         crate::function::Func::Math(math_func) => match math_func.arity() {
             MathFuncArity::Nullary => match math_func {
                 MathFunc::Pi => {
@@ -11508,19 +11551,18 @@ pub fn op_yield(
             state.registers[*yield_reg].set_int((state.pc + 1) as i64);
             state.pc = pc;
 
-            // Strip JSON subtypes from co-routine output columns so they do not
+            // Strip subtypes from co-routine output columns so they do not
             // survive the subquery boundary, matching SQLite's OP_Copy P5=0x0002.
             // subtype_clear_count > 0 only for coroutine body yields.
-            #[cfg(feature = "json")]
             if *subtype_clear_count > 0 {
                 use crate::types::TextSubtype;
                 for reg in &mut state.registers
                     [*subtype_clear_start_reg..*subtype_clear_start_reg + *subtype_clear_count]
                 {
+                    // A subtype can live in the tag beside the register or inline in TEXT; a pointer goes with the tag.
+                    reg.clear_tag();
                     if let Register::Value(Value::Text(text)) = reg {
-                        if text.subtype == TextSubtype::Json {
-                            text.subtype = TextSubtype::Text;
-                        }
+                        text.subtype = TextSubtype::Text;
                     }
                 }
             }
@@ -11739,6 +11781,11 @@ pub fn op_insert(
                                 let record = ImmutableRecord::from_values(values, values.len())?;
                                 std::borrow::Cow::Owned(record)
                             }
+                            Register::Tagged(tagged) => {
+                                let values = [&tagged.value];
+                                let record = ImmutableRecord::from_values(values, values.len())?;
+                                std::borrow::Cow::Owned(record)
+                            }
                             Register::Aggregate(..) => {
                                 unreachable!("Cannot insert an aggregate value.")
                             }
@@ -11756,8 +11803,14 @@ pub fn op_insert(
                 if !state.active_op_state.insert().is_noop_update {
                     let record = match &state.registers[*record_reg] {
                         Register::Record(r) => std::borrow::Cow::Borrowed(r),
+                        // A record has nowhere to keep a subtype or pointer.
                         Register::Value(value) => {
                             let values = [value];
+                            let record = ImmutableRecord::from_values(values, values.len())?;
+                            std::borrow::Cow::Owned(record)
+                        }
+                        Register::Tagged(tagged) => {
+                            let values = [&tagged.value];
                             let record = ImmutableRecord::from_values(values, values.len())?;
                             std::borrow::Cow::Owned(record)
                         }
@@ -11860,8 +11913,14 @@ pub fn op_insert(
 
                     let record = match &state.registers[*record_reg] {
                         Register::Record(r) => std::borrow::Cow::Borrowed(r),
+                        // A record has nowhere to keep a subtype or pointer.
                         Register::Value(value) => {
                             let values = [value];
+                            let record = ImmutableRecord::from_values(values, values.len())?;
+                            std::borrow::Cow::Owned(record)
+                        }
+                        Register::Tagged(tagged) => {
+                            let values = [&tagged.value];
                             let record = ImmutableRecord::from_values(values, values.len())?;
                             std::borrow::Cow::Owned(record)
                         }
@@ -14952,6 +15011,7 @@ pub fn op_add_imm(
     let current = &state.registers[*register];
     let current_value = match current {
         Register::Value(val) => val,
+        Register::Tagged(tagged) => &tagged.value,
         Register::Aggregate(_) => &Value::Null,
         Register::Record(_) => &Value::Null,
     };
@@ -14980,7 +15040,14 @@ pub fn op_variable(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Variable { index, dest }, insn);
-    state.registers[*dest].set_value(state.get_parameter(*index));
+    let value = state.get_parameter(*index);
+    // A pointer-bound parameter reads as NULL but carries its object.
+    match state.get_parameter_pointer(*index) {
+        Some(pointer) => {
+            state.registers[*dest].set_tagged(value, crate::udf::ValueTag::from_pointer(pointer))
+        }
+        None => state.registers[*dest].set_value(value),
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -17595,7 +17662,7 @@ pub fn op_hash_grace_advance_partition(
 }
 
 fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
-    if let Register::Value(value) = target {
+    if let Some(value) = target.value_mut() {
         if matches!(value, Value::Blob(_)) {
             return true;
         }

@@ -1,6 +1,5 @@
 use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
-use crate::function::Func;
 use crate::index_method::{ensure_mvcc_support, IndexMethodConfiguration};
 use crate::numeric::Numeric;
 use crate::schema::{Column, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
@@ -226,20 +225,12 @@ pub fn translate_create_index(
         has_rowid: tbl.has_rowid,
         // store the *original* where clause, because we need to rewrite it
         // before translating, and it cannot reference a table alias
-        where_clause: where_clause.clone(),
+        where_clause,
         index_method: index_method.clone(),
         on_conflict: None,
     });
 
-    if !idx.validate_where_expr(&table, resolver) {
-        crate::bail_parse_error!(
-            "Error: cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX:\n {}",
-            where_clause
-                .as_ref()
-                .expect("where expr has to exist in order to fail")
-                .to_string()
-        );
-    }
+    idx.validate_where_expr(&table, resolver)?;
 
     let sqlite_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id =
@@ -942,8 +933,19 @@ fn resolve_sorted_columns_with_resolver(
                 .expect("resolved index columns vector was preallocated to cols.len()");
             continue;
         }
-        if !validate_index_expression(unwrapped_expr, table) {
-            crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
+        match validate_index_expression(unwrapped_expr, table, resolver) {
+            None => {}
+            Some(IndexExpressionProblem::NoSuchFunction(name)) => {
+                crate::bail_parse_error!("no such function: {}", name);
+            }
+            Some(IndexExpressionProblem::NonDeterministicFunction) => {
+                crate::bail_parse_error!(
+                    "non-deterministic functions prohibited in index expressions"
+                );
+            }
+            Some(IndexExpressionProblem::NotIndexable) => {
+                crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
+            }
         }
         resolved
             .push_within_capacity(IndexColumn {
@@ -1030,13 +1032,18 @@ fn resolve_index_column<'a>(
 /// Expressions in CREATE INDEX statements may not use subqueries.
 /// Additionally, a standalone string literal is interpreted as a column name (for backwards
 /// compatibility with SQLite), not as a string literal. It is rejected if no such column exists.
-fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
+/// A non-deterministic function gets SQLite's own wording, which upstream `indexexpr1.test` expects.
+fn validate_index_expression(
+    expr: &Expr,
+    table: &BTreeTable,
+    resolver: Option<&Resolver>,
+) -> Option<IndexExpressionProblem> {
     // A top-level string literal would have been handled by resolve_index_column().
     // If we get here with a string literal, it means the column doesn't exist.
     // (SQLite interprets standalone string literals as column names for backwards compat.)
     // Note: extract_collation already unwraps parentheses, so we check the unwrapped expr.
     if matches!(expr, Expr::Literal(ast::Literal::String(_))) {
-        return false;
+        return Some(IndexExpressionProblem::NotIndexable);
     }
 
     let tbl_norm = normalize_ident(table.name.as_str());
@@ -1048,12 +1055,7 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
             .any(|c| c.name.as_ref().is_some_and(|cn| normalize_ident(cn) == n))
     };
     let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
-    let is_deterministic_fn = |name: &str, args: &[Box<Expr>]| {
-        let n = normalize_ident(name);
-        Func::resolve_function(&n, args.len())
-            .is_ok_and(|f| f.is_some_and(|f| is_deterministic_schema_function_call(&f, args)))
-    };
-
+    let mut problem = None;
     let mut ok = true;
     let _ = walk_expr(expr, &mut |e: &Expr| -> crate::Result<WalkControl> {
         if !ok {
@@ -1098,8 +1100,27 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
                         Expr::FunctionCallStar { .. } => &[] as &[Box<Expr>],
                         _ => unreachable!(),
                     };
-                    if !is_deterministic_fn(name.as_str(), argc) {
-                        ok = false;
+                    // Without a resolver we are reading a stored schema row back and the function may not be
+                    // registered on this connection; the statement that needs it is where the error belongs.
+                    if let Some(resolver) = resolver {
+                        let resolved = resolver
+                            .resolve_function(&normalize_ident(name.as_str()), argc.len())
+                            .ok()
+                            .flatten();
+                        match resolved {
+                            Some(func) if func.is_aggregate() => ok = false,
+                            Some(func) if is_deterministic_schema_function_call(&func, argc) => {}
+                            Some(_) => {
+                                ok = false;
+                                problem = Some(IndexExpressionProblem::NonDeterministicFunction);
+                            }
+                            None => {
+                                ok = false;
+                                problem = Some(IndexExpressionProblem::NoSuchFunction(
+                                    name.as_str().to_string(),
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -1119,7 +1140,17 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
             WalkControl::SkipChildren
         })
     });
-    ok
+    if ok {
+        None
+    } else {
+        Some(problem.unwrap_or(IndexExpressionProblem::NotIndexable))
+    }
+}
+
+enum IndexExpressionProblem {
+    NoSuchFunction(String),
+    NonDeterministicFunction,
+    NotIndexable,
 }
 
 fn emit_index_column_value_from_cursor(
@@ -1132,14 +1163,19 @@ fn emit_index_column_value_from_cursor(
     dest_reg: usize,
 ) -> crate::Result<()> {
     if let Some(expr) = &idx_col.expr {
+        let saved_schema_sql = resolver.begin_schema_sql();
         let mut expr = expr.as_ref().clone();
-        bind_and_rewrite_expr(
+        let bound = bind_and_rewrite_expr(
             &mut expr,
             Some(table_references),
             None,
             resolver,
             BindingBehavior::ResultColumnsNotAllowed,
-        )?;
+        );
+        if bound.is_err() {
+            resolver.end_schema_sql(saved_schema_sql);
+        }
+        bound?;
         let self_table_context =
             table_references
                 .joined_tables()
@@ -1148,10 +1184,13 @@ fn emit_index_column_value_from_cursor(
                     table_ref_id: jt.internal_id,
                     referenced_tables: table_references.clone(),
                 });
-        resolver.with_self_table_context(program, self_table_context.as_ref(), |program, _| {
-            translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
-            Ok(())
-        })?;
+        let translated =
+            resolver.with_self_table_context(program, self_table_context.as_ref(), |program, _| {
+                translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
+                Ok(())
+            });
+        resolver.end_schema_sql(saved_schema_sql);
+        translated?;
         // For virtual generated column references, apply the column's
         // declared affinity to the computed expression result.
         if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {

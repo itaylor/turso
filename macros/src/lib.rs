@@ -362,6 +362,10 @@ pub fn derive_scalar(input: TokenStream) -> TokenStream {
 
 /// Define an aggregate function for your extension by deriving
 /// AggregateDerive on a struct that implements the AggFunc trait.
+///
+/// To also allow `my_agg(x) OVER (...)`, set `const WINDOW: bool = true;` and
+/// implement `value` and `inverse`. Only opt in when undoing a step is cheap
+/// and exact — a running sum qualifies, a median does not.
 /// ```ignore
 /// use turso_ext::{register_extension, Value, AggregateDerive, AggFunc};
 ///

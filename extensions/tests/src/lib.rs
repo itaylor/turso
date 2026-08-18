@@ -8,16 +8,17 @@ use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use turso_ext::{
-    register_extension, scalar, Connection, ConstraintInfo, ConstraintOp, ConstraintUsage,
-    ExtResult, IndexInfo, OrderByInfo, ResultCode, ScalarDerive, ScalarFunc, StepResult,
-    VTabCursor, VTabKind, VTabModule, VTabModuleDerive, VTable, Value,
+    register_extension, scalar, AggFunc, AggregateDerive, Connection, ConstraintInfo, ConstraintOp,
+    ConstraintUsage, ExtResult, IndexInfo, OrderByInfo, ResultCode, ScalarDerive, ScalarFunc,
+    StepResult, VTabCursor, VTabKind, VTabModule, VTabModuleDerive, VTable, Value, ValueType,
 };
 #[cfg(not(target_family = "wasm"))]
 use turso_ext::{BufferRef, Callback, VfsDerive, VfsExtension, VfsFile};
 
 register_extension! {
+    aggregates: { TestWindowSum, TestSubtypeSum },
     vtabs: { KVStoreVTabModule, TableStatsVtabModule },
-    scalars: { test_scalar, CtxScalar },
+    scalars: { test_scalar, CtxScalar, test_subtype_tag, test_subtype_of },
     vfs: { TestFS },
 }
 
@@ -337,7 +338,7 @@ pub struct TestFS {
 
 // Test that we can have additional extension types in the same file
 // and still register the vfs at comptime if linking staticly
-#[scalar(name = "test_scalar")]
+#[scalar(name = "test_scalar", argc = 1, deterministic)]
 fn test_scalar(_args: turso_ext::Value) -> turso_ext::Value {
     turso_ext::Value::from_integer(42)
 }
@@ -350,6 +351,8 @@ struct CtxScalar;
 impl ScalarFunc for CtxScalar {
     type State = i64;
     const NAME: &'static str = "test_ctx_scalar";
+    const ARGC: i32 = 2;
+    const DETERMINISTIC: bool = true;
 
     fn init() -> Self::State {
         100
@@ -358,6 +361,79 @@ impl ScalarFunc for CtxScalar {
     fn call(state: &Self::State, args: &[Value]) -> Value {
         let sum: i64 = args.iter().filter_map(Value::to_integer).sum();
         Value::from_integer(sum + *state)
+    }
+}
+
+/// `Value` owns its payload and cannot be cloned, so copy it by hand.
+fn copy_value(value: &Value) -> Value {
+    match value.value_type() {
+        ValueType::Null => Value::null(),
+        ValueType::Integer => Value::from_integer(value.to_integer().unwrap_or_default()),
+        ValueType::Float => Value::from_float(value.to_float().unwrap_or_default()),
+        ValueType::Text => Value::from_text(value.to_text().unwrap_or_default().to_string()),
+        ValueType::Blob => Value::from_blob(value.to_blob().unwrap_or_default()),
+        ValueType::Error => Value::error(ResultCode::Error),
+    }
+}
+
+// Returns argument 0 tagged with the subtype byte given as argument 1.
+#[scalar(name = "test_subtype_tag", argc = 2)]
+fn test_subtype_tag(args: &[turso_ext::Value]) -> turso_ext::Value {
+    let Some(value) = args.first() else {
+        return Value::null();
+    };
+    let subtype = args.get(1).and_then(Value::to_integer).unwrap_or_default() as u8;
+    copy_value(value).with_subtype(subtype)
+}
+
+#[scalar(name = "test_subtype_of", argc = 1)]
+fn test_subtype_of(args: &[turso_ext::Value]) -> turso_ext::Value {
+    let subtype = args.first().map(Value::subtype).unwrap_or_default();
+    Value::from_integer(subtype as i64)
+}
+
+#[derive(AggregateDerive)]
+struct TestSubtypeSum;
+
+impl AggFunc for TestSubtypeSum {
+    type State = i64;
+    type Error = &'static str;
+    const NAME: &'static str = "test_subtype_sum";
+    const ARGS: i32 = 1;
+
+    fn step(state: &mut Self::State, args: &[Value]) {
+        *state += args.first().and_then(Value::to_integer).unwrap_or_default();
+    }
+
+    fn finalize(state: Self::State) -> Result<Value, Self::Error> {
+        Ok(Value::from_integer(state).with_subtype(9))
+    }
+}
+
+#[derive(AggregateDerive)]
+struct TestWindowSum;
+
+impl AggFunc for TestWindowSum {
+    type State = i64;
+    type Error = &'static str;
+    const NAME: &'static str = "test_window_sum";
+    const ARGS: i32 = 1;
+    const WINDOW: bool = true;
+
+    fn step(state: &mut Self::State, args: &[Value]) {
+        *state += args.first().and_then(Value::to_integer).unwrap_or_default();
+    }
+
+    fn inverse(state: &mut Self::State, args: &[Value]) {
+        *state -= args.first().and_then(Value::to_integer).unwrap_or_default();
+    }
+
+    fn value(state: &Self::State) -> Result<Value, Self::Error> {
+        Ok(Value::from_integer(*state))
+    }
+
+    fn finalize(state: Self::State) -> Result<Value, Self::Error> {
+        Ok(Value::from_integer(state))
     }
 }
 

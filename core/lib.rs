@@ -51,7 +51,7 @@ mod connection;
 mod database;
 pub mod dialect;
 mod error;
-mod ext;
+pub mod ext;
 mod fast_lock;
 mod function;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
@@ -80,6 +80,7 @@ mod stats;
 #[cfg(feature = "time")]
 mod time;
 mod translate;
+pub mod udf;
 mod util;
 #[cfg(feature = "uuid")]
 mod uuid;
@@ -94,6 +95,11 @@ pub use function::MathFunc;
 /// by the C API's sqlite3_mprintf/sqlite3_snprintf so both share one
 /// formatting implementation.
 pub use functions::printf::{exec_printf_values, printf_c_arg_plan, PrintfCArg};
+pub use udf::{
+    aggregate_from_fns, AggregateFunction, AggregateState, ExternalFunc, FunctionContext,
+    FunctionFlags, FunctionImpl, PointerValue, ScalarFunction, ValueTag, MAX_FUNCTION_ARG,
+    POINTER_SUBTYPE,
+};
 
 use crate::{
     busy::{BusyHandler, BusyHandlerCallback},
@@ -171,7 +177,7 @@ pub use types::{IOResult, Value, ValueBlob, ValueRef};
 pub use util::IOExt;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
-    FromValueRow, PrepareContext, PreparedProgram, Program, Register,
+    FromValueRow, PrepareContext, PreparedProgram, Program, Register, TaggedValue,
 };
 pub use vtab::{InternalVirtualTable, InternalVirtualTableCursor, VirtualTable};
 

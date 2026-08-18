@@ -97,6 +97,11 @@ def test_regexp():
     turso.run_test_fn("SELECT regexp('a.c', 'ac');", false)
     turso.run_test_fn("SELECT regexp('[0-9]+', 'the year is 2021');", true)
     turso.run_test_fn("SELECT regexp('[0-9]+', 'the year is unknow');", false)
+    turso.run_test_fn(
+        "SELECT regexp('[0-9]+');",
+        lambda res: "wrong number of arguments to function regexp()" in res,
+        "regexp rejects the wrong number of arguments",
+    )
     turso.run_test_fn("SELECT regexp_like('the year is 2021', '[0-9]+');", true)
     turso.run_test_fn("SELECT regexp_like('the year is unknow', '[0-9]+');", false)
     turso.run_test_fn(
@@ -127,6 +132,12 @@ def test_regexp():
     turso.run_test_fn(
         "select regexp_capture('no digits here', '([0-9]+)');",
         null,
+    )
+    # flags & 2048 is the deterministic bit.
+    turso.run_test_fn(
+        "SELECT flags & 2048 FROM pragma_function_list() WHERE name = 'regexp_replace';",
+        lambda res: res == "2048",
+        "regexp_replace is listed with the deterministic flag set",
     )
     turso.quit()
 
@@ -384,6 +395,18 @@ def test_crypto():
         validate_url_decode,
         "url should decode correctly",
     )
+    # flags & 2048 is the deterministic bit.
+    turso.run_test_fn(
+        "SELECT narg || ':' || (flags & 2048) FROM pragma_function_list() WHERE name = 'crypto_sha256';",
+        lambda res: res == "1:2048",
+        "crypto_sha256 is listed with argc=1 and the deterministic flag set",
+    )
+    # A declared argc makes the parser reject the call before the callback runs.
+    turso.run_test_fn(
+        "SELECT crypto_sha256('a', 'b');",
+        lambda res: "wrong number of arguments to function crypto_sha256()" in res,
+        "crypto_sha256 rejects the wrong number of arguments",
+    )
     turso.quit()
 
 
@@ -606,6 +629,16 @@ def test_ipaddr():
         lambda res: "2001:db8::1/128" == res,
         "ipnetwork function returns the network for IPv6",
     )
+    turso.run_test_fn(
+        "SELECT flags & 2048 FROM pragma_function_list() WHERE name = 'ipfamily';",
+        lambda res: res == "2048",
+        "ipfamily is listed with the deterministic flag set",
+    )
+    turso.run_test_fn(
+        "SELECT ipfamily();",
+        lambda res: "wrong number of arguments to function ipfamily()" in res,
+        "ipfamily rejects the wrong number of arguments",
+    )
     turso.quit()
 
 
@@ -739,67 +772,72 @@ def test_fuzzy():
         validate_fuzzy_script,
         "fuzzy script function works",
     )
+    # A declared argc makes the parser reject the call before the callback runs.
     turso.run_test_fn(
         "SELECT fuzzy_rsoundex();",
-        lambda res: "Invalid Argument" in res,
+        lambda res: "wrong number of arguments to function fuzzy_rsoundex()" in res,
         "fuzzy rsoundex function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_leven('awesome');",
-        lambda res: "Invalid Argument" in res,
+        lambda res: "wrong number of arguments to function fuzzy_leven()" in res,
         "fuzzy levenshtein function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_damlev('awesome');",
-        lambda res: "Invalid Argument" in res,
+        lambda res: "wrong number of arguments to function fuzzy_damlev()" in res,
         "fuzzy damerau levenshtein1 function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_editdist('abc');",
-        lambda res: "Invalid Argument" in res,
+        lambda res: "wrong number of arguments to function fuzzy_editdist()" in res,
         "fuzzy editdist1 function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_jarowin('awesome');",
-        lambda res: "Invalid Argument" in res,
+        lambda res: "wrong number of arguments to function fuzzy_jarowin()" in res,
         "fuzzy jarowin function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_osadist('awesome');",
-        lambda res: "Invalid Argument" in res,
+        lambda res: "wrong number of arguments to function fuzzy_osadist()" in res,
         "fuzzy osadist function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_phonetic();",
-        lambda res: "Invalid Argument" in res,
+        lambda res: "wrong number of arguments to function fuzzy_phonetic()" in res,
         "fuzzy phonetic function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_caver();",
-        lambda res: "Invalid Argument" in res,
+        lambda res: "wrong number of arguments to function fuzzy_caver()" in res,
         "fuzzy caver function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_soundex();",
-        lambda res: "Invalid Argument" in res,
+        lambda res: "wrong number of arguments to function fuzzy_soundex()" in res,
         "fuzzy soundex function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_hamming('awesome');",
-        lambda res: "Invalid Argument" in res,
+        lambda res: "wrong number of arguments to function fuzzy_hamming()" in res,
         "fuzzy hamming function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_translit();",
-        lambda res: "Invalid Argument" in res,
+        lambda res: "wrong number of arguments to function fuzzy_translit()" in res,
         "fuzzy translit function works",
     )
     turso.run_test_fn(
         "SELECT fuzzy_script();",
-        lambda res: "Invalid Argument" in res,
+        lambda res: "wrong number of arguments to function fuzzy_script()" in res,
         "fuzzy script function works",
     )
-
+    turso.run_test_fn(
+        "SELECT narg || ':' || (flags & 2048) FROM pragma_function_list() WHERE name = 'fuzzy_leven';",
+        lambda res: res == "2:2048",
+        "fuzzy_leven is listed with argc=2 and the deterministic flag set",
+    )
 
 
 def test_vfs():
@@ -936,6 +974,95 @@ def test_csv():
     turso.quit()
 
 
+def test_window_aggregate():
+    # `test_window_sum` in extensions/tests sets `AggFunc::WINDOW = true`.
+    ext_path = f"{DEBUG_DIR}/libturso_ext_tests"
+    turso = TestTursoShell()
+    turso.run_test_fn(
+        "SELECT test_window_sum(1);",
+        lambda res: "no such function" in res.lower(),
+        "test_window_sum is not registered before the extension loads",
+    )
+    turso.execute_dot(f".load {ext_path}")
+    turso.execute_dot("CREATE TABLE win (id INTEGER, v INTEGER);")
+    turso.execute_dot("INSERT INTO win VALUES (1, 10), (2, 20), (3, 30), (4, 40);")
+    turso.run_test_fn(
+        "SELECT test_window_sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM win;",
+        lambda res: [ln.strip() for ln in res.splitlines() if ln.strip()] == ["10", "30", "50", "70"],
+        "extension window aggregate follows a frame with a moving start",
+    )
+    turso.run_test_fn(
+        "SELECT test_window_sum(v) FROM win;",
+        lambda res: res == "100",
+        "extension window aggregate still works as a plain aggregate",
+    )
+    turso.quit()
+
+
+def test_value_subtypes():
+    # Goes through dlopen, so it also covers the ABI-version handshake.
+    ext_path = f"{DEBUG_DIR}/libturso_ext_tests"
+    turso = TestTursoShell()
+    turso.run_test_fn(
+        "SELECT test_subtype_of(5);",
+        lambda res: "no such function" in res.lower(),
+        "test_subtype_of is not registered before the extension loads",
+    )
+    turso.execute_dot(f".load {ext_path}")
+
+    for literal, label in [
+        ("5", "integer"),
+        ("1.5", "float"),
+        ("X'00'", "blob"),
+        ("NULL", "null"),
+        ("'txt'", "text"),
+    ]:
+        turso.run_test_fn(
+            f"SELECT test_subtype_of(test_subtype_tag({literal}, 42));",
+            lambda res: res == "42",
+            f"a subtype survives a round trip on a {label} value",
+        )
+    turso.run_test_fn(
+        "SELECT test_subtype_tag(5, 42);",
+        lambda res: res == "5",
+        "tagging a value leaves the value alone",
+    )
+    turso.run_test_fn(
+        "SELECT test_subtype_of(5);",
+        lambda res: res == "0",
+        "a value nobody tagged has no subtype",
+    )
+    # 74 is 'J', the byte the built-in JSON functions stamp on their result.
+    turso.run_test_fn(
+        "SELECT test_subtype_of(json('[1]'));",
+        lambda res: res == "74",
+        "the JSON subtype of a built-in result reaches the extension",
+    )
+    turso.run_test_fn(
+        "SELECT test_subtype_of(test_subtype_tag('[1,2]', 74));",
+        lambda res: res == "74",
+        "an extension can stamp the JSON subtype itself",
+    )
+    turso.run_test_fn(
+        "SELECT typeof(test_subtype_tag('[1,2]', 74)) || ',' || json_valid(test_subtype_tag('[1,2]', 74));",
+        lambda res: res == "text,1",
+        "text tagged as JSON is still text, and the JSON functions accept it",
+    )
+    turso.execute_dot("CREATE TABLE nums (v);")
+    turso.execute_dot("INSERT INTO nums VALUES (1), (2), (3);")
+    turso.run_test_fn(
+        "SELECT test_subtype_of(test_subtype_sum(v)) FROM nums;",
+        lambda res: res == "9",
+        "an aggregate result carries the subtype its finalize attached",
+    )
+    turso.run_test_fn(
+        "SELECT test_subtype_of(v) FROM nums LIMIT 1;",
+        lambda res: res == "0",
+        "a value read out of a table has no subtype",
+    )
+    turso.quit()
+
+
 def cleanup():
     if os.path.exists("testing/system/vfs.db"):
         os.remove("testing/system/vfs.db")
@@ -1062,6 +1189,8 @@ def main():
         test_kv()
         test_csv()
         test_tablestats()
+        test_window_aggregate()
+        test_value_subtypes()
         test_fuzzy()
     except Exception as e:
         console.error(f"Test FAILED: {e}")

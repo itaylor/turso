@@ -331,6 +331,7 @@ impl CompiledExpression {
             &attached_databases,
             syms,
             true,
+            true,
             DoubleQuotedDml::Enabled,
             std::sync::Arc::new(crate::dialect::SqliteDialect),
             &None,
@@ -422,9 +423,9 @@ impl CompiledExpression {
                 }
 
                 // The compiled expression puts the result in register 0
-                match state.get_register(0) {
-                    Register::Value(v) => Ok(v.clone()),
-                    _ => Ok(Value::Null),
+                match state.get_register(0).value() {
+                    Some(v) => Ok(v.clone()),
+                    None => Ok(Value::Null),
                 }
             }
         }

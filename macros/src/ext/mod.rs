@@ -3,7 +3,7 @@ use quote::quote;
 use syn::parse::ParseStream;
 use syn::punctuated::Punctuated;
 use syn::token::Eq;
-use syn::{parse_macro_input, Ident, LitStr, Token};
+use syn::{parse_macro_input, Ident, LitBool, LitInt, LitStr, Token};
 mod agg_derive;
 mod match_ignore_ascii_case;
 mod scalars;
@@ -105,6 +105,14 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
                 ::turso_ext::ResultCode::OK
               }
 
+            /// ABI version this extension was built against. An extension
+            /// without this symbol is treated as version 1.
+            #[cfg(not(feature = "static"))]
+            #[no_mangle]
+            pub extern "C" fn turso_ext_api_version() -> u32 {
+                ::turso_ext::TURSO_EXT_API_VERSION
+            }
+
             #[cfg(not(feature = "static"))]
             #[no_mangle]
             pub unsafe extern "C" fn register_extension(api: &::turso_ext::ExtensionApi) -> ::turso_ext::ResultCode {
@@ -179,11 +187,19 @@ impl syn::parse::Parse for RegisterExtensionInput {
 pub(crate) struct ScalarInfo {
     pub name: String,
     pub alias: Option<String>,
+    /// Argument count, or `-1` for variadic.
+    pub argc: i32,
+    pub deterministic: bool,
 }
 
 impl ScalarInfo {
-    pub fn new(name: String, alias: Option<String>) -> Self {
-        Self { name, alias }
+    pub fn new(name: String, alias: Option<String>, argc: i32, deterministic: bool) -> Self {
+        Self {
+            name,
+            alias,
+            argc,
+            deterministic,
+        }
     }
 }
 
@@ -191,6 +207,8 @@ impl syn::parse::Parse for ScalarInfo {
     fn parse(input: ParseStream) -> syn::parse::Result<Self> {
         let mut name = None;
         let mut alias = None;
+        let mut argc = -1i32;
+        let mut deterministic = false;
         while !input.is_empty() {
             if let Ok(ident) = input.parse::<Ident>() {
                 if ident.to_string().as_str() == "name" {
@@ -199,6 +217,16 @@ impl syn::parse::Parse for ScalarInfo {
                 } else if ident.to_string().as_str() == "alias" {
                     let _ = input.parse::<Eq>();
                     alias = Some(input.parse::<LitStr>()?);
+                } else if ident.to_string().as_str() == "argc" {
+                    let _ = input.parse::<Eq>();
+                    argc = input.parse::<LitInt>()?.base10_parse::<i32>()?;
+                } else if ident.to_string().as_str() == "deterministic" {
+                    if input.peek(Eq) {
+                        let _ = input.parse::<Eq>();
+                        deterministic = input.parse::<LitBool>()?.value;
+                    } else {
+                        deterministic = true;
+                    }
                 }
             }
             if input.peek(Token![,]) {
@@ -208,6 +236,11 @@ impl syn::parse::Parse for ScalarInfo {
         let Some(name) = name else {
             return Err(input.error("Expected name"));
         };
-        Ok(Self::new(name.value(), alias.map(|i| i.value())))
+        Ok(Self::new(
+            name.value(),
+            alias.map(|i| i.value()),
+            argc,
+            deterministic,
+        ))
     }
 }

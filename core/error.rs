@@ -123,6 +123,9 @@ pub enum LimboError {
     UnsupportedEncoding(String),
     #[error("Out of memory")]
     OutOfMemory,
+    /// `sqlite3_result_error_code` and friends: the code reaches `sqlite3_step`, the message `sqlite3_errmsg`.
+    #[error("{message}")]
+    UserFunction { code: i32, message: String },
 }
 
 impl LimboError {
@@ -141,6 +144,7 @@ impl LimboError {
             Self::TooBig => 18,
             Self::NotADB => 26,
             Self::BlobHandleExpired => 4,
+            Self::UserFunction { code, .. } => *code,
             _ => 1,
         }
     }

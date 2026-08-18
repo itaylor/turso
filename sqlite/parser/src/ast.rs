@@ -1919,6 +1919,8 @@ pub enum PragmaName {
     Synchronous,
     /// Control where temporary tables and indices are stored (DEFAULT=0, FILE=1, MEMORY=2)
     TempStore,
+    /// `PRAGMA trusted_schema` (default ON)
+    TrustedSchema,
     /// returns information about the columns of an index
     IndexInfo,
     /// returns extended information about the columns of an index

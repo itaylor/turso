@@ -12,9 +12,9 @@ use std::{
 };
 use turso_core::{Connection, LimboError, StepResult};
 use turso_ext::{
-    AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarDerive,
-    ScalarFunc, ScalarFunction, StepFunction, Value as ExtValue, ValueDestructor,
-    ValueType as ExtValueType,
+    AggCtx, AggFunc, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode,
+    ScalarDerive, ScalarFunc, ScalarFunction, StepFunction, Value as ExtValue, ValueDestructor,
+    ValueType as ExtValueType, WindowInverseFunction, WindowValueFunction,
 };
 
 static CTX_CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -154,6 +154,8 @@ struct CallbackCounters {
     aggregate_steps: AtomicUsize,
     aggregate_finals: AtomicUsize,
     aggregate_drops: AtomicUsize,
+    aggregate_values: AtomicUsize,
+    aggregate_inverses: AtomicUsize,
 }
 
 struct ScalarContext {
@@ -504,6 +506,78 @@ fn register_context_aggregate(
     Ok(())
 }
 
+unsafe extern "C" fn managed_sum_value(context: usize, aggregate_context: *mut AggCtx) -> ExtValue {
+    let ctx = unsafe { &*(context as *const AggregateContext) };
+    ctx.counters
+        .aggregate_values
+        .fetch_add(1, AtomicOrdering::SeqCst);
+    let state = unsafe { sum_state(aggregate_context) };
+    ExtValue::from_integer(state.sum)
+}
+
+unsafe extern "C" fn managed_sum_inverse(
+    context: usize,
+    aggregate_context: *mut AggCtx,
+    argc: i32,
+    argv: *const ExtValue,
+) -> ExtValue {
+    let ctx = unsafe { &*(context as *const AggregateContext) };
+    ctx.counters
+        .aggregate_inverses
+        .fetch_add(1, AtomicOrdering::SeqCst);
+    let state = unsafe { sum_state(aggregate_context) };
+    if argc > 0 && !argv.is_null() {
+        let args = unsafe { std::slice::from_raw_parts(argv, argc as usize) };
+        state.sum -= args
+            .first()
+            .and_then(ExtValue::to_integer)
+            .unwrap_or_default();
+    }
+    ExtValue::null()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn register_context_window_aggregate(
+    conn: &Connection,
+    name: &str,
+    argc: i32,
+    flags: u32,
+    context: usize,
+    init: InitAggFunction,
+    step: StepFunction,
+    finalize: FinalizeFunction,
+    value: WindowValueFunction,
+    inverse: WindowInverseFunction,
+    context_destructor: Option<ContextDestructor>,
+    aggregate_destructor: Option<ContextDestructor>,
+    value_destructor: Option<ValueDestructor>,
+) -> anyhow::Result<()> {
+    let name = CString::new(name)?;
+    let api = unsafe { conn._build_turso_ext() };
+    let result = unsafe {
+        (api.register_window_function)(
+            api.ctx,
+            name.as_ptr(),
+            argc,
+            flags,
+            context,
+            init,
+            step,
+            finalize,
+            value,
+            inverse,
+            context_destructor,
+            aggregate_destructor,
+            value_destructor,
+        )
+    };
+    unsafe { conn._free_extension_ctx(api) };
+    if result != ResultCode::OK {
+        anyhow::bail!("managed window aggregate registration failed: {result}");
+    }
+    Ok(())
+}
+
 #[turso_macros::test]
 #[serial]
 fn managed_scalar_callbacks_cover_fixed_args_metadata_and_invalidation(
@@ -814,6 +888,89 @@ fn managed_aggregate_errors_leave_connection_usable(tmp_db: TempDatabase) -> any
     Ok(())
 }
 
+#[turso_macros::test]
+#[serial]
+fn managed_window_aggregate_runs_a_moving_frame(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let counters = Arc::new(CallbackCounters::default());
+    let conn = tmp_db.connect_limbo();
+
+    register_context_window_aggregate(
+        &conn,
+        "managed_window_sum",
+        1,
+        0,
+        boxed_aggregate_context(counters.clone()),
+        managed_sum_init,
+        managed_sum_step,
+        managed_sum_final,
+        managed_sum_value,
+        managed_sum_inverse,
+        Some(drop_aggregate_context),
+        Some(drop_sum_state),
+        None,
+    )?;
+
+    conn.execute("CREATE TABLE window_items(id INTEGER, value INTEGER)")?;
+    conn.execute("INSERT INTO window_items VALUES (1, 10), (2, 20), (3, 30), (4, 40)")?;
+
+    let moving: Vec<(i64, i64)> = conn.exec_rows(
+        "SELECT id, managed_window_sum(value) OVER (
+             ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+         ) FROM window_items ORDER BY id",
+    );
+    assert_eq!(moving, vec![(1, 10), (2, 30), (3, 50), (4, 70)]);
+    assert_eq!(counters.aggregate_values.load(AtomicOrdering::SeqCst), 4);
+    assert_eq!(counters.aggregate_inverses.load(AtomicOrdering::SeqCst), 2);
+
+    let plain: Vec<(i64,)> = conn.exec_rows("SELECT managed_window_sum(value) FROM window_items");
+    assert_eq!(plain, vec![(100,)]);
+
+    unregister_extension_function(&conn, "managed_window_sum")?;
+    assert_eq!(counters.context_drops.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(
+        counters.aggregate_inits.load(AtomicOrdering::SeqCst),
+        counters.aggregate_drops.load(AtomicOrdering::SeqCst)
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+#[serial]
+fn managed_window_registration_carries_its_flags(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let counters = Arc::new(CallbackCounters::default());
+    let conn = tmp_db.connect_limbo();
+
+    // 0x800 is SQLITE_DETERMINISTIC; unknown bits are dropped rather than rejected.
+    register_context_window_aggregate(
+        &conn,
+        "managed_flagged_sum",
+        1,
+        0x800 | 0x8000_0000,
+        boxed_aggregate_context(counters.clone()),
+        managed_sum_init,
+        managed_sum_step,
+        managed_sum_final,
+        managed_sum_value,
+        managed_sum_inverse,
+        Some(drop_aggregate_context),
+        Some(drop_sum_state),
+        None,
+    )?;
+
+    let function_list: Vec<(String, i64, String, String, i64, i64)> =
+        conn.exec_rows("PRAGMA function_list");
+    let metadata = function_list
+        .iter()
+        .find(|(name, _, _, _, _, _)| name == "managed_flagged_sum")
+        .expect("managed_flagged_sum should be listed");
+    assert_eq!(metadata.2, "a");
+    assert_eq!(metadata.4, 1);
+    assert_ne!(metadata.5 & 0x800, 0);
+
+    unregister_extension_function(&conn, "managed_flagged_sum")?;
+    Ok(())
+}
+
 unsafe extern "C" fn dotnet_nocase_collation(
     _context: usize,
     left_ptr: *const u8,
@@ -959,5 +1116,191 @@ fn custom_collations_cover_dotnet_create_collation_cases(
     assert_eq!(rows, vec![("ok".to_string(),)]);
     other_conn.unregister_external_collation("dotnet_nocase");
 
+    Ok(())
+}
+
+// Value subtypes across the C ABI
+
+/// `ExtValue` cannot be cloned because it owns whatever it points at.
+fn copy_ext_value(value: &ExtValue) -> ExtValue {
+    match value.value_type() {
+        ExtValueType::Null => ExtValue::null(),
+        ExtValueType::Integer => ExtValue::from_integer(value.to_integer().unwrap_or_default()),
+        ExtValueType::Float => ExtValue::from_float(value.to_float().unwrap_or_default()),
+        ExtValueType::Text => ExtValue::from_text(value.to_text().unwrap_or_default().to_string()),
+        ExtValueType::Blob => ExtValue::from_blob(value.to_blob().unwrap_or_default()),
+        ExtValueType::Error => ExtValue::error(ResultCode::Error),
+    }
+}
+
+#[turso_ext::scalar(name = "ext_tag_subtype", argc = 2)]
+fn ext_tag_subtype(args: &[ExtValue]) -> ExtValue {
+    let Some(value) = args.first() else {
+        return ExtValue::null();
+    };
+    let subtype = args
+        .get(1)
+        .and_then(ExtValue::to_integer)
+        .unwrap_or_default() as u8;
+    copy_ext_value(value).with_subtype(subtype)
+}
+
+#[turso_ext::scalar(name = "ext_read_subtype", argc = 1)]
+fn ext_read_subtype(args: &[ExtValue]) -> ExtValue {
+    let subtype = args.first().map(ExtValue::subtype).unwrap_or_default();
+    ExtValue::from_integer(subtype as i64)
+}
+
+#[derive(turso_ext::AggregateDerive)]
+struct ExtSubtypeSum;
+
+impl AggFunc for ExtSubtypeSum {
+    type State = i64;
+    type Error = &'static str;
+    const NAME: &'static str = "ext_subtype_sum";
+    const ARGS: i32 = 1;
+
+    fn step(state: &mut Self::State, args: &[ExtValue]) {
+        *state += args
+            .first()
+            .and_then(ExtValue::to_integer)
+            .unwrap_or_default();
+    }
+
+    fn finalize(state: Self::State) -> Result<ExtValue, Self::Error> {
+        Ok(ExtValue::from_integer(state).with_subtype(9))
+    }
+}
+
+fn register_subtype_scalars(conn: &Arc<Connection>) {
+    let api = unsafe { conn._build_turso_ext() };
+    assert_eq!(
+        unsafe { register_ext_tag_subtype(&api as *const _) },
+        ResultCode::OK
+    );
+    assert_eq!(
+        unsafe { register_ext_read_subtype(&api as *const _) },
+        ResultCode::OK
+    );
+    assert_eq!(
+        unsafe { ExtSubtypeSum::register_ExtSubtypeSum(&api as *const _) },
+        ResultCode::OK
+    );
+    unsafe { conn._free_extension_ctx(api) };
+}
+
+#[turso_macros::test]
+fn extension_scalar_tags_and_reads_a_subtype_on_every_value_type(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    register_subtype_scalars(&conn);
+
+    for literal in ["5", "1.5", "X'00'", "NULL", "'txt'"] {
+        let rows: Vec<(i64,)> = conn.exec_rows(&format!(
+            "SELECT ext_read_subtype(ext_tag_subtype({literal}, 42))"
+        ));
+        assert_eq!(rows, vec![(42,)], "subtype lost for {literal}");
+    }
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT ext_tag_subtype(5, 42)");
+    assert_eq!(rows, vec![(5,)]);
+    let rows: Vec<(String,)> = conn.exec_rows(
+        "SELECT typeof(ext_tag_subtype(5, 42)) || ',' || typeof(ext_tag_subtype('txt', 42))",
+    );
+    assert_eq!(rows, vec![("integer,text".to_string(),)]);
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT ext_read_subtype(5)");
+    assert_eq!(rows, vec![(0,)]);
+
+    conn.execute("CREATE TABLE t (v)")?;
+    conn.execute("INSERT INTO t VALUES (ext_tag_subtype(5, 42))")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT ext_read_subtype(v) FROM t");
+    assert_eq!(rows, vec![(0,)]);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn extension_sees_the_json_subtype_a_builtin_attached(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    register_subtype_scalars(&conn);
+
+    // 74 is 'J'.
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT ext_read_subtype(json('[1]'))");
+    assert_eq!(rows, vec![(74,)]);
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT ext_read_subtype(ext_tag_subtype('[1,2]', 74))");
+    assert_eq!(rows, vec![(74,)]);
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT typeof(ext_tag_subtype('[1,2]', 74))");
+    assert_eq!(rows, vec![("text".to_string(),)]);
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT json_valid(ext_tag_subtype('[1,2]', 74))");
+    assert_eq!(rows, vec![(1,)]);
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT json_quote(ext_tag_subtype('[1,2]', 74))");
+    assert_eq!(rows, vec![("[1,2]".to_string(),)]);
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT json_quote(ext_tag_subtype('[1,2]', 7))");
+    assert_eq!(rows, vec![("\"[1,2]\"".to_string(),)]);
+    Ok(())
+}
+
+struct NativeReadSubtype;
+
+impl turso_core::udf::ScalarFunction for NativeReadSubtype {
+    fn call(
+        &self,
+        ctx: &mut turso_core::udf::FunctionContext<'_>,
+        _args: &[turso_core::types::ValueRef<'_>],
+    ) -> turso_core::Result<turso_core::Value> {
+        Ok(turso_core::Value::from_i64(ctx.arg_subtype(0) as i64))
+    }
+}
+
+struct NativeTagSubtype;
+
+impl turso_core::udf::ScalarFunction for NativeTagSubtype {
+    fn call(
+        &self,
+        ctx: &mut turso_core::udf::FunctionContext<'_>,
+        args: &[turso_core::types::ValueRef<'_>],
+    ) -> turso_core::Result<turso_core::Value> {
+        let subtype = args.get(1).and_then(|v| v.as_int()).unwrap_or_default() as u8;
+        ctx.set_result_subtype(subtype);
+        Ok(args[0].to_owned()?)
+    }
+}
+
+#[turso_macros::test]
+fn native_and_extension_functions_exchange_subtypes(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    register_subtype_scalars(&conn);
+    conn.create_scalar_function(
+        "native_read_subtype",
+        1,
+        turso_core::udf::FunctionFlags::empty(),
+        NativeReadSubtype,
+    )?;
+    conn.create_scalar_function(
+        "native_tag_subtype",
+        2,
+        turso_core::udf::FunctionFlags::empty(),
+        NativeTagSubtype,
+    )?;
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT native_read_subtype(ext_tag_subtype(5, 42))");
+    assert_eq!(rows, vec![(42,)]);
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT ext_read_subtype(native_tag_subtype(5, 42))");
+    assert_eq!(rows, vec![(42,)]);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn extension_aggregate_result_carries_a_subtype(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    register_subtype_scalars(&conn);
+    conn.execute("CREATE TABLE nums (v)")?;
+    conn.execute("INSERT INTO nums VALUES (1), (2), (3)")?;
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT ext_subtype_sum(v) FROM nums");
+    assert_eq!(rows, vec![(6,)]);
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT ext_read_subtype(ext_subtype_sum(v)) FROM nums");
+    assert_eq!(rows, vec![(9,)]);
     Ok(())
 }

@@ -26,6 +26,8 @@ pub fn scalar(attr: TokenStream, input: TokenStream) -> TokenStream {
     let fn_name = &ast.sig.ident;
     let scalar_info = parse_macro_input!(attr as ScalarInfo);
     let name = &scalar_info.name;
+    let argc = scalar_info.argc;
+    let deterministic = scalar_info.deterministic;
     let register_fn_name = format_ident!("register_{}", fn_name);
     let args_variable_name = argument_name(&ast, 0, "args");
     let fn_body = &ast.block;
@@ -37,8 +39,8 @@ pub fn scalar(attr: TokenStream, input: TokenStream) -> TokenStream {
             (api.register_scalar_function)(
                 api.ctx,
                 alias_c_name.as_ptr(),
-                -1,
-                false,
+                #argc,
+                #deterministic,
                 0,
                 #fn_name,
                 None,
@@ -64,8 +66,8 @@ pub fn scalar(attr: TokenStream, input: TokenStream) -> TokenStream {
             (api.register_scalar_function)(
                 api.ctx,
                 c_name.as_ptr(),
-                -1,
-                false,
+                #argc,
+                #deterministic,
                 0,
                 #fn_name,
                 None,
@@ -165,8 +167,8 @@ pub fn derive_scalar(input: TokenStream) -> TokenStream {
             let rc = (api.register_scalar_function)(
                 api.ctx,
                 c_name.as_ptr(),
-                -1,
-                false,
+                <#struct_name as ::turso_ext::ScalarFunc>::ARGC,
+                <#struct_name as ::turso_ext::ScalarFunc>::DETERMINISTIC,
                 context,
                 #call_fn_name,
                 Some(#drop_fn_name),
@@ -189,8 +191,8 @@ pub fn derive_scalar(input: TokenStream) -> TokenStream {
                 let alias_rc = (api.register_scalar_function)(
                     api.ctx,
                     alias_c_name.as_ptr(),
-                    -1,
-                    false,
+                    <#struct_name as ::turso_ext::ScalarFunc>::ARGC,
+                    <#struct_name as ::turso_ext::ScalarFunc>::DETERMINISTIC,
                     alias_context,
                     #call_fn_name,
                     Some(#drop_fn_name),

@@ -26,6 +26,8 @@ mod stmt_journal;
 mod stmt_readonly;
 mod storage;
 mod trigger;
+mod udf;
+mod udf_registry;
 mod unreliable_io;
 mod wal;
 

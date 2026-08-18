@@ -1,7 +1,6 @@
 use crate::turso_debug_assert;
 use branches::{mark_unlikely, unlikely};
 use either::Either;
-use turso_ext::{AggCtx, ContextDestructor, FinalizeFunction, StepFunction, ValueDestructor};
 use turso_parser::ast::SortOrder;
 
 use crate::alloc::*;
@@ -17,8 +16,10 @@ use crate::storage::btree::CursorTrait;
 use crate::storage::sqlite3_ondisk::{
     read_integer, read_value, read_varint, varint_len, write_varint,
 };
+use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
+use crate::udf::AggregateState;
 use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
@@ -61,12 +62,27 @@ impl Display for ValueType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Subtype byte a function attached to a TEXT value (`sqlite3_value_subtype` numbering); 0 means none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum TextSubtype {
-    Text,
-    #[cfg(feature = "json")]
-    Json,
+pub struct TextSubtype(pub u8);
+
+#[allow(non_upper_case_globals)]
+impl TextSubtype {
+    pub const Text: Self = Self(0);
+    pub const Json: Self = Self(JSON_SUBTYPE);
+
+    pub const fn new(subtype: u8) -> Self {
+        Self(subtype)
+    }
+
+    pub const fn as_u8(self) -> u8 {
+        self.0
+    }
+
+    pub const fn is_json(self) -> bool {
+        self.0 == JSON_SUBTYPE
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +110,13 @@ impl Text {
         Self {
             value: value.into(),
             subtype: TextSubtype::Json,
+        }
+    }
+
+    pub fn with_subtype(value: impl Into<Cow<'static, str>>, subtype: u8) -> Self {
+        Self {
+            value: value.into(),
+            subtype: TextSubtype::new(subtype),
         }
     }
 
@@ -546,6 +569,29 @@ impl Value {
         Self::Text(Text::new(text))
     }
 
+    #[cfg(feature = "json")]
+    pub fn json_text(text: String) -> Self {
+        Self::Text(Text::json(text))
+    }
+
+    pub fn text_with_subtype(text: String, subtype: u8) -> Self {
+        Self::Text(Text::with_subtype(text, subtype))
+    }
+
+    /// No-op for anything but TEXT: only TEXT has room for a subtype inside the value.
+    #[must_use]
+    pub fn with_subtype(mut self, subtype: u8) -> Self {
+        if let Self::Text(text) = &mut self {
+            text.subtype = TextSubtype::new(subtype);
+        }
+        self
+    }
+
+    /// Only TEXT keeps a subtype inline; use `FunctionContext::arg_subtype` for a function argument of any type.
+    pub fn subtype(&self) -> u8 {
+        self.as_ref().subtype()
+    }
+
     pub fn to_blob(&self) -> Option<&[u8]> {
         match self {
             Self::Blob(blob) => Some(blob),
@@ -659,15 +705,39 @@ impl Value {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ExternalAggState {
-    pub context: usize,
-    pub state: *mut AggCtx,
-    pub argc: usize,
-    pub step_fn: StepFunction,
-    pub finalize_fn: FinalizeFunction,
-    pub aggregate_destructor: Option<ContextDestructor>,
-    pub value_destructor: Option<ValueDestructor>,
+/// Live accumulator of an external aggregate. `Register` is `Clone + PartialEq`, but an accumulator is
+/// neither, so clones alias one accumulator and equality is handle identity.
+#[derive(Clone)]
+pub struct ExternalAggHandle(Arc<crate::sync::Mutex<Option<Box<dyn AggregateState>>>>);
+
+impl ExternalAggHandle {
+    pub fn new(state: Box<dyn AggregateState>) -> Self {
+        Self(Arc::new(crate::sync::Mutex::new(Some(state))))
+    }
+
+    pub fn lock(&self) -> crate::sync::MutexGuard<'_, Option<Box<dyn AggregateState>>> {
+        self.0.lock()
+    }
+
+    pub fn take(&self) -> Option<Box<dyn AggregateState>> {
+        self.0.lock().take()
+    }
+
+    pub fn clear(&self) {
+        *self.0.lock() = None;
+    }
+}
+
+impl Debug for ExternalAggHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExternalAggHandle")
+    }
+}
+
+impl PartialEq for ExternalAggHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 /// Please use Display trait for all limbo output so we have single origin of truth
@@ -698,12 +768,19 @@ impl Value {
             Self::Null => ExtValue::null(),
             Self::Numeric(Numeric::Integer(i)) => ExtValue::from_integer(*i),
             Self::Numeric(Numeric::Float(fl)) => ExtValue::from_float(f64::from(*fl)),
-            Self::Text(text) => ExtValue::from_text(text.as_str().to_string()),
+            // Set both the subtype byte and the text flag: extensions built before the subtype byte existed only read the flag.
+            Self::Text(text) if text.subtype.is_json() => {
+                ExtValue::from_json(text.as_str().to_string())
+            }
+            Self::Text(text) => {
+                ExtValue::from_text(text.as_str().to_string()).with_subtype(text.subtype.as_u8())
+            }
             Self::Blob(blob) => ExtValue::from_blob(blob.to_vec()),
         }
     }
 
-    pub(crate) fn from_ffi_ref(v: &ExtValue) -> Result<Self> {
+    /// Copy an FFI value into an owned `Value` without freeing it. Public so sdk-kit can share it.
+    pub fn from_ffi_ref(v: &ExtValue) -> Result<Self> {
         match v.value_type() {
             ExtValueType::Null => Ok(Value::Null),
             ExtValueType::Integer => {
@@ -722,8 +799,9 @@ impl Value {
                 let Some(text) = v.to_text() else {
                     return Ok(Value::Null);
                 };
+                // Deliberately the text flag and not `is_json()`: C-ABI callers may leave the subtype byte uninitialized.
                 #[cfg(feature = "json")]
-                if v.is_json() {
+                if v.is_json_text() {
                     return Ok(Value::Text(Text::json(text.to_string())));
                 }
                 Ok(Value::build_text(text.to_string()))
@@ -897,8 +975,7 @@ pub enum AggContext {
     /// Built-in aggregates store state as a flat Vec<Value> payload.
     /// The layout depends on the aggregate function (see init_agg_payload).
     Builtin(Vec<Value>),
-    /// External (extension) aggregates need FFI state that can't be serialized.
-    External(ExternalAggState),
+    External(ExternalAggHandle),
 }
 
 impl TryClone for AggContext {
@@ -919,31 +996,13 @@ impl TryClone for AggContext {
                 }
                 Ok(Self::Builtin(values))
             }
+            // Shared, not copied: only one statement ever steps it.
             Self::External(_) => Ok(self.clone()),
         }
     }
 }
 
 impl AggContext {
-    pub fn compute_external(&self) -> Result<Value> {
-        if let Self::External(ext_state) = self {
-            let mut final_value =
-                unsafe { (ext_state.finalize_fn)(ext_state.context, ext_state.state) };
-            let value = Value::from_ffi_ref(&final_value);
-            if let Some(value_destructor) = ext_state.value_destructor {
-                unsafe { value_destructor(&mut final_value) };
-            } else {
-                unsafe { final_value.__free_internal_type() };
-            }
-            if let Some(aggregate_destructor) = ext_state.aggregate_destructor {
-                unsafe { aggregate_destructor(ext_state.state as usize) };
-            }
-            value
-        } else {
-            panic!("AggContext::compute_external() expected External, found {self:?}");
-        }
-    }
-
     /// Get a mutable reference to the builtin payload as a slice
     pub fn payload_mut(&mut self) -> &mut [Value] {
         match self {
@@ -2154,7 +2213,18 @@ impl<'a> Clone for ValueIterator<'a> {
     }
 }
 
+/// The subtype `json()` and friends stamp on their result (ASCII `J`); the only one the engine gives meaning to.
+pub const JSON_SUBTYPE: u8 = b'J';
+
 impl<'a> ValueRef<'a> {
+    /// The inline subtype (TEXT only). `FunctionContext::arg_subtype` is the general reader for function arguments.
+    pub fn subtype(&self) -> u8 {
+        match self {
+            Self::Text(text) => text.subtype.as_u8(),
+            _ => 0,
+        }
+    }
+
     pub fn from_f64(f: f64) -> Self {
         match NonNan::new(f) {
             Some(nn) => Self::Numeric(Numeric::Float(nn)),
@@ -2171,7 +2241,12 @@ impl<'a> ValueRef<'a> {
             Self::Null => ExtValue::null(),
             Self::Numeric(Numeric::Integer(i)) => ExtValue::from_integer(*i),
             Self::Numeric(Numeric::Float(fl)) => ExtValue::from_float(f64::from(*fl)),
-            Self::Text(text) => ExtValue::from_text(text.as_str().to_string()),
+            Self::Text(text) if text.subtype.is_json() => {
+                ExtValue::from_json(text.as_str().to_string())
+            }
+            Self::Text(text) => {
+                ExtValue::from_text(text.as_str().to_string()).with_subtype(text.subtype.as_u8())
+            }
             Self::Blob(blob) => ExtValue::from_blob(blob.to_vec()),
         }
     }

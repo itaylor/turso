@@ -888,6 +888,8 @@ pub fn fire_trigger(
 
     let saved_register_affinities = std::mem::take(&mut resolver.register_affinities);
     let saved_register_collations = std::mem::take(&mut resolver.register_collations);
+    // A trigger body is schema SQL.
+    let saved_schema_sql = resolver.begin_schema_sql();
     populate_trigger_register_affinities(resolver, ctx);
     let result = (|| -> Result<()> {
         // A trigger body is inlined and re-executed once per affected row. Any
@@ -973,6 +975,7 @@ pub fn fire_trigger(
         program.preassign_label_to_next_insn(firing_end);
         Ok(())
     })();
+    resolver.end_schema_sql(saved_schema_sql);
     resolver.register_affinities = saved_register_affinities;
     resolver.register_collations = saved_register_collations;
     result

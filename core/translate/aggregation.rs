@@ -1,15 +1,14 @@
 use turso_parser::ast;
 
 use crate::{
-    function::{AccumulatorFunc, AggFunc},
+    function::{AccumulatorFunc, AggFunc, ExternalAggCall},
     schema::Table,
-    sync::Arc,
     translate::collate::CollationSeq,
     vdbe::{
         builder::ProgramBuilder,
         insn::{AggStepData, HashDistinctData, Insn},
     },
-    LimboError, Result,
+    Result,
 };
 
 use super::{
@@ -453,7 +452,7 @@ pub fn translate_aggregation_step(
             let expr = &agg_arg_source.arg_at(0);
             let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
             let comparator =
-                super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
+                super::order_by::custom_type_comparator(expr, referenced_tables, resolver);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -475,7 +474,7 @@ pub fn translate_aggregation_step(
             let expr = &agg_arg_source.arg_at(0);
             let arg_collation = agg_arg_collation(referenced_tables, expr, resolver);
             let comparator =
-                super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema());
+                super::order_by::custom_type_comparator(expr, referenced_tables, resolver);
             program.emit_insn(Insn::AggStep {
                 data: Box::new(AggStepData {
                     acc_reg: target_register,
@@ -651,15 +650,11 @@ pub fn translate_aggregation_step(
             });
             target_register
         }
-        AggFunc::External(ref func) => {
-            let registered_argc = func.agg_args().map_err(|_| {
-                LimboError::ExtensionError(
-                    "External aggregate function called with wrong number of arguments".to_string(),
-                )
-            })?;
-            if registered_argc >= 0 && registered_argc as usize != num_args {
+        AggFunc::External(ref call) => {
+            if !call.func.matches_arg_count(num_args) {
                 crate::bail_parse_error!(
-                    "External aggregate function called with wrong number of arguments"
+                    "wrong number of arguments to function {}()",
+                    call.func.name()
                 );
             }
             let argc = num_args;
@@ -682,10 +677,10 @@ pub fn translate_aggregation_step(
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
-                    func: AccumulatorFunc::Agg(AggFunc::External(if registered_argc < 0 {
-                        Arc::new(func.with_aggregate_arg_count(num_args))
-                    } else {
-                        func.clone()
+                    // A variadic function can be called with a different count at every call site.
+                    func: AccumulatorFunc::Agg(AggFunc::External(ExternalAggCall {
+                        func: call.func.clone(),
+                        argc: num_args,
                     })),
                     comparator: None,
                     collation: None,

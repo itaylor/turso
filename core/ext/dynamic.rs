@@ -1,7 +1,7 @@
 use crate::{
     ext::{
         register_aggregate_function, register_scalar_function_with_options, register_vtab_module,
-        unregister_function,
+        register_window_function, unregister_function,
     },
     Connection, LimboError,
 };
@@ -11,7 +11,26 @@ use std::{
     ffi::{c_char, CString},
     sync::{Arc, Mutex, OnceLock},
 };
-use turso_ext::{ExtensionApi, ExtensionApiRef, ExtensionEntryPoint, ResultCode, VfsImpl};
+use turso_ext::{
+    ExtensionApi, ExtensionApiRef, ExtensionEntryPoint, ResultCode, VfsImpl, TURSO_EXT_API_VERSION,
+};
+
+/// Optional symbol an extension exports to report its ABI version.
+#[cfg(not(target_family = "wasm"))]
+type ExtensionApiVersionFn = unsafe extern "C" fn() -> u32;
+
+/// ABI version an extension speaks. `reported` is `None` when it exports no
+/// version symbol, which means version 1. An older extension is fine because
+/// the ABI only grows; a newer one may expect fields this host lacks.
+fn extension_abi_version(reported: Option<u32>, host: u32) -> crate::Result<u32> {
+    let version = reported.unwrap_or(1);
+    if version > host {
+        return Err(LimboError::ExtensionError(format!(
+            "extension built for turso_ext ABI v{version}, this build supports v{host}"
+        )));
+    }
+    Ok(version)
+}
 
 #[cfg(not(target_family = "wasm"))]
 type ExtensionStore = Vec<(Arc<Library>, ExtensionApiRef)>;
@@ -44,9 +63,15 @@ impl Connection {
     ) -> crate::Result<()> {
         use turso_ext::ExtensionApiRef;
 
-        let api = Box::new(unsafe { self._build_turso_ext() });
         let lib =
             unsafe { Library::new(path).map_err(|e| LimboError::ExtensionError(e.to_string()))? };
+        let reported_abi_version = unsafe {
+            lib.get::<ExtensionApiVersionFn>(b"turso_ext_api_version")
+                .ok()
+                .map(|version| version())
+        };
+        let abi_version = extension_abi_version(reported_abi_version, TURSO_EXT_API_VERSION)?;
+        let api = Box::new(unsafe { self.build_turso_ext_for_abi(abi_version) });
         let entry: Symbol<ExtensionEntryPoint> = unsafe {
             lib.get(b"register_extension")
                 .map_err(|e| LimboError::ExtensionError(e.to_string()))?
@@ -117,6 +142,8 @@ pub fn add_builtin_vfs_extensions(
                 builtin_vfs: vfslist.as_mut_ptr(),
                 builtin_vfs_count: 0,
             },
+            api_version: TURSO_EXT_API_VERSION,
+            register_window_function,
         },
         Some(mut api) => {
             api.vfs_interface.builtin_vfs = vfslist.as_mut_ptr();
@@ -186,4 +213,34 @@ pub fn get_vfs_modules() -> Vec<Vfs> {
         .lock()
         .unwrap()
         .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extension_abi_version;
+
+    #[test]
+    fn extension_without_a_version_symbol_is_the_first_abi() {
+        assert_eq!(extension_abi_version(None, 2).unwrap(), 1);
+    }
+
+    #[test]
+    fn extension_older_than_the_host_loads_at_its_own_version() {
+        assert_eq!(extension_abi_version(Some(1), 2).unwrap(), 1);
+        assert_eq!(extension_abi_version(Some(2), 5).unwrap(), 2);
+    }
+
+    #[test]
+    fn extension_matching_the_host_loads() {
+        assert_eq!(extension_abi_version(Some(2), 2).unwrap(), 2);
+    }
+
+    #[test]
+    fn extension_newer_than_the_host_is_refused() {
+        let err = extension_abi_version(Some(3), 2).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Extension error: extension built for turso_ext ABI v3, this build supports v2"
+        );
+    }
 }

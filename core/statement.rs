@@ -1278,6 +1278,18 @@ impl Statement {
         Ok(())
     }
 
+    /// `sqlite3_bind_pointer`: NULL to SQL, visible only to a function asking for the same `ptype` via
+    /// `FunctionContext::arg_pointer`. Rebinding the index or `clear_bindings` drops it.
+    pub fn bind_pointer(
+        &mut self,
+        index: NonZero<usize>,
+        object: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+        ptype: impl Into<std::borrow::Cow<'static, str>>,
+    ) -> Result<()> {
+        self.state.bind_pointer(index, object, ptype)?;
+        Ok(())
+    }
+
     /// Returns the SQL text with every parameter marker replaced by the
     /// literal of its currently bound value (NULL when unbound), following
     /// SQLite's sqlite3_expanded_sql rendering. The text is re-tokenized

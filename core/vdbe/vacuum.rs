@@ -377,12 +377,11 @@ pub(crate) fn finalize_vacuum_into_output(target: &VacuumTargetBuildContext) -> 
 pub(crate) fn mirror_symbols(source: &Connection, target: &Connection) {
     let source_syms = source.syms.read();
     let mut target_syms = target.syms.write();
-    target_syms.functions.extend(
-        source_syms
-            .functions
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone())),
-    );
+    for overloads in source_syms.functions.values() {
+        for func in overloads {
+            target_syms.insert_function(func.clone());
+        }
+    }
     target_syms.vtab_modules.extend(
         source_syms
             .vtab_modules

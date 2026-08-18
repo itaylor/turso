@@ -3532,8 +3532,8 @@ impl IndexMethodCursor for FtsCursor {
         let rowid_reg = values.last().ok_or_else(|| {
             LimboError::InternalError("FTS insert requires at least rowid".into())
         })?;
-        let rowid = match rowid_reg {
-            Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
+        let rowid = match rowid_reg.value() {
+            Some(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
             _ => {
                 return Err(LimboError::InternalError(
                     "FTS rowid must be integer".into(),
@@ -3545,11 +3545,10 @@ impl IndexMethodCursor for FtsCursor {
         doc.add_i64(self.rowid_field, rowid);
 
         for ((_col, field), reg) in self.text_fields.iter().zip(&values[..values.len() - 1]) {
-            match reg {
-                Register::Value(Value::Text(t)) => {
+            match reg.value() {
+                Some(Value::Text(t)) => {
                     doc.add_text(*field, t.as_str());
                 }
-                Register::Value(Value::Null) => continue,
                 _ => continue,
             }
         }
@@ -3576,8 +3575,8 @@ impl IndexMethodCursor for FtsCursor {
         let rowid_reg = values.last().ok_or_else(|| {
             LimboError::InternalError("FTS delete requires at least rowid".into())
         })?;
-        let rowid = match rowid_reg {
-            Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
+        let rowid = match rowid_reg.value() {
+            Some(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
             _ => {
                 return Err(LimboError::InternalError(
                     "FTS rowid must be integer".into(),
@@ -3619,15 +3618,15 @@ impl IndexMethodCursor for FtsCursor {
         }
 
         // values[0] = pattern index
-        let pattern_idx = match &values[0] {
-            Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
+        let pattern_idx = match values[0].value() {
+            Some(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
             _ => FTS_PATTERN_SCORE,
         };
         self.current_pattern = pattern_idx;
 
         // values[1] = query string
-        let query_str = match &values[1] {
-            Register::Value(Value::Text(t)) => t.as_str().to_string(),
+        let query_str = match values[1].value() {
+            Some(Value::Text(t)) => t.as_str().to_string(),
             _ => return Err(LimboError::InternalError("FTS query must be text".into())),
         };
 
@@ -3640,8 +3639,8 @@ impl IndexMethodCursor for FtsCursor {
             | FTS_PATTERN_MATCH_LIMIT
             | FTS_PATTERN_COMBINED_LIMIT
             | FTS_PATTERN_COMBINED_ORDERED_LIMIT => Some(if values.len() > 2 {
-                match &values[2] {
-                    Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
+                match values[2].value() {
+                    Some(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
                     _ => {
                         tracing::debug!(
                             "FTS query_start: LIMIT value is not an integer, using default 10"

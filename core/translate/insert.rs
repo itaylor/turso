@@ -1795,6 +1795,7 @@ fn emit_notnulls(
         // or if the column has no default value, then the ABORT algorithm is used
         if on_replace {
             if let Some(default_expr) = column_mapping.column.default.as_ref() {
+                resolver.check_schema_sql_expr(default_expr)?;
                 let skip_label = program.allocate_label();
 
                 program.emit_insn(Insn::NotNull {
@@ -1927,7 +1928,7 @@ fn resolve_defaults_in_row(
     table: &Table,
     columns: &[ast::Name],
     resolver: &Resolver,
-) {
+) -> Result<()> {
     let is_strict = table.is_strict();
     for (i, expr) in row.iter_mut().enumerate() {
         if !matches!(expr.as_ref(), Expr::Default) {
@@ -1954,7 +1955,10 @@ fn resolve_defaults_in_row(
             }),
             None => Box::new(ast::Expr::Literal(ast::Literal::Null)),
         };
+        // A DEFAULT expression is schema SQL.
+        resolver.check_schema_sql_expr(expr)?;
     }
+    Ok(())
 }
 
 #[turso_macros::trace_stack]
@@ -1993,18 +1997,21 @@ fn bind_insert(
                     })
                 })
                 .collect();
+            for value in &values {
+                resolver.check_schema_sql_expr(value)?;
+            }
         }
         InsertBody::Select(select, upsert_opt) => {
             // Resolve Expr::Default in all VALUES rows before any compilation.
             if let OneSelect::Values(values_expr) = &mut select.body.select {
                 for row in values_expr.iter_mut() {
-                    resolve_defaults_in_row(row, table, columns, resolver);
+                    resolve_defaults_in_row(row, table, columns, resolver)?;
                 }
             }
             for compound in select.body.compounds.iter_mut() {
                 if let OneSelect::Values(values_expr) = &mut compound.select {
                     for row in values_expr.iter_mut() {
-                        resolve_defaults_in_row(row, table, columns, resolver);
+                        resolve_defaults_in_row(row, table, columns, resolver)?;
                     }
                 }
             }
@@ -2364,6 +2371,9 @@ fn init_source_emission<'a>(
                     Box::new(ast::Expr::Literal(ast::Literal::Null))
                 })
             }));
+            for value in values.iter() {
+                resolver.check_schema_sql_expr(value)?;
+            }
             (
                 num_values,
                 program.alloc_cursor_id_keyed(
@@ -2810,9 +2820,11 @@ fn translate_column(
             dest_end: None,
         });
     } else if let Some(default_expr) = column.default.as_ref() {
+        resolver.check_schema_sql_expr(default_expr)?;
         translate_expr(program, None, default_expr, column_register, resolver)?;
     } else if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
         if let Some(default_expr) = resolved.default_expr() {
+            resolver.check_schema_sql_expr(default_expr)?;
             translate_expr(program, None, default_expr, column_register, resolver)?;
         } else {
             program.emit_insn(Insn::Null {

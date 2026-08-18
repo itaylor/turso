@@ -718,6 +718,11 @@ fn update_pragma(
             connection.set_check_constraints_ignored(enabled);
             Ok(TransactionMode::None)
         }
+        PragmaName::TrustedSchema => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_trusted_schema(enabled);
+            Ok(TransactionMode::None)
+        }
         #[cfg(target_vendor = "apple")]
         PragmaName::Fullfsync => {
             let enabled = parse_pragma_enabled(&value);
@@ -980,12 +985,9 @@ fn query_pragma(
             }
 
             // External (extension) functions
-            for (name, is_agg, argc, deterministic) in connection.get_syms_functions() {
+            for (name, is_agg, argc, func_flags) in connection.get_syms_functions() {
                 let func_type = if is_agg { "a" } else { "s" };
-                let mut flags = 0;
-                if deterministic {
-                    flags |= SQLITE_DETERMINISTIC;
-                }
+                let flags = func_flags.bits() as i64;
                 program.emit_string8(name, base_reg);
                 program.emit_int(0, base_reg + 1); // builtin = 0
                 program.emit_string8(func_type.to_string(), base_reg + 2);
@@ -1661,6 +1663,14 @@ fn query_pragma(
             let ignored = connection.check_constraints_ignored();
             let register = program.alloc_register();
             program.emit_int(ignored as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::TrustedSchema => {
+            let trusted = connection.trusted_schema();
+            let register = program.alloc_register();
+            program.emit_int(trusted as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)

@@ -2391,6 +2391,7 @@ impl Database {
             n_active_writes: AtomicI32::new(0),
             n_active_root_statements: AtomicI32::new(0),
             check_constraints_pragma: AtomicBool::new(false),
+            trusted_schema_pragma: AtomicBool::new(true),
             vtab_txn_states: RwLock::new(HashSet::default()),
             named_savepoints: RwLock::new(Vec::new()),
             schema_reparse_in_progress: AtomicBool::new(false),
@@ -2408,6 +2409,61 @@ impl Database {
 
     pub fn is_readonly(&self) -> bool {
         self.open_flags.contains(OpenFlags::ReadOnly)
+    }
+
+    /// Register a scalar function every connection opened after this call starts out with. SQLite has
+    /// no equivalent: a new connection copies the database's function table at connect time, so
+    /// already-open connections are not affected, and a connection-level registration of the same
+    /// name and arity shadows this one for that connection only.
+    pub fn create_scalar_function(
+        &self,
+        name: &str,
+        argc: i32,
+        flags: crate::udf::FunctionFlags,
+        f: impl crate::udf::ScalarFunction + 'static,
+    ) -> Result<()> {
+        crate::udf::validate_registration(name, argc)?;
+        let name = crate::util::normalize_ident(name);
+        self.register_function(Arc::new(crate::udf::ExternalFunc::new_scalar(
+            name,
+            argc,
+            flags,
+            Arc::new(f),
+        )))
+    }
+
+    /// Same inheritance rules as `create_scalar_function`.
+    pub fn create_aggregate_function(
+        &self,
+        name: &str,
+        argc: i32,
+        flags: crate::udf::FunctionFlags,
+        f: impl crate::udf::AggregateFunction + 'static,
+    ) -> Result<()> {
+        crate::udf::validate_registration(name, argc)?;
+        let name = crate::util::normalize_ident(name);
+        self.register_function(Arc::new(crate::udf::ExternalFunc::new_aggregate(
+            name,
+            argc,
+            flags,
+            Arc::new(f),
+        )))
+    }
+
+    /// The name is used as given; callers must normalize it first.
+    pub fn register_function(&self, func: Arc<crate::udf::ExternalFunc>) -> Result<()> {
+        crate::udf::validate_registration(func.name(), func.argc())?;
+        self.builtin_syms.write().insert_function(func);
+        Ok(())
+    }
+
+    /// Only connections opened after this call see the removal. Removing an unregistered function is
+    /// not an error, matching SQLite.
+    pub fn remove_function(&self, name: &str, argc: i32) -> Result<()> {
+        crate::udf::validate_registration(name, argc)?;
+        let name = crate::util::normalize_ident(name);
+        self.builtin_syms.write().remove_function(&name, argc);
+        Ok(())
     }
 
     /// Non-blocking read of the 512-byte database file header (page 1's

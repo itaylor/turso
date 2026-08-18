@@ -485,6 +485,8 @@ pub struct Connection {
     pub(crate) n_active_root_statements: AtomicI32,
     /// Whether pragma ignore_check_constraints=ON for this connection
     pub(super) check_constraints_pragma: AtomicBool,
+    /// `PRAGMA trusted_schema`, ON by default like SQLite.
+    pub(super) trusted_schema_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
     /// Connection-level named savepoint stack used to mirror savepoint state
@@ -1903,6 +1905,16 @@ impl Connection {
 
     pub fn check_constraints_ignored(&self) -> bool {
         self.check_constraints_pragma.load(Ordering::Acquire)
+    }
+
+    pub fn set_trusted_schema(&self, trusted: bool) {
+        self.trusted_schema_pragma.store(trusted, Ordering::Release);
+        // Compiled statements carry the decision.
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn trusted_schema(&self) -> bool {
+        self.trusted_schema_pragma.load(Ordering::Acquire)
     }
 
     pub(crate) fn clear_deferred_foreign_key_violations(&self) -> isize {
@@ -4417,25 +4429,14 @@ impl Connection {
         self.syms.read().vtab_modules.keys().cloned().collect()
     }
 
-    /// Returns external (extension) functions: (name, is_aggregate, argc, deterministic)
-    pub fn get_syms_functions(&self) -> Vec<(String, bool, i32, bool)> {
+    /// Returns external (extension) functions: (name, is_aggregate, argc, flags)
+    pub fn get_syms_functions(&self) -> Vec<(String, bool, i32, crate::udf::FunctionFlags)> {
         self.syms
             .read()
             .functions
             .values()
-            .map(|f| {
-                let is_agg = f.func.is_aggregate();
-                let argc = match &f.func {
-                    function::ExtFunc::Aggregate { argc, .. } => *argc,
-                    function::ExtFunc::Scalar { argc, .. } => *argc,
-                };
-                (
-                    f.name.clone(),
-                    is_agg,
-                    argc,
-                    function::Deterministic::is_deterministic(f.as_ref()),
-                )
-            })
+            .flatten()
+            .map(|f| (f.name().to_string(), f.is_aggregate(), f.argc(), f.flags()))
             .collect()
     }
 
@@ -5040,7 +5041,8 @@ pub type StepResult = vdbe::StepResult;
 
 #[derive(Default)]
 pub struct SymbolTable {
-    pub functions: HashMap<String, Arc<function::ExternalFunc>>,
+    /// Keyed by lowercase name; each name may carry several arities, at most one entry per argument count.
+    pub functions: HashMap<String, Vec<Arc<function::ExternalFunc>>>,
     pub collations: HashMap<u32, Arc<function::ExternalCollation>>,
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
     pub vtab_modules: HashMap<String, Arc<crate::ext::VTabImpl>>,
@@ -5088,20 +5090,56 @@ impl SymbolTable {
             index_methods: HashMap::default(),
         }
     }
+    /// An exact arity wins over a variadic registration, matching `sqlite3FindFunction`.
     pub fn resolve_function(
         &self,
         name: &str,
         arg_count: usize,
     ) -> Option<Arc<function::ExternalFunc>> {
-        self.functions
-            .get(name)
+        let overloads = self.functions.get(&crate::util::normalize_ident(name))?;
+        overloads
+            .iter()
+            .find(|func| func.argc() >= 0 && func.argc() as usize == arg_count)
+            .or_else(|| overloads.iter().find(|func| func.argc() < 0))
             .cloned()
-            .or_else(|| {
-                self.functions
-                    .get(&crate::util::normalize_ident(name))
-                    .cloned()
-            })
-            .filter(|func| func.func.matches_arg_count(arg_count))
+    }
+
+    /// Tells "no such function" apart from "wrong number of arguments".
+    pub fn function_exists(&self, name: &str) -> bool {
+        self.functions
+            .get(&crate::util::normalize_ident(name))
+            .is_some_and(|overloads| !overloads.is_empty())
+    }
+
+    pub fn insert_function(&mut self, func: Arc<function::ExternalFunc>) {
+        let overloads = self
+            .functions
+            .entry(crate::util::normalize_ident(func.name()))
+            .or_default();
+        match overloads.iter_mut().find(|f| f.argc() == func.argc()) {
+            Some(existing) => *existing = func,
+            None => overloads.push(func),
+        }
+    }
+
+    pub fn remove_function(&mut self, name: &str, argc: i32) -> bool {
+        let name = crate::util::normalize_ident(name);
+        let Some(overloads) = self.functions.get_mut(&name) else {
+            return false;
+        };
+        let before = overloads.len();
+        overloads.retain(|f| f.argc() != argc);
+        let removed = overloads.len() != before;
+        if overloads.is_empty() {
+            self.functions.remove(&name);
+        }
+        removed
+    }
+
+    pub fn remove_all_functions_named(&mut self, name: &str) -> bool {
+        self.functions
+            .remove(&crate::util::normalize_ident(name))
+            .is_some_and(|overloads| !overloads.is_empty())
     }
 
     pub fn resolve_collation(&self, name: &str) -> Option<CollationSeq> {
@@ -5124,8 +5162,10 @@ impl SymbolTable {
     }
 
     pub fn extend(&mut self, other: &SymbolTable) {
-        for (name, func) in &other.functions {
-            self.functions.insert(name.clone(), func.clone());
+        for overloads in other.functions.values() {
+            for func in overloads {
+                self.insert_function(func.clone());
+            }
         }
         for (id, collation) in &other.collations {
             self.collations.insert(*id, collation.clone());

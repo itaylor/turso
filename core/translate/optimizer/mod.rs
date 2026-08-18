@@ -4120,6 +4120,7 @@ mod tests {
             attached_databases,
             syms,
             true,
+            true,
             DoubleQuotedDml::Enabled,
             crate::sync::Arc::new(crate::dialect::SqliteDialect),
             &None,

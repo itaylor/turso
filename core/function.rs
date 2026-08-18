@@ -2,11 +2,9 @@ use crate::sync::Arc;
 use std::fmt;
 use std::fmt::{Debug, Display};
 use strum::IntoEnumIterator;
-use turso_ext::{
-    ContextDestructor, FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction,
-    ValueDestructor,
-};
+use turso_ext::ContextDestructor;
 
+pub use crate::udf::{ExternalAggCall, ExternalFunc};
 use crate::LimboError;
 
 pub type ContextCollationFunction = unsafe extern "C" fn(
@@ -19,11 +17,6 @@ pub type ContextCollationFunction = unsafe extern "C" fn(
 
 pub trait Deterministic: std::fmt::Display {
     fn is_deterministic(&self) -> bool;
-}
-
-pub struct ExternalFunc {
-    pub name: String,
-    pub func: ExtFunc,
 }
 
 pub struct ExternalCollation {
@@ -62,159 +55,6 @@ impl Debug for ExternalCollation {
         f.debug_struct("ExternalCollation")
             .field("name", &self.name)
             .finish()
-    }
-}
-
-impl Deterministic for ExternalFunc {
-    fn is_deterministic(&self) -> bool {
-        match self.func {
-            ExtFunc::Scalar { deterministic, .. } => deterministic,
-            _ => false,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum ExtFunc {
-    Scalar {
-        context: usize,
-        argc: i32,
-        deterministic: bool,
-        callback: ScalarFunction,
-        context_destructor: Option<ContextDestructor>,
-        value_destructor: Option<ValueDestructor>,
-    },
-    Aggregate {
-        context: usize,
-        argc: i32,
-        init: InitAggFunction,
-        step: StepFunction,
-        finalize: FinalizeFunction,
-        context_destructor: Option<ContextDestructor>,
-        aggregate_destructor: Option<ContextDestructor>,
-        value_destructor: Option<ValueDestructor>,
-    },
-}
-
-impl ExtFunc {
-    pub fn agg_args(&self) -> Result<i32, ()> {
-        if let ExtFunc::Aggregate { argc, .. } = self {
-            return Ok(*argc);
-        }
-        Err(())
-    }
-
-    pub fn matches_arg_count(&self, arg_count: usize) -> bool {
-        match self {
-            Self::Scalar { argc, .. } => *argc < 0 || *argc as usize == arg_count,
-            Self::Aggregate { argc, .. } => *argc < 0 || *argc as usize == arg_count,
-        }
-    }
-
-    pub fn is_aggregate(&self) -> bool {
-        matches!(self, Self::Aggregate { .. })
-    }
-
-    pub fn with_aggregate_arg_count(&self, arg_count: usize) -> Self {
-        match self {
-            Self::Aggregate {
-                context,
-                init,
-                step,
-                finalize,
-                aggregate_destructor,
-                value_destructor,
-                ..
-            } => Self::Aggregate {
-                context: *context,
-                argc: arg_count as i32,
-                init: *init,
-                step: *step,
-                finalize: *finalize,
-                context_destructor: None,
-                aggregate_destructor: *aggregate_destructor,
-                value_destructor: *value_destructor,
-            },
-            _ => self.clone(),
-        }
-    }
-}
-
-impl ExternalFunc {
-    pub fn new_scalar(
-        name: String,
-        argc: i32,
-        deterministic: bool,
-        context: usize,
-        callback: ScalarFunction,
-        context_destructor: Option<ContextDestructor>,
-        value_destructor: Option<ValueDestructor>,
-    ) -> Self {
-        Self {
-            name,
-            func: ExtFunc::Scalar {
-                context,
-                argc,
-                deterministic,
-                callback,
-                context_destructor,
-                value_destructor,
-            },
-        }
-    }
-
-    pub fn new_aggregate(
-        name: String,
-        argc: i32,
-        context: usize,
-        func: (InitAggFunction, StepFunction, FinalizeFunction),
-        context_destructor: Option<ContextDestructor>,
-        aggregate_destructor: Option<ContextDestructor>,
-        value_destructor: Option<ValueDestructor>,
-    ) -> Self {
-        Self {
-            name,
-            func: ExtFunc::Aggregate {
-                context,
-                argc,
-                init: func.0,
-                step: func.1,
-                finalize: func.2,
-                context_destructor,
-                aggregate_destructor,
-                value_destructor,
-            },
-        }
-    }
-}
-
-impl Drop for ExternalFunc {
-    fn drop(&mut self) {
-        match self.func {
-            ExtFunc::Scalar {
-                context,
-                context_destructor: Some(context_destructor),
-                ..
-            }
-            | ExtFunc::Aggregate {
-                context,
-                context_destructor: Some(context_destructor),
-                ..
-            } => unsafe { context_destructor(context) },
-            _ => {}
-        }
-    }
-}
-
-impl Debug for ExternalFunc {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.name)
-    }
-}
-
-impl Display for ExternalFunc {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.name)
     }
 }
 
@@ -457,7 +297,7 @@ pub enum AggFunc {
     #[strum(disabled)]
     PercentileDisc,
     #[strum(disabled)]
-    External(Arc<ExtFunc>),
+    External(ExternalAggCall),
 }
 
 #[derive(Debug, Clone, strum::EnumIter)]
@@ -474,7 +314,7 @@ pub enum WindowFunc {
     LastValue,
     NthValue,
     #[strum(disabled)]
-    External(Arc<ExtFunc>),
+    External(Arc<ExternalFunc>),
 }
 
 impl WindowFunc {
@@ -493,9 +333,7 @@ impl WindowFunc {
             Self::FirstValue => "first_value",
             Self::LastValue => "last_value",
             Self::NthValue => "nth_value",
-            Self::External(_) => unreachable!(
-                "WindowFunc::External is not constructible: ExtFunc has no Window variant"
-            ),
+            Self::External(_) => unreachable!("WindowFunc::External is never constructed"),
         }
     }
 
@@ -507,9 +345,7 @@ impl WindowFunc {
             Self::Ntile | Self::FirstValue | Self::LastValue => &[1],
             Self::NthValue => &[2],
             Self::Lag | Self::Lead => &[1, 2, 3],
-            Self::External(_) => unreachable!(
-                "WindowFunc::External is not constructible: ExtFunc has no Window variant"
-            ),
+            Self::External(_) => unreachable!("WindowFunc::External is never constructed"),
         }
     }
 
@@ -588,9 +424,7 @@ impl WindowFunc {
                 exclude: None,
             }),
             Self::FirstValue | Self::LastValue | Self::NthValue => None,
-            Self::External(_) => unreachable!(
-                "WindowFunc::External is not constructible: ExtFunc has no Window variant"
-            ),
+            Self::External(_) => unreachable!("WindowFunc::External is never constructed"),
         }
     }
 }
@@ -631,9 +465,7 @@ impl Deterministic for WindowFunc {
             | Self::FirstValue
             | Self::LastValue
             | Self::NthValue => true,
-            Self::External(_) => unreachable!(
-                "WindowFunc::External is not constructible: ExtFunc has no Window variant"
-            ),
+            Self::External(_) => unreachable!("WindowFunc::External is never constructed"),
         }
     }
 }
@@ -692,7 +524,9 @@ impl PartialEq for AggFunc {
             | (Self::Mode, Self::Mode)
             | (Self::PercentileCont, Self::PercentileCont)
             | (Self::PercentileDisc, Self::PercentileDisc) => true,
-            (Self::External(a), Self::External(b)) => Arc::ptr_eq(a, b),
+            (Self::External(a), Self::External(b)) => {
+                Arc::ptr_eq(&a.func, &b.func) && a.argc == b.argc
+            }
             _ => false,
         }
     }
@@ -730,10 +564,7 @@ impl AggFunc {
             Self::JsonGroupArray | Self::JsonbGroupArray => 1,
             #[cfg(feature = "json")]
             Self::JsonGroupObject | Self::JsonbGroupObject => 2,
-            Self::External(func) => func
-                .agg_args()
-                .map(|argc| argc.max(0) as usize)
-                .unwrap_or(0),
+            Self::External(call) => call.argc,
         }
     }
 
@@ -1569,6 +1400,14 @@ impl Deterministic for Func {
 }
 
 impl Func {
+    pub fn is_aggregate(&self) -> bool {
+        match self {
+            Self::Agg(_) => true,
+            Self::External(external_func) => external_func.is_aggregate(),
+            _ => false,
+        }
+    }
+
     pub fn supports_star_syntax(&self) -> bool {
         // Functions that need star expansion also support star syntax
         if self.needs_star_expansion() {
