@@ -268,14 +268,7 @@ impl DatabaseTape {
         tracing::debug!("opening replay session");
         let conn = self.connect(coro).await?;
         conn.execute("BEGIN IMMEDIATE")?;
-        Ok(DatabaseReplaySession {
-            conn: conn.clone(),
-            cached_delete_stmt: HashMap::new(),
-            cached_insert_stmt: HashMap::new(),
-            cached_update_stmt: HashMap::new(),
-            in_txn: true,
-            generator: DatabaseReplayGenerator { conn, opts },
-        })
+        Ok(DatabaseReplaySession::for_open_txn(conn, opts))
     }
 }
 
@@ -580,6 +573,11 @@ pub(crate) struct CachedStmt {
     info: ReplayInfo,
 }
 
+/// Applies [DatabaseTapeOperation]s to a database inside one transaction.
+///
+/// A batch is all-or-nothing: the first operation that cannot be applied rolls
+/// back the transaction and makes every later operation, commit included, fail
+/// too. The caller stays at its previous revision and can retry the same batch.
 pub struct DatabaseReplaySession {
     pub(crate) conn: Arc<turso_core::Connection>,
     pub(crate) cached_delete_stmt: HashMap<(String, bool), CachedStmt>,
@@ -587,6 +585,8 @@ pub struct DatabaseReplaySession {
     pub(crate) cached_update_stmt: HashMap<(String, Vec<bool>), CachedStmt>,
     pub(crate) in_txn: bool,
     pub(crate) generator: DatabaseReplayGenerator,
+    /// Error which stopped the batch, if any.
+    failed: Option<String>,
 }
 
 async fn replay_stmt<Ctx>(
@@ -603,6 +603,46 @@ async fn replay_stmt<Ctx>(
 }
 
 impl DatabaseReplaySession {
+    /// Builds a session for a write transaction already open on `conn`.
+    pub(crate) fn for_open_txn(
+        conn: Arc<turso_core::Connection>,
+        opts: DatabaseReplaySessionOpts,
+    ) -> Self {
+        Self {
+            conn: conn.clone(),
+            cached_delete_stmt: HashMap::new(),
+            cached_insert_stmt: HashMap::new(),
+            cached_update_stmt: HashMap::new(),
+            in_txn: true,
+            generator: DatabaseReplayGenerator { conn, opts },
+            failed: None,
+        }
+    }
+
+    /// Aborts the batch, rolling back everything applied so far.
+    fn fail(&mut self, error: Error) -> Error {
+        let message = error.to_string();
+        tracing::error!("replay: aborting batch after failed operation: {message}");
+        self.failed = Some(message.clone());
+        if !self.in_txn {
+            return error;
+        }
+        if self.conn.is_nested_stmt() {
+            // An outer owner (a raw WAL session) holds the transaction and
+            // discards the batch itself; ROLLBACK here would only desync it.
+            return error;
+        }
+        match self.conn.execute("ROLLBACK") {
+            Ok(()) => {
+                self.in_txn = false;
+                error
+            }
+            Err(rollback_error) => Error::DatabaseTapeError(format!(
+                "{message}; additionally failed to roll back the replay transaction: {rollback_error}"
+            )),
+        }
+    }
+
     fn clear_cached_statements(&mut self) {
         self.cached_delete_stmt.clear();
         self.cached_insert_stmt.clear();
@@ -624,7 +664,25 @@ impl DatabaseReplaySession {
     pub fn conn(&self) -> Arc<turso_core::Connection> {
         self.conn.clone()
     }
+    /// Applies a single operation. A failure aborts the whole batch; see
+    /// [DatabaseReplaySession].
     pub async fn replay<Ctx>(
+        &mut self,
+        coro: &Coro<Ctx>,
+        operation: DatabaseTapeOperation,
+    ) -> Result<()> {
+        if let Some(failed) = &self.failed {
+            return Err(Error::DatabaseTapeError(format!(
+                "replay batch was already aborted and cannot apply or commit anything else: {failed}"
+            )));
+        }
+        match self.replay_operation(coro, operation).await {
+            Ok(()) => Ok(()),
+            Err(error) => Err(self.fail(error)),
+        }
+    }
+
+    async fn replay_operation<Ctx>(
         &mut self,
         coro: &Coro<Ctx>,
         operation: DatabaseTapeOperation,
@@ -908,7 +966,8 @@ mod tests {
 
     use crate::{
         database_tape::{
-            run_stmt_once, DatabaseChangesIteratorOpts, DatabaseReplaySessionOpts, DatabaseTape,
+            run_stmt_once, DatabaseChangesIteratorOpts, DatabaseReplaySession,
+            DatabaseReplaySessionOpts, DatabaseTape,
         },
         types::{
             Coro, DatabaseSchemaKind, DatabaseSchemaReplay, DatabaseStatementReplay,
@@ -1362,7 +1421,7 @@ mod tests {
                 let opts = DatabaseReplaySessionOpts {
                     use_implicit_rowid: true,
                 };
-                let mut session = db.start_replay_session(&coro, opts).await.unwrap();
+                let mut session = db.start_replay_session(&coro, opts.clone()).await.unwrap();
                 session
                     .replay(
                         &coro,
@@ -1381,32 +1440,50 @@ mod tests {
                     )
                     .await
                     .unwrap();
+                session
+                    .replay(&coro, DatabaseTapeOperation::Commit)
+                    .await
+                    .unwrap();
+
                 // A delete without projection or before image on a table whose
                 // PRIMARY KEY is not the rowid must be refused: the local
                 // rowid may not match the remote's, so a rowid-based delete
-                // could remove the wrong row.
-                let refused = session
-                    .replay(
-                        &coro,
-                        DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
-                            change_id: 2,
-                            change_time: 2,
-                            table_name: "q".to_string(),
-                            id: 8,
-                            change: DatabaseTapeRowChangeType::Delete {
-                                before: crate::alloc::vec![],
-                                key: None,
-                            },
-                        }),
-                    )
-                    .await;
+                // could remove the wrong row. The refusal aborts its whole
+                // batch, so it gets a session of its own.
+                let mut refused_session =
+                    db.start_replay_session(&coro, opts.clone()).await.unwrap();
+                let rowid_delete = DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                    change_id: 2,
+                    change_time: 2,
+                    table_name: "q".to_string(),
+                    id: 8,
+                    change: DatabaseTapeRowChangeType::Delete {
+                        before: crate::alloc::vec![],
+                        key: None,
+                    },
+                });
+                let refused = refused_session.replay(&coro, rowid_delete).await;
                 let err = format!("{:?}", refused.expect_err("rowid fallback must be refused"));
                 assert!(
                     err.contains("refusing rowid-based replay"),
                     "unexpected error for refused rowid fallback: {err}"
                 );
+                let after_refusal = format!(
+                    "{:?}",
+                    refused_session
+                        .replay(&coro, DatabaseTapeOperation::Commit)
+                        .await
+                        .expect_err("an aborted batch must not commit")
+                );
+                assert!(
+                    after_refusal.contains("already aborted"),
+                    "unexpected error after an aborted batch: {after_refusal}"
+                );
+                drop(refused_session);
+
                 // Tables with no PRIMARY KEY have the rowid as their only
                 // identity: the fallback is exact and stays allowed.
+                let mut session = db.start_replay_session(&coro, opts).await.unwrap();
                 session
                     .replay(
                         &coro,
@@ -3407,6 +3484,623 @@ mod tests {
             rows,
             vec!["a|1|right".to_string(), "b|2|left".to_string()],
             "the swap must keep both rows"
+        );
+    }
+
+    // UDFs are registered per-connection and never travel over sync: the CDC
+    // table records the row image *after* a statement ran. The tests below
+    // stand in for a push+pull round trip by capturing changes on one
+    // `DatabaseTape` and replaying them into a second one.
+
+    fn register_triple(conn: &Arc<turso_core::Connection>) {
+        conn.create_scalar_function(
+            "triple",
+            1,
+            turso_core::FunctionFlags::DETERMINISTIC,
+            |_ctx: &mut turso_core::FunctionContext<'_>,
+             args: &[turso_core::ValueRef<'_>]|
+             -> turso_core::Result<turso_core::Value> {
+                let turso_core::ValueRef::Numeric(turso_core::Numeric::Integer(x)) = args[0] else {
+                    panic!("expected integer argument");
+                };
+                Ok(turso_core::Value::from_i64(x * 3))
+            },
+        )
+        .unwrap();
+    }
+
+    /// The destination never needs the function registered to receive rows a
+    /// UDF computed on the source.
+    #[test]
+    pub fn sync_replays_scalar_udf_output_as_plain_values() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let db_path2 = temp_file2.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db1 =
+            turso_core::Database::open_file(io.clone(), db_path1, Arc::new(SqliteDialect)).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let db2 =
+            turso_core::Database::open_file(io.clone(), db_path2, Arc::new(SqliteDialect)).unwrap();
+        let db2 = Arc::new(DatabaseTape::new(db2));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db1 = db1.clone();
+            let db2 = db2.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn1 = db1.connect(&coro).await.unwrap();
+                register_triple(&conn1);
+                conn1.execute("CREATE TABLE t(x)").unwrap();
+                conn1
+                    .execute("INSERT INTO t(x) VALUES (triple(1)), (triple(2)), (triple(3))")
+                    .unwrap();
+
+                let conn2 = db2.connect(&coro).await.unwrap();
+                conn2.execute("CREATE TABLE t(x)").unwrap();
+                let no_such_function = conn2.prepare("SELECT triple(1)").unwrap_err();
+                assert!(
+                    no_such_function.to_string().contains("no such function"),
+                    "sanity check: destination must really not have triple() registered, got {no_such_function}"
+                );
+
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    };
+                    let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
+                    let opts = Default::default();
+                    let mut iterator = db1.iterate_changes(opts).unwrap();
+                    while let Some(operation) = iterator.next(&coro).await.unwrap() {
+                        session.replay(&coro, operation).await.unwrap();
+                    }
+                }
+
+                let mut stmt = conn2.prepare("SELECT x FROM t ORDER BY x").unwrap();
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                rows
+            }
+        });
+        let rows = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        };
+        assert_eq!(
+            rows,
+            vec![
+                vec![turso_core::Value::from_i64(3)],
+                vec![turso_core::Value::from_i64(6)],
+                vec![turso_core::Value::from_i64(9)],
+            ],
+            "sync must ship the values triple() computed, never the call itself"
+        );
+    }
+
+    async fn read_rows(
+        coro: &Coro<()>,
+        conn: &Arc<turso_core::Connection>,
+        sql: &str,
+    ) -> Vec<Vec<turso_core::Value>> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let mut rows = Vec::new();
+        while let Some(row) = run_stmt_once(coro, &mut stmt).await.unwrap() {
+            rows.push(row.get_values().cloned().collect::<Vec<_>>());
+        }
+        rows
+    }
+
+    fn register_udf_double(conn: &Arc<turso_core::Connection>) {
+        conn.create_scalar_function(
+            "udf_double",
+            1,
+            turso_core::FunctionFlags::DETERMINISTIC,
+            |_ctx: &mut turso_core::FunctionContext<'_>,
+             args: &[turso_core::ValueRef<'_>]|
+             -> turso_core::Result<turso_core::Value> {
+                let turso_core::ValueRef::Numeric(turso_core::Numeric::Integer(x)) = args[0] else {
+                    panic!("expected integer argument");
+                };
+                Ok(turso_core::Value::from_i64(x * 2))
+            },
+        )
+        .unwrap();
+    }
+
+    /// Replay re-executes `CREATE INDEX ... (udf_double(x))` on the
+    /// destination, so a destination without the function must refuse the
+    /// whole batch: rows of `t` are only correct where `t_idx` can be
+    /// maintained too. Registering the function and retrying must converge.
+    #[test]
+    pub fn sync_replay_of_expression_index_needs_the_function_on_destination() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let db_path2 = temp_file2.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db1 =
+            turso_core::Database::open_file(io.clone(), db_path1, Arc::new(SqliteDialect)).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+        let db2 =
+            turso_core::Database::open_file(io.clone(), db_path2, Arc::new(SqliteDialect)).unwrap();
+        let db2 = Arc::new(DatabaseTape::new(db2));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db1 = db1.clone();
+            let db2 = db2.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn1 = db1.connect(&coro).await.unwrap();
+                register_udf_double(&conn1);
+                conn1.execute("CREATE TABLE t(x INTEGER)").unwrap();
+                conn1
+                    .execute("CREATE INDEX t_idx ON t(udf_double(x))")
+                    .unwrap();
+                conn1.execute("INSERT INTO t(x) VALUES (1), (2)").unwrap();
+
+                let changes_opts = || DatabaseChangesIteratorOpts {
+                    ignore_schema_changes: false,
+                    ..Default::default()
+                };
+                let replay_opts = || DatabaseReplaySessionOpts {
+                    use_implicit_rowid: false,
+                };
+
+                // Destination without the function: record where it breaks.
+                let conn2 = db2.connect(&coro).await.unwrap();
+                let mut outcomes: Vec<(String, Option<String>)> = Vec::new();
+                {
+                    let mut session = db2
+                        .start_replay_session(&coro, replay_opts())
+                        .await
+                        .unwrap();
+                    let mut iterator = db1.iterate_changes(changes_opts()).unwrap();
+                    while let Some(operation) = iterator.next(&coro).await.unwrap() {
+                        let desc = format!("{operation:?}");
+                        let error = session
+                            .replay(&coro, operation)
+                            .await
+                            .err()
+                            .map(|error| error.to_string());
+                        outcomes.push((desc, error));
+                    }
+                }
+                let schema_after_failure = read_rows(
+                    &coro,
+                    &conn2,
+                    "SELECT type, name FROM sqlite_schema WHERE tbl_name = 't' ORDER BY type",
+                )
+                .await;
+                let rows_after_failure =
+                    read_rows(&coro, &conn2, "SELECT x FROM t ORDER BY x").await;
+
+                // Retry the same tape after registering the function. It must
+                // go on the replay session's own connection: registration is
+                // per-connection and the session opens its own.
+                let conn2_retry = {
+                    let mut session = db2
+                        .start_replay_session(&coro, replay_opts())
+                        .await
+                        .unwrap();
+                    register_udf_double(&session.conn());
+                    let mut iterator = db1.iterate_changes(changes_opts()).unwrap();
+                    while let Some(operation) = iterator.next(&coro).await.unwrap() {
+                        session.replay(&coro, operation).await.unwrap();
+                    }
+                    session.conn()
+                };
+                let schema_after_retry = read_rows(
+                    &coro,
+                    &conn2_retry,
+                    "SELECT type, name FROM sqlite_schema WHERE tbl_name = 't' ORDER BY type",
+                )
+                .await;
+                let rows_after_retry =
+                    read_rows(&coro, &conn2_retry, "SELECT x FROM t ORDER BY x").await;
+                let integrity_after_retry =
+                    read_rows(&coro, &conn2_retry, "PRAGMA integrity_check").await;
+
+                (
+                    outcomes,
+                    schema_after_failure,
+                    rows_after_failure,
+                    schema_after_retry,
+                    rows_after_retry,
+                    integrity_after_retry,
+                )
+            }
+        });
+        let (
+            outcomes,
+            schema_after_failure,
+            rows_after_failure,
+            schema_after_retry,
+            rows_after_retry,
+            integrity_after_retry,
+        ) = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        };
+
+        tracing::info!("replay outcomes without the function: {:?}", outcomes);
+        let first_failure = outcomes
+            .iter()
+            .position(|(_, error)| error.is_some())
+            .expect(
+                "replaying a schema that needs udf_double() must not silently succeed on a \
+                 destination that cannot maintain the index",
+            );
+        let first_error = outcomes[first_failure].1.as_ref().unwrap();
+        assert!(
+            first_error.contains("no such function: udf_double"),
+            "expected a \"no such function: udf_double\" failure, got {first_error}"
+        );
+        assert!(
+            first_failure + 1 < outcomes.len(),
+            "the tape must still hold operations after the failing CREATE INDEX: {outcomes:?}"
+        );
+        for (desc, error) in &outcomes[first_failure + 1..] {
+            let error = error
+                .as_ref()
+                .unwrap_or_else(|| panic!("operation after an aborted batch must fail: {desc}"));
+            assert!(
+                error.contains("already aborted"),
+                "unexpected error after an aborted batch ({desc}): {error}"
+            );
+        }
+
+        assert_eq!(
+            schema_after_failure,
+            vec![vec![
+                turso_core::Value::Text(turso_core::types::Text::new("table")),
+                turso_core::Value::Text(turso_core::types::Text::new("t")),
+            ]],
+            "the aborted batch must leave no trace of t_idx on the destination"
+        );
+        assert_eq!(
+            rows_after_failure,
+            Vec::<Vec<turso_core::Value>>::new(),
+            "rows whose index could not be built must not be committed"
+        );
+
+        assert_eq!(
+            schema_after_retry,
+            vec![
+                vec![
+                    turso_core::Value::Text(turso_core::types::Text::new("index")),
+                    turso_core::Value::Text(turso_core::types::Text::new("t_idx")),
+                ],
+                vec![
+                    turso_core::Value::Text(turso_core::types::Text::new("table")),
+                    turso_core::Value::Text(turso_core::types::Text::new("t")),
+                ],
+            ]
+        );
+        assert_eq!(
+            rows_after_retry,
+            vec![
+                vec![turso_core::Value::from_i64(1)],
+                vec![turso_core::Value::from_i64(2)],
+            ]
+        );
+        assert_eq!(
+            integrity_after_retry,
+            vec![vec![turso_core::Value::Text(turso_core::types::Text::new(
+                "ok"
+            ))]],
+            "the replayed index must agree with the replayed table"
+        );
+    }
+
+    /// Replay upserts over primary-key conflicts on purpose, but a row the
+    /// destination's own constraints reject aborts the batch instead.
+    #[test]
+    pub fn sync_replay_aborts_the_batch_when_a_row_breaks_a_destination_constraint() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let db_path2 = temp_file2.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db1 =
+            turso_core::Database::open_file(io.clone(), db_path1, Arc::new(SqliteDialect)).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+        let db2 =
+            turso_core::Database::open_file(io.clone(), db_path2, Arc::new(SqliteDialect)).unwrap();
+        let db2 = Arc::new(DatabaseTape::new(db2));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db1 = db1.clone();
+            let db2 = db2.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn1 = db1.connect(&coro).await.unwrap();
+                conn1.execute("CREATE TABLE t(x INTEGER)").unwrap();
+                // One statement, so both rows land in the same replay batch.
+                conn1.execute("INSERT INTO t(x) VALUES (1), (50)").unwrap();
+
+                // The destination's table is stricter: x = 50 cannot be stored.
+                let conn2 = db2.connect(&coro).await.unwrap();
+                conn2
+                    .execute("CREATE TABLE t(x INTEGER CHECK (x < 10))")
+                    .unwrap();
+
+                let mut outcomes: Vec<(String, Option<String>)> = Vec::new();
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    };
+                    let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
+                    let mut iterator = db1.iterate_changes(Default::default()).unwrap();
+                    while let Some(operation) = iterator.next(&coro).await.unwrap() {
+                        let desc = format!("{operation:?}");
+                        let error = session
+                            .replay(&coro, operation)
+                            .await
+                            .err()
+                            .map(|error| error.to_string());
+                        outcomes.push((desc, error));
+                    }
+                }
+                let rows_after_failure =
+                    read_rows(&coro, &conn2, "SELECT x FROM t ORDER BY x").await;
+
+                // Retry the same tape once the row is no longer rejected.
+                conn2.execute("DROP TABLE t").unwrap();
+                conn2.execute("CREATE TABLE t(x INTEGER)").unwrap();
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    };
+                    let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
+                    let mut iterator = db1.iterate_changes(Default::default()).unwrap();
+                    while let Some(operation) = iterator.next(&coro).await.unwrap() {
+                        session.replay(&coro, operation).await.unwrap();
+                    }
+                }
+                let rows_after_retry = read_rows(&coro, &conn2, "SELECT x FROM t ORDER BY x").await;
+
+                (outcomes, rows_after_failure, rows_after_retry)
+            }
+        });
+        let (outcomes, rows_after_failure, rows_after_retry) = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        };
+
+        tracing::info!("replay outcomes against the stricter table: {:?}", outcomes);
+        let first_failure = outcomes
+            .iter()
+            .position(|(_, error)| error.is_some())
+            .expect("a row the destination rejects must fail the replay");
+        let first_error = outcomes[first_failure].1.as_ref().unwrap();
+        assert!(
+            first_error.to_lowercase().contains("check constraint"),
+            "expected a CHECK constraint failure, got {first_error}"
+        );
+        assert!(
+            first_failure + 1 < outcomes.len(),
+            "the tape must still hold operations after the rejected row: {outcomes:?}"
+        );
+        for (desc, error) in &outcomes[first_failure + 1..] {
+            let error = error
+                .as_ref()
+                .unwrap_or_else(|| panic!("operation after an aborted batch must fail: {desc}"));
+            assert!(
+                error.contains("already aborted"),
+                "unexpected error after an aborted batch ({desc}): {error}"
+            );
+        }
+        assert_eq!(
+            rows_after_failure,
+            Vec::<Vec<turso_core::Value>>::new(),
+            "the accepted rows of an aborted batch must roll back with it"
+        );
+        assert_eq!(
+            rows_after_retry,
+            vec![
+                vec![turso_core::Value::from_i64(1)],
+                vec![turso_core::Value::from_i64(50)],
+            ],
+            "retrying the same tape after the destination accepts the row must converge"
+        );
+    }
+
+    /// Under a nested-program guard the transaction belongs to an outer owner,
+    /// so the session must not roll back itself, but must still refuse every
+    /// later operation.
+    #[test]
+    pub fn sync_replay_leaves_rollback_to_the_owner_of_a_nested_transaction() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db =
+            turso_core::Database::open_file(io.clone(), db_path, Arc::new(SqliteDialect)).unwrap();
+        let db = Arc::new(DatabaseTape::new(db));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db = db.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db.connect(&coro).await.unwrap();
+                conn.execute("CREATE TABLE t(x INTEGER CHECK (x < 10))")
+                    .unwrap();
+
+                // Mimic the raw WAL apply path: the caller owns the
+                // transaction and marks the connection as nested.
+                conn.execute("BEGIN IMMEDIATE").unwrap();
+                conn.start_nested();
+                let mut session = DatabaseReplaySession::for_open_txn(
+                    conn.clone(),
+                    DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    },
+                );
+                let rejected = session
+                    .replay(
+                        &coro,
+                        DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                            change_id: 1,
+                            change_time: 1,
+                            table_name: "t".to_string(),
+                            id: 1,
+                            change: DatabaseTapeRowChangeType::Insert {
+                                after: crate::alloc::vec![turso_core::Value::from_i64(50)],
+                            },
+                        }),
+                    )
+                    .await
+                    .expect_err("the rejected row must fail the replay");
+                let owner_still_in_txn = !conn.get_auto_commit();
+                let after_failure = session
+                    .replay(&coro, DatabaseTapeOperation::Commit)
+                    .await
+                    .expect_err("an aborted batch must not commit");
+                conn.end_nested();
+                conn.execute("ROLLBACK").unwrap();
+
+                (
+                    rejected.to_string(),
+                    owner_still_in_txn,
+                    after_failure.to_string(),
+                )
+            }
+        });
+        let (rejected, owner_still_in_txn, after_failure) = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        };
+        assert!(
+            rejected.to_lowercase().contains("check constraint"),
+            "expected a CHECK constraint failure, got {rejected}"
+        );
+        assert!(
+            owner_still_in_txn,
+            "the session must leave the nested transaction to its owner"
+        );
+        assert!(
+            after_failure.contains("already aborted"),
+            "unexpected error after an aborted batch: {after_failure}"
+        );
+    }
+
+    /// An aggregate UDF reads replayed rows the same way it reads local ones.
+    #[test]
+    pub fn sync_replayed_rows_work_with_aggregate_udf_once_registered_on_both_sides() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let db_path2 = temp_file2.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db1 =
+            turso_core::Database::open_file(io.clone(), db_path1, Arc::new(SqliteDialect)).unwrap();
+        let db1 = Arc::new(DatabaseTape::new(db1));
+
+        let db2 =
+            turso_core::Database::open_file(io.clone(), db_path2, Arc::new(SqliteDialect)).unwrap();
+        let db2 = Arc::new(DatabaseTape::new(db2));
+
+        fn register_udf_sum(conn: &Arc<turso_core::Connection>) {
+            conn.create_aggregate_function(
+                "udf_sum",
+                1,
+                turso_core::FunctionFlags::empty(),
+                turso_core::aggregate_from_fns(
+                    || 0i64,
+                    |state: &mut i64,
+                     args: &[turso_core::ValueRef<'_>]|
+                     -> turso_core::Result<()> {
+                        if let turso_core::ValueRef::Numeric(turso_core::Numeric::Integer(x)) =
+                            args[0]
+                        {
+                            *state += x;
+                        }
+                        Ok(())
+                    },
+                    |state: i64| -> turso_core::Result<turso_core::Value> {
+                        Ok(turso_core::Value::from_i64(state))
+                    },
+                ),
+            )
+            .unwrap();
+        }
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db1 = db1.clone();
+            let db2 = db2.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn1 = db1.connect(&coro).await.unwrap();
+                conn1.execute("CREATE TABLE t(x)").unwrap();
+                conn1
+                    .execute("INSERT INTO t(x) VALUES (1), (2), (3), (4)")
+                    .unwrap();
+
+                let conn2 = db2.connect(&coro).await.unwrap();
+                conn2.execute("CREATE TABLE t(x)").unwrap();
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    };
+                    let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
+                    let opts = Default::default();
+                    let mut iterator = db1.iterate_changes(opts).unwrap();
+                    while let Some(operation) = iterator.next(&coro).await.unwrap() {
+                        session.replay(&coro, operation).await.unwrap();
+                    }
+                }
+
+                // Registered on each side only after the rows synced across.
+                register_udf_sum(&conn1);
+                register_udf_sum(&conn2);
+
+                let mut stmt = conn1.prepare("SELECT udf_sum(x) FROM t").unwrap();
+                let source = run_stmt_once(&coro, &mut stmt)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get_values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+
+                let mut stmt = conn2.prepare("SELECT udf_sum(x) FROM t").unwrap();
+                let dest = run_stmt_once(&coro, &mut stmt)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get_values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+
+                (source, dest)
+            }
+        });
+        let (source, dest) = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        };
+        assert_eq!(source, vec![turso_core::Value::from_i64(10)]);
+        assert_eq!(
+            dest, source,
+            "the aggregate over synced rows must agree with the source"
         );
     }
 }
