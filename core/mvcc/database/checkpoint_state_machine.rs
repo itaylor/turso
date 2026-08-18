@@ -3372,11 +3372,13 @@ mod tests {
                         sort_order: SortOrder::Asc,
                         collation: CollationSeq::Binary,
                         nulls_order: None,
+                        custom_collation: None,
                     },
                     KeyInfo {
                         sort_order: SortOrder::Asc,
                         collation: CollationSeq::Binary,
                         nulls_order: None,
+                        custom_collation: None,
                     },
                 ],
                 true,

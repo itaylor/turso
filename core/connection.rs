@@ -4478,14 +4478,7 @@ impl Connection {
         &self,
         collation: CollationSeq,
     ) -> Result<Arc<function::ExternalCollation>> {
-        self.syms
-            .read()
-            .collations
-            .get(&collation.id())
-            .cloned()
-            .ok_or_else(|| {
-                LimboError::ParseError(format!("no such collation sequence: {}", collation.name()))
-            })
+        self.syms.read().get_external_collation(collation)
     }
 
     pub(crate) fn custom_collation_compare(
@@ -5116,6 +5109,18 @@ impl SymbolTable {
         self.collations
             .contains_key(&collation.id())
             .then_some(collation)
+    }
+
+    pub(crate) fn get_external_collation(
+        &self,
+        collation: CollationSeq,
+    ) -> Result<Arc<function::ExternalCollation>> {
+        self.collations
+            .get(&collation.id())
+            .cloned()
+            .ok_or_else(|| {
+                LimboError::ParseError(format!("no such collation sequence: {}", collation.name()))
+            })
     }
 
     pub fn extend(&mut self, other: &SymbolTable) {

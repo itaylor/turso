@@ -888,18 +888,17 @@ fn custom_collations_cover_dotnet_create_collation_cases(
     );
     assert_eq!(min_max, vec![("ALPHA".to_string(), "Gamma".to_string())]);
 
+    // Naming an unregistered collation in the schema is covered in tests/integration/custom_collations.rs.
+    conn.execute("CREATE TABLE collated(value TEXT COLLATE dotnet_nocase)")?;
+    conn.execute("CREATE INDEX collated_idx ON names(value COLLATE dotnet_nocase)")?;
     let err = conn
-        .execute("CREATE TABLE bad(value TEXT COLLATE dotnet_nocase)")
+        .execute("CREATE TABLE bad(value TEXT COLLATE dotnet_missing)")
         .unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("custom collations are not supported"));
-    let err = conn
-        .execute("CREATE INDEX bad_idx ON names(value COLLATE dotnet_nocase)")
-        .unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("custom collations are not supported"));
+    assert!(
+        err.to_string()
+            .contains("no such collation sequence: dotnet_missing"),
+        "{err}"
+    );
 
     conn.execute("CREATE TABLE left_values(value TEXT)")?;
     conn.execute("CREATE TABLE right_values(value TEXT)")?;
@@ -935,16 +934,7 @@ fn custom_collations_cover_dotnet_create_collation_cases(
     );
     let joined: Vec<(i64,)> = conn.exec_rows(join_sql);
     assert_eq!(joined, vec![(1000,)]);
-    let explain_rows = limbo_exec_rows(&conn, &format!("EXPLAIN {join_sql}"));
-    let has_hash = explain_rows.iter().any(|row| {
-        row.get(1).is_some_and(|value| {
-            matches!(value, SqliteValue::Text(op) if op == "HashBuild" || op == "HashProbe")
-        })
-    });
-    assert!(
-        !has_hash,
-        "custom collations must not use binary-hashed joins"
-    );
+    // Hash tables compare text through the connection's collation callback, so a hash join is correct here.
 
     let other_conn = tmp_db.connect_limbo();
     other_conn.register_external_collation(

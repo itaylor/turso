@@ -1399,11 +1399,7 @@ impl Directory for HybridBTreeDirectory {
 
 /// Creates default `KeyInfo` for BTree index columns.
 fn key_info() -> KeyInfo {
-    KeyInfo {
-        sort_order: SortOrder::Asc,
-        collation: CollationSeq::Binary,
-        nulls_order: None,
-    }
+    KeyInfo::new(SortOrder::Asc, CollationSeq::Binary, None)
 }
 
 /// Parse field weights from a string like "body=2.0,title=1.0"

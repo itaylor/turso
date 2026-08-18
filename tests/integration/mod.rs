@@ -5,6 +5,7 @@ mod attach;
 mod checkpoint_crash_atomicity;
 mod common;
 mod conflict_resolution;
+mod custom_collations;
 mod custom_types;
 mod database;
 mod expr_depth_stack_overflow;

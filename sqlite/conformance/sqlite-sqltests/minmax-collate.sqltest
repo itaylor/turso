@@ -1,0 +1,245 @@
+@database :memory:
+
+# min() / max() / nullif() COLLATION
+# These three pick their collation at compile time: the first argument with a
+# defined collation, left to right. A plain column counts (it defaults to
+# BINARY) and stops the search; BINARY when no argument offers one.
+
+setup minmax_collate_schema {
+    CREATE TABLE t(a, n TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('a', 'a');
+}
+
+# -----------------------------------------------------------------------
+# One test per column of the query that exposed the bug: an all-BINARY
+# comparator gave `a` everywhere instead of picking up NOCASE.
+# -----------------------------------------------------------------------
+
+@setup minmax_collate_schema
+test minmax_collate_max_literal_first_explicit_nocase {
+    SELECT max('a', 'B' COLLATE NOCASE) FROM t;
+}
+expect {
+    B
+}
+
+@setup minmax_collate_schema
+test minmax_collate_max_binary_column_first_explicit_nocase_second {
+    SELECT max(a, 'B' COLLATE NOCASE) FROM t;
+}
+expect {
+    a
+}
+
+@setup minmax_collate_schema
+test minmax_collate_max_nocase_column_first {
+    SELECT max(n, 'B') FROM t;
+}
+expect {
+    B
+}
+
+@setup minmax_collate_schema
+test minmax_collate_max_binary_column_before_nocase_column {
+    SELECT max(a, n) FROM t;
+}
+expect {
+    a
+}
+
+@setup minmax_collate_schema
+test minmax_collate_max_three_args_explicit_nocase_last {
+    SELECT max(1, 'a', 'B' COLLATE NOCASE) FROM t;
+}
+expect {
+    B
+}
+
+@setup minmax_collate_schema
+test minmax_collate_nullif_literal_explicit_nocase_equal {
+    SELECT nullif('a', 'A' COLLATE NOCASE) FROM t;
+}
+expect {
+}
+
+@setup minmax_collate_schema
+test minmax_collate_nullif_binary_column_explicit_nocase_not_equal {
+    SELECT nullif(a, 'A' COLLATE NOCASE) FROM t;
+}
+expect {
+    a
+}
+
+@setup minmax_collate_schema
+test minmax_collate_nullif_nocase_column_vs_literal_equal {
+    SELECT nullif(n, 'A') FROM t;
+}
+expect {
+}
+
+@setup minmax_collate_schema
+test minmax_collate_min_nocase_column_first {
+    SELECT min(n, 'B') FROM t;
+}
+expect {
+    a
+}
+
+@setup minmax_collate_schema
+test minmax_collate_min_binary_column_first {
+    SELECT min(a, 'B') FROM t;
+}
+expect {
+    B
+}
+
+# -----------------------------------------------------------------------
+# A NOCASE column loses to a preceding plain column (which counts as BINARY)
+# but wins over a preceding literal, which offers no collation.
+# -----------------------------------------------------------------------
+
+@setup minmax_collate_schema
+test minmax_collate_max_literal_before_nocase_column {
+    SELECT max('B', n) FROM t;
+}
+expect {
+    B
+}
+
+@setup minmax_collate_schema
+test minmax_collate_min_literal_before_nocase_column {
+    SELECT min('B', n) FROM t;
+}
+expect {
+    a
+}
+
+# -----------------------------------------------------------------------
+# Three-argument forms.
+# -----------------------------------------------------------------------
+
+@setup minmax_collate_schema
+test minmax_collate_max_three_args_nocase_column_in_middle {
+    SELECT max('B', n, 'c') FROM t;
+}
+expect {
+    c
+}
+
+@setup minmax_collate_schema
+test minmax_collate_max_three_args_binary_column_first_wins {
+    SELECT max(a, 'B', n) FROM t;
+}
+expect {
+    a
+}
+
+test minmax_collate_min_three_args_explicit_nocase_last {
+    SELECT min(1, 'a', 'B' COLLATE NOCASE);
+}
+expect {
+    1
+}
+
+test minmax_collate_min_three_args_explicit_nocase_first {
+    SELECT min('B' COLLATE NOCASE, 1, 'a');
+}
+expect {
+    1
+}
+
+# -----------------------------------------------------------------------
+# nullif() with column collations, both argument orders.
+# -----------------------------------------------------------------------
+
+@setup minmax_collate_schema
+test minmax_collate_nullif_nocase_column_then_binary_column {
+    SELECT nullif(n, a) FROM t;
+}
+expect {
+}
+
+@setup minmax_collate_schema
+test minmax_collate_nullif_binary_column_then_nocase_column {
+    SELECT nullif(a, n) FROM t;
+}
+expect {
+}
+
+@setup minmax_collate_schema
+test minmax_collate_nullif_literal_then_nocase_column_not_equal {
+    SELECT nullif('B', n) FROM t;
+}
+expect {
+    B
+}
+
+# -----------------------------------------------------------------------
+# Collation only matters between two text values; the cross-type ordering is
+# unaffected, and any NULL argument makes min()/max() NULL.
+# -----------------------------------------------------------------------
+
+test minmax_collate_max_mixed_numeric_text {
+    SELECT max(1, 'a');
+}
+expect {
+    a
+}
+
+test minmax_collate_min_mixed_numeric_text {
+    SELECT min(1, 'a');
+}
+expect {
+    1
+}
+
+test minmax_collate_max_null_argument_in_middle_is_null {
+    SELECT max(1, NULL, 'a');
+}
+expect {
+}
+
+test minmax_collate_max_null_first_argument_is_null {
+    SELECT max(NULL, 1);
+}
+expect {
+}
+
+test minmax_collate_nullif_both_null {
+    SELECT nullif(NULL, NULL);
+}
+expect {
+}
+
+test minmax_collate_nullif_mixed_types_not_equal {
+    SELECT nullif(1, 'a');
+}
+expect {
+    1
+}
+
+# -----------------------------------------------------------------------
+# Ties are asymmetric: max() keeps the FIRST of equal values, min() the LAST.
+# An RTRIM tie makes this observable; quote() shows the trailing spaces.
+# -----------------------------------------------------------------------
+
+setup minmax_collate_rtrim_schema {
+    CREATE TABLE t2(x TEXT COLLATE RTRIM);
+    INSERT INTO t2 VALUES ('a');
+}
+
+@setup minmax_collate_rtrim_schema
+test minmax_collate_min_rtrim_tie_keeps_last_argument {
+    SELECT quote(min(x, 'a  ')) FROM t2;
+}
+expect {
+    'a  '
+}
+
+@setup minmax_collate_rtrim_schema
+test minmax_collate_max_rtrim_tie_keeps_first_argument {
+    SELECT quote(max(x, 'a  ')) FROM t2;
+}
+expect {
+    'a'
+}

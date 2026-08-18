@@ -1526,6 +1526,15 @@ pub fn insn_to_row(
                     )
                 },
             ),
+            Insn::CollSeq { collation } => (
+                "CollSeq",
+                0,
+                0,
+                0,
+                Value::build_text(collation.to_string()),
+                0,
+                "".to_string(),
+            ),
             Insn::InitCoroutine {
                 yield_reg,
                 jump_on_definition,

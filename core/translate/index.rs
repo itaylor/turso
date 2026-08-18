@@ -974,14 +974,13 @@ fn extract_collation<'a>(
         match current {
             Expr::Collate(inner, seq) => {
                 if coll.is_none() {
-                    let collation = match resolver {
+                    // With a resolver this is CREATE INDEX, where an unregistered collation is an error (SQLite's
+                    // `!db->init.busy && !sqlite3LocateCollSeq()`); without one we are reading the schema back and
+                    // the name is kept as a token.
+                    coll = Some(match resolver {
                         Some(resolver) => resolver.resolve_collation(seq.as_str())?,
-                        None => CollationSeq::new(seq.as_str())?,
-                    };
-                    if collation.is_custom() {
-                        crate::bail_parse_error!("custom collations are not supported in indexes");
-                    }
-                    coll = Some(collation);
+                        None => CollationSeq::from_schema_sql(seq.as_str()),
+                    });
                 }
                 current = inner.as_ref();
             }

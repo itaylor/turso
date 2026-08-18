@@ -1261,6 +1261,12 @@ pub fn translate_alter_table(
                     }
                 }
             }
+            // Adding a column is a CREATE, so an unresolvable collation name is an error, as in CREATE TABLE.
+            for c in &col_def.constraints {
+                if let ast::ColumnConstraint::Collate { collation_name } = &c.constraint {
+                    resolver.resolve_collation(collation_name.as_str())?;
+                }
+            }
             let constraints = col_def.constraints.clone();
             let mut column = Column::try_from(&col_def)?;
 

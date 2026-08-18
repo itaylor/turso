@@ -3,7 +3,9 @@ use crate::function::{AccumulatorFunc, AggFunc, WindowFunc};
 use crate::schema::{BTreeCharacteristics, BTreeTable, Index, IndexColumn, Table};
 use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
-use crate::translate::collate::{get_collseq_from_expr, CollationSeq};
+use crate::translate::collate::{
+    get_collseq_from_expr, get_collseq_from_expr_with_symbols, CollationSeq,
+};
 use crate::translate::emitter::{Resolver, TranslateCtx};
 use crate::translate::expr::{
     expr_contains_nondeterministic_scalar_function, translate_expr, translate_expr_no_constant_opt,
@@ -17,7 +19,7 @@ use crate::translate::plan::{
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::result_row::emit_select_result;
 use crate::translate::subquery::plan_subqueries_from_select_plan;
-use crate::types::KeyInfo;
+use crate::types::{KeyCollations, KeyInfo};
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
@@ -26,6 +28,7 @@ use crate::vdbe::insn::{
 use crate::vdbe::{BranchOffset, CursorID};
 use crate::Connection;
 use crate::Result;
+use crate::SymbolTable;
 use crate::{turso_assert, turso_assert_eq};
 use std::mem;
 use turso_parser::ast::Name;
@@ -918,16 +921,20 @@ pub struct WindowCursors {
 fn build_order_by_key_info(
     window: &Window,
     table_references: &crate::translate::plan::TableReferences,
+    symbol_table: &SymbolTable,
 ) -> crate::Result<Vec<KeyInfo>> {
     window
         .order_by
         .iter()
         .map(|(expr, _, _)| {
-            let collation = get_collseq_from_expr(expr, table_references)?.unwrap_or_default();
+            let collation =
+                get_collseq_from_expr_with_symbols(expr, table_references, Some(symbol_table))?
+                    .unwrap_or_default();
             Ok(KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation,
                 nulls_order: None,
+                custom_collation: KeyCollations::Symbols(symbol_table).resolve(collation)?,
             })
         })
         .collect()
@@ -1404,7 +1411,14 @@ impl EmitWindow {
         let minmax = meta.minmax.clone();
 
         emit_load_order_by_columns(program, window, &registers);
-        emit_flush_buffer_if_new_partition(program, &labels, &registers, window, plan)?;
+        emit_flush_buffer_if_new_partition(
+            program,
+            &labels,
+            &registers,
+            window,
+            plan,
+            t_ctx.resolver.symbol_table,
+        )?;
 
         // `rowid_reg` was NULL'd at partition entry; it stays NULL until the
         // first Insert of this partition. That tells the two branches apart:
@@ -1676,6 +1690,7 @@ impl EmitWindow {
                 program,
                 window,
                 &plan.table_references,
+                t_ctx.resolver.symbol_table,
                 registers.new_order_by_columns_start,
                 registers.source_peer_values,
                 label_step_end,
@@ -1880,6 +1895,7 @@ fn emit_if_new_peer(
     program: &mut ProgramBuilder,
     window: &Window,
     table_references: &TableReferences,
+    symbol_table: &SymbolTable,
     reg_new: Option<usize>,
     reg_old: Option<usize>,
     target_if_peer: BranchOffset,
@@ -1902,7 +1918,7 @@ fn emit_if_new_peer(
         start_reg_a: reg_a,
         start_reg_b: reg_b,
         count: order_by_len,
-        key_info: build_order_by_key_info(window, table_references)?,
+        key_info: build_order_by_key_info(window, table_references, symbol_table)?,
     });
     program.emit_insn(Insn::Jump {
         target_pc_lt: label_new_peer,
@@ -1977,6 +1993,7 @@ fn emit_flush_buffer_if_new_partition(
     registers: &WindowRegisters,
     window: &Window,
     plan: &SelectPlan,
+    symbol_table: &SymbolTable,
 ) -> Result<()> {
     if let Some(reg_partition_start) = registers.partition_start {
         let same_partition_label = program.allocate_label();
@@ -1993,11 +2010,7 @@ fn emit_flush_buffer_if_new_partition(
             "compare partition keys to detect new partition",
         );
         let mut compare_key_info = (0..partition_by_len)
-            .map(|_| KeyInfo {
-                sort_order: SortOrder::Asc,
-                collation: CollationSeq::default(),
-                nulls_order: None,
-            })
+            .map(|_| KeyInfo::new(SortOrder::Asc, CollationSeq::default(), None))
             .collect::<Vec<_>>();
         for (i, c) in compare_key_info
             .iter_mut()
@@ -2013,8 +2026,13 @@ fn emit_flush_buffer_if_new_partition(
                 .iter()
                 .find(|e| matches!(e, Expr::Column { column, .. } if *column == i))
                 .unwrap_or(&window.partition_by[i]);
-            let maybe_collation = get_collseq_from_expr(expr, &plan.table_references)?;
+            let maybe_collation = get_collseq_from_expr_with_symbols(
+                expr,
+                &plan.table_references,
+                Some(symbol_table),
+            )?;
             c.collation = maybe_collation.unwrap_or_default();
+            c.custom_collation = KeyCollations::Symbols(symbol_table).resolve(c.collation)?;
         }
         program.emit_insn(Insn::Compare {
             start_reg_a: registers.src_columns_start,
@@ -2421,7 +2439,11 @@ fn emit_window_full_scan(
                     start_reg_a: reg_a,
                     start_reg_b: reg_b,
                     count: order_by_len,
-                    key_info: build_order_by_key_info(window, &plan.table_references)?,
+                    key_info: build_order_by_key_info(
+                        window,
+                        &plan.table_references,
+                        t_ctx.resolver.symbol_table,
+                    )?,
                 });
                 program.emit_insn(Insn::Jump {
                     target_pc_lt: label_step,
@@ -2977,6 +2999,7 @@ fn emit_window_op(
             program,
             window,
             &plan.table_references,
+            t_ctx.resolver.symbol_table,
             temp_start,
             peer_ref_reg,
             label_continue,

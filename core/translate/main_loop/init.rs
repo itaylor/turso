@@ -86,8 +86,9 @@ impl InitLoop {
                 1,
                 "DISTINCT aggregate functions must have exactly one argument"
             );
+            // The DISTINCT dedup keys off the argument's own collation, not the whole `agg(DISTINCT arg)` call.
             let collations = vec![get_collseq_from_expr_with_symbols(
-                &agg.original_expr,
+                &agg.args[0],
                 tables,
                 Some(t_ctx.resolver.symbol_table),
             )?

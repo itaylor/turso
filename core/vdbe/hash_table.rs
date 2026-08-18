@@ -11,7 +11,7 @@ use crate::{
         Arc, RwLock,
     },
     translate::collate::CollationSeq,
-    types::{IOCompletions, IOResult, Value, ValueRef},
+    types::{IOCompletions, IOResult, KeyInfo, Value, ValueRef},
     vdbe::metrics::HashJoinMetrics,
     CompletionError, Numeric, Result,
 };
@@ -41,6 +41,11 @@ const FLOAT_HASH: u8 = 2;
 const TEXT_HASH: u8 = 3;
 const BLOB_HASH: u8 = 4;
 
+/// `KeyInfo` for a built-in collation. Hash tables never order keys, so only the collation matters.
+pub fn key_collation(collation: CollationSeq) -> KeyInfo {
+    KeyInfo::new(turso_parser::ast::SortOrder::Asc, collation, None)
+}
+
 #[inline]
 /// Hash text case-insensitively without allocation (ASCII-only for SQLite NOCASE).
 /// SQLite's NOCASE collation only considers ASCII case, so to_ascii_lowercase() is correct.
@@ -56,7 +61,7 @@ fn hash_text_nocase(hasher: &mut impl Hasher, text: &str) {
 
 /// Hash function for join keys using rapidhash
 /// Takes collation into account when hashing text values
-fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
+fn hash_join_key(key_values: &[ValueRef], collations: &[KeyInfo]) -> u64 {
     let mut hasher = RapidHasher::new(DEFAULT_SEED);
 
     for (idx, value) in key_values.iter().enumerate() {
@@ -83,9 +88,11 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
                 hasher.write(&bits.to_le_bytes());
             }
             ValueRef::Text(text) => {
-                let collation = collations.get(idx).unwrap_or(&CollationSeq::Binary);
+                let collation = collations
+                    .get(idx)
+                    .map_or(CollationSeq::Binary, |key| key.collation);
                 hasher.write_u8(TEXT_HASH);
-                match *collation {
+                match collation {
                     CollationSeq::NoCase => {
                         hash_text_nocase(&mut hasher, text.as_str());
                     }
@@ -100,9 +107,8 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
                         hasher.write(&collation.hash_key(text.as_str()));
                     }
                     CollationSeq::Custom(_) => {
-                        unreachable!(
-                            "custom collations are rejected before hash table construction"
-                        )
+                        // A custom collation callback can declare any two strings equal, and no hash can mirror that, so
+                        // hash only the TEXT tag: every text value lands in one bucket and the callback decides equality.
                     }
                 }
             }
@@ -137,13 +143,13 @@ fn has_null_key_ref(key_values: &[ValueRef]) -> bool {
 }
 
 /// Check if two key value arrays are equal, taking collation into account.
-fn keys_equal(key1: &[Value], key2: &[ValueRef], collations: &[CollationSeq]) -> bool {
+fn keys_equal(key1: &[Value], key2: &[ValueRef], collations: &[KeyInfo]) -> bool {
     if key1.len() != key2.len() {
         return false;
     }
+    let binary = key_collation(CollationSeq::Binary);
     for (idx, (v1, v2)) in key1.iter().zip(key2.iter()).enumerate() {
-        let collation = collations.get(idx).copied().unwrap_or(CollationSeq::Binary);
-        if !values_equal(v1.as_ref(), *v2, collation) {
+        if !values_equal(v1.as_ref(), *v2, collations.get(idx).unwrap_or(&binary)) {
             return false;
         }
     }
@@ -152,7 +158,7 @@ fn keys_equal(key1: &[Value], key2: &[ValueRef], collations: &[CollationSeq]) ->
 
 /// Check if two values are equal, using the specified collation for text comparison.
 /// NOTE: In SQL, NULL = NULL evaluates to NULL (falsy), so this returns false for NULL comparisons.
-fn values_equal(v1: ValueRef, v2: ValueRef, collation: CollationSeq) -> bool {
+fn values_equal(v1: ValueRef, v2: ValueRef, collation: &KeyInfo) -> bool {
     match (v1, v2) {
         // NULL = NULL is false in SQL (actually NULL, which is falsy)
         (ValueRef::Null, _) | (_, ValueRef::Null) => false,
@@ -161,15 +167,14 @@ fn values_equal(v1: ValueRef, v2: ValueRef, collation: CollationSeq) -> bool {
         }
         (ValueRef::Blob(b1), ValueRef::Blob(b2)) => b1 == b2,
         (ValueRef::Text(t1), ValueRef::Text(t2)) => {
-            // Use collation for text comparison
-            collation.compare_strings(t1.as_str(), t2.as_str()) == Ordering::Equal
+            collation.compare_text(t1.as_str(), t2.as_str()) == Ordering::Equal
         }
         _ => false,
     }
 }
 
 /// DISTINCT equality: NULLs compare equal to NULL.
-fn values_equal_distinct(v1: ValueRef, v2: ValueRef, collation: CollationSeq) -> bool {
+fn values_equal_distinct(v1: ValueRef, v2: ValueRef, collation: &KeyInfo) -> bool {
     match (v1, v2) {
         (ValueRef::Null, ValueRef::Null) => true,
         (ValueRef::Null, _) | (_, ValueRef::Null) => false,
@@ -177,13 +182,13 @@ fn values_equal_distinct(v1: ValueRef, v2: ValueRef, collation: CollationSeq) ->
     }
 }
 
-fn keys_equal_distinct(key1: &[Value], key2: &[ValueRef], collations: &[CollationSeq]) -> bool {
+fn keys_equal_distinct(key1: &[Value], key2: &[ValueRef], collations: &[KeyInfo]) -> bool {
     if key1.len() != key2.len() {
         return false;
     }
+    let binary = key_collation(CollationSeq::Binary);
     for (idx, (v1, v2)) in key1.iter().zip(key2.iter()).enumerate() {
-        let collation = collations.get(idx).copied().unwrap_or(CollationSeq::Binary);
-        if !values_equal_distinct(v1.as_ref(), *v2, collation) {
+        if !values_equal_distinct(v1.as_ref(), *v2, collations.get(idx).unwrap_or(&binary)) {
             return false;
         }
     }
@@ -716,12 +721,13 @@ impl SpilledPartition {
         self.buffer_len.load(atomic::Ordering::Acquire)
     }
 
-    /// Check if partition is ready for probing
+    /// Ready to read: every entry that belongs to it is in `buckets`. `Loaded` alone is not enough,
+    /// because DISTINCT loads partitions while the build is still spilling into them.
     pub const fn is_loaded(&self) -> bool {
         matches!(
             self.state,
             PartitionState::Loaded | PartitionState::InMemory
-        )
+        ) && !self.has_more_chunks()
     }
 
     /// Check if there are more chunks to load
@@ -777,8 +783,9 @@ pub struct HashTableConfig {
     pub mem_budget: usize,
     /// Number of keys in the join condition.
     pub num_keys: usize,
-    /// Collation sequences for each join key.
-    pub collations: Vec<CollationSeq>,
+    /// Collation for each join key; a custom collation must arrive with its callback already resolved
+    /// (`KeyCollations::resolve`), because the hash table has no connection to ask.
+    pub collations: Vec<KeyInfo>,
     /// Only spill to a file when != TempStore::Memory
     pub temp_store: crate::TempStore,
     /// Whether to track which entries have been matched during probing (for FULL OUTER JOIN).
@@ -793,7 +800,7 @@ impl Default for HashTableConfig {
             initial_buckets: DEFAULT_BUCKETS,
             mem_budget: DEFAULT_MEM_BUDGET,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![key_collation(CollationSeq::Binary)],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             partition_count: None,
@@ -958,8 +965,8 @@ pub struct HashTable {
     mem_budget: usize,
     /// Number of join keys.
     num_keys: usize,
-    /// Collation sequences for each join key.
-    collations: Vec<CollationSeq>,
+    /// Collation for each join key.
+    collations: Vec<KeyInfo>,
     /// Current state of the hash table.
     state: HashTableState,
     /// IO object for disk operations.
@@ -1046,16 +1053,14 @@ enum ParseChunkResult {
 impl HashTable {
     /// Create a new hash table.
     pub fn new(config: HashTableConfig, io: Arc<dyn IO>) -> Result<Self> {
-        if config
-            .collations
-            .iter()
-            .any(|collation| collation.is_custom())
-        {
-            // Custom collation equality is a connection-owned callback. Hash tables do
-            // not carry connection context, so hash/equality cannot be made consistent here.
-            return Err(LimboError::InternalError(
-                "custom collations are not supported by hash tables".to_string(),
-            ));
+        // Comparing these keys as BINARY would silently give the wrong answer.
+        for key in &config.collations {
+            if key.collation.is_custom() && key.custom_collation.is_none() {
+                return Err(LimboError::InternalError(format!(
+                    "hash table key uses collation {} without its comparison callback",
+                    key.collation.name()
+                )));
+            }
         }
         let num_buckets = config.initial_buckets;
         let buckets = (0..num_buckets).map(|_| HashBucket::new()).try_collect()?;
@@ -3286,20 +3291,179 @@ mod hashtests {
     use crate::io::Buffer;
     use crate::MemoryIO;
 
+    /// Calls values equal that BINARY, NOCASE and RTRIM all keep apart.
+    unsafe extern "C" fn nocase_trim_collation(
+        _context: usize,
+        left_ptr: *const u8,
+        left_len: usize,
+        right_ptr: *const u8,
+        right_len: usize,
+    ) -> i32 {
+        let left = unsafe { std::slice::from_raw_parts(left_ptr, left_len) };
+        let right = unsafe { std::slice::from_raw_parts(right_ptr, right_len) };
+        let normalize = |bytes: &[u8]| {
+            String::from_utf8_lossy(bytes)
+                .trim_end()
+                .to_ascii_lowercase()
+        };
+        match normalize(left).cmp(&normalize(right)) {
+            Ordering::Less => -1,
+            Ordering::Equal => 0,
+            Ordering::Greater => 1,
+        }
+    }
+
+    fn nocase_trim_key(name: &str) -> KeyInfo {
+        let collation = CollationSeq::custom(name);
+        KeyInfo {
+            custom_collation: Some(Arc::new(crate::function::ExternalCollation::new(
+                name.to_string(),
+                0,
+                nocase_trim_collation,
+                None,
+            ))),
+            ..key_collation(collation)
+        }
+    }
+
     #[test]
-    fn test_hash_table_rejects_custom_collations() {
+    fn test_hash_table_rejects_a_custom_collation_without_its_callback() {
         let io = Arc::new(MemoryIO::new());
         let config = HashTableConfig {
-            collations: vec![CollationSeq::custom("hash_table_custom")],
+            collations: vec![key_collation(CollationSeq::custom("hash_table_custom"))],
             ..Default::default()
         };
         let err = match HashTable::new(config, io) {
-            Ok(_) => panic!("custom-collated hash table should be rejected"),
+            Ok(_) => panic!("a custom collation with no callback should be refused"),
             Err(err) => err,
         };
-        assert!(err
-            .to_string()
-            .contains("custom collations are not supported by hash tables"));
+        assert!(
+            err.to_string().contains("without its comparison callback"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_hash_table_probes_through_a_custom_collation_callback() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 1024 * 1024,
+            num_keys: 1,
+            collations: vec![nocase_trim_key("hash_table_probe_custom")],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            partition_count: None,
+        };
+        let mut ht = HashTable::new(config, io).unwrap();
+
+        let _ = ht
+            .insert(vec![Value::Text("alpha".into())], 100, vec![], None)
+            .unwrap();
+        let _ = ht
+            .insert(vec![Value::Text("beta".into())], 200, vec![], None)
+            .unwrap();
+        let _ = ht.finalize_build(None);
+
+        // 'ALPHA  ' equals 'alpha' only under the callback.
+        let entry = ht
+            .probe(vec![Value::Text("ALPHA  ".into())], None)
+            .unwrap()
+            .expect("probe should match through the custom collation");
+        assert_eq!(entry.rowid, 100);
+
+        assert!(ht
+            .probe(vec![Value::Text("gamma".into())], None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_distinct_uses_the_custom_collation_callback() {
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 1024 * 1024,
+            num_keys: 1,
+            collations: vec![nocase_trim_key("hash_table_distinct_custom")],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            partition_count: None,
+        };
+        let mut ht = HashTable::new(config, io).unwrap();
+
+        let mut insert = |text: &str| {
+            let values = vec![Value::Text(text.into())];
+            let refs = vec![values[0].as_ref()];
+            match ht.insert_distinct(&values, &refs, None).unwrap() {
+                IOResult::Done(inserted) => inserted,
+                IOResult::IO(_) => panic!("in-memory distinct insert should not do IO"),
+            }
+        };
+
+        assert!(insert("alpha"));
+        assert!(!insert("ALPHA  "));
+        assert!(insert("beta"));
+    }
+
+    #[test]
+    fn test_distinct_over_a_custom_collation_dedups_after_spilling() {
+        // Custom-collated text all hashes the same, so one partition is spilled, reloaded and spilled again.
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 8 * 1024,
+            num_keys: 1,
+            collations: vec![nocase_trim_key("hash_table_spill_custom")],
+            temp_store: crate::TempStore::Default,
+            track_matched: false,
+            partition_count: None,
+        };
+        let mut ht = HashTable::new(config, io).unwrap();
+
+        let mut new_values = 0;
+        for pass in 0..2 {
+            for i in 0..2000 {
+                let text = if pass == 0 {
+                    format!("value_{i}")
+                } else {
+                    format!("VALUE_{i}  ")
+                };
+                let values = vec![Value::Text(text.into())];
+                let refs = vec![values[0].as_ref()];
+                loop {
+                    match ht.insert_distinct(&values, &refs, None).unwrap() {
+                        IOResult::Done(true) => {
+                            new_values += 1;
+                            break;
+                        }
+                        IOResult::Done(false) => break,
+                        IOResult::IO(_) => continue,
+                    }
+                }
+            }
+        }
+        assert!(ht.has_spilled(), "the test needs the table to spill");
+        assert_eq!(new_values, 2000);
+    }
+
+    #[test]
+    fn test_custom_collated_text_hashes_to_one_bucket() {
+        use crate::types::{TextRef, TextSubtype};
+
+        let collations = vec![nocase_trim_key("hash_table_hash_custom")];
+        let hash_of = |text: &str| {
+            hash_join_key(
+                &[ValueRef::Text(TextRef::new(text, TextSubtype::Text))],
+                &collations,
+            )
+        };
+        assert_eq!(hash_of("alpha"), hash_of("ALPHA  "));
+        assert_eq!(hash_of("alpha"), hash_of("something else entirely"));
+        assert_ne!(
+            hash_join_key(&[ValueRef::from_i64(1)], &collations),
+            hash_join_key(&[ValueRef::from_i64(2)], &collations)
+        );
     }
 
     #[test]
@@ -3327,7 +3491,10 @@ mod hashtests {
             )),
         ];
 
-        let collations = vec![CollationSeq::Binary, CollationSeq::Binary];
+        let collations = vec![
+            key_collation(CollationSeq::Binary),
+            key_collation(CollationSeq::Binary),
+        ];
         let hash1 = hash_join_key(&keys1, &collations);
         let hash2 = hash_join_key(&keys2, &collations);
         let hash3 = hash_join_key(&keys3, &collations);
@@ -3338,7 +3505,7 @@ mod hashtests {
 
     #[test]
     fn test_hash_function_numeric_equivalence() {
-        let collations = vec![CollationSeq::Binary];
+        let collations = vec![key_collation(CollationSeq::Binary)];
 
         // Zero variants should hash identically
         let h_zero = hash_join_key(&[ValueRef::from_f64(0.0)], &collations);
@@ -3378,7 +3545,10 @@ mod hashtests {
             )),
         ];
 
-        let collations = vec![CollationSeq::Binary, CollationSeq::Binary];
+        let collations = vec![
+            key_collation(CollationSeq::Binary),
+            key_collation(CollationSeq::Binary),
+        ];
         assert!(keys_equal(&key1, &key2, &collations));
         assert!(!keys_equal(&key1, &key3, &collations));
     }
@@ -3390,7 +3560,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024 * 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![key_collation(CollationSeq::Binary)],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             partition_count: None,
@@ -3432,7 +3602,7 @@ mod hashtests {
             initial_buckets: 2, // Small number to force collisions
             mem_budget: 1024 * 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![key_collation(CollationSeq::Binary)],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             partition_count: None,
@@ -3464,7 +3634,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024 * 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![key_collation(CollationSeq::Binary)],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             partition_count: None,
@@ -3641,7 +3811,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![key_collation(CollationSeq::Binary)],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             partition_count: Some(64),
@@ -3662,7 +3832,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![key_collation(CollationSeq::Binary)],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             partition_count: None,
@@ -3686,7 +3856,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![key_collation(CollationSeq::Binary)],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             partition_count: Some(16),
@@ -3739,7 +3909,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![key_collation(CollationSeq::Binary)],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             partition_count: Some(16),
@@ -3775,7 +3945,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![key_collation(CollationSeq::Binary)],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             partition_count: Some(16),
@@ -3837,13 +4007,13 @@ mod hashtests {
         let keys2 = vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))];
 
         // Under BINARY: hashes must differ
-        let bin_coll = vec![CollationSeq::Binary];
+        let bin_coll = vec![key_collation(CollationSeq::Binary)];
         let h1_bin = hash_join_key(&keys1, &bin_coll);
         let h2_bin = hash_join_key(&keys2, &bin_coll);
         assert_ne!(h1_bin, h2_bin);
 
         // Under NOCASE: hashes should be equal
-        let nocase_coll = vec![CollationSeq::NoCase];
+        let nocase_coll = vec![key_collation(CollationSeq::NoCase)];
         let h1_nc = hash_join_key(&keys1, &nocase_coll);
         let h2_nc = hash_join_key(&keys2, &nocase_coll);
         assert_eq!(h1_nc, h2_nc);
@@ -3860,7 +4030,7 @@ mod hashtests {
 
         // Under NOCASE: ASCII portion differs (b/B), so hashes should differ
         // (because SQLite NOCASE doesn't handle Unicode case folding)
-        let nocase_coll = vec![CollationSeq::NoCase];
+        let nocase_coll = vec![key_collation(CollationSeq::NoCase)];
         let h1 = hash_join_key(&keys1, &nocase_coll);
         let h2 = hash_join_key(&keys2, &nocase_coll);
 
@@ -3877,18 +4047,26 @@ mod hashtests {
     fn test_hash_nocase_embedded_nul_matches_equality() {
         use crate::types::{TextRef, TextSubtype};
 
-        let nocase_coll = vec![CollationSeq::NoCase];
+        let nocase_coll = vec![key_collation(CollationSeq::NoCase)];
         let keys1 = vec![ValueRef::Text(TextRef::new("A\0x", TextSubtype::Text))];
         let keys2 = vec![ValueRef::Text(TextRef::new("a\0y", TextSubtype::Text))];
         let keys3 = vec![ValueRef::Text(TextRef::new("a\0yz", TextSubtype::Text))];
 
-        assert!(values_equal(keys1[0], keys2[0], CollationSeq::NoCase));
+        assert!(values_equal(
+            keys1[0],
+            keys2[0],
+            &key_collation(CollationSeq::NoCase)
+        ));
         assert_eq!(
             hash_join_key(&keys1, &nocase_coll),
             hash_join_key(&keys2, &nocase_coll)
         );
 
-        assert!(!values_equal(keys1[0], keys3[0], CollationSeq::NoCase));
+        assert!(!values_equal(
+            keys1[0],
+            keys3[0],
+            &key_collation(CollationSeq::NoCase)
+        ));
         assert_ne!(
             hash_join_key(&keys1, &nocase_coll),
             hash_join_key(&keys3, &nocase_coll)
@@ -3903,14 +4081,14 @@ mod hashtests {
         let h2 = ValueRef::Text(TextRef::new("hello", TextSubtype::Text));
 
         // Binary: case / trailing spaces matter
-        assert!(!values_equal(h1, h2, CollationSeq::Binary));
+        assert!(!values_equal(h1, h2, &key_collation(CollationSeq::Binary)));
 
         // NOCASE: case-insensitive but trailing spaces still matter -> likely false
-        assert!(!values_equal(h1, h2, CollationSeq::NoCase));
+        assert!(!values_equal(h1, h2, &key_collation(CollationSeq::NoCase)));
 
         // RTRIM: ignore trailing spaces, but case is still significant
         let h3 = ValueRef::Text(TextRef::new("Hello", TextSubtype::Text));
-        assert!(values_equal(h1, h3, CollationSeq::Rtrim));
+        assert!(values_equal(h1, h3, &key_collation(CollationSeq::Rtrim)));
     }
 
     #[test]
@@ -3921,10 +4099,18 @@ mod hashtests {
         let key2 = vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))];
 
         // Binary: not equal
-        assert!(!keys_equal(&key1, &key2, &[CollationSeq::Binary]));
+        assert!(!keys_equal(
+            &key1,
+            &key2,
+            &[key_collation(CollationSeq::Binary)]
+        ));
 
         // NOCASE: equal
-        assert!(keys_equal(&key1, &key2, &[CollationSeq::NoCase]));
+        assert!(keys_equal(
+            &key1,
+            &key2,
+            &[key_collation(CollationSeq::NoCase)]
+        ));
     }
 
     #[test]
@@ -3982,7 +4168,7 @@ mod hashtests {
             // very small budget to force spill
             mem_budget: 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![key_collation(CollationSeq::Binary)],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             ..Default::default()
@@ -4024,7 +4210,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 8 * 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![key_collation(CollationSeq::Binary)],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             partition_count: None,
@@ -4068,7 +4254,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 8 * 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![key_collation(CollationSeq::Binary)],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             partition_count: None,
@@ -4118,7 +4304,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024 * 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![key_collation(CollationSeq::Binary)],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             partition_count: None,
@@ -4172,7 +4358,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024 * 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![key_collation(CollationSeq::Binary)],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             partition_count: None,
@@ -4204,7 +4390,10 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024 * 1024,
             num_keys: 2,
-            collations: vec![CollationSeq::Binary, CollationSeq::Binary],
+            collations: vec![
+                key_collation(CollationSeq::Binary),
+                key_collation(CollationSeq::Binary),
+            ],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             partition_count: None,
@@ -4249,7 +4438,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024 * 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![key_collation(CollationSeq::Binary)],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             partition_count: None,
@@ -4285,7 +4474,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024 * 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![key_collation(CollationSeq::Binary)],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             partition_count: None,
@@ -4439,7 +4628,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024, // tiny, forces spill
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![key_collation(CollationSeq::Binary)],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             ..Default::default()
@@ -4565,7 +4754,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024 * 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![key_collation(CollationSeq::Binary)],
             temp_store: crate::TempStore::Default,
             track_matched: false,
             ..Default::default()
@@ -4771,7 +4960,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 4096,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![key_collation(CollationSeq::Binary)],
             temp_store: crate::TempStore::Default,
             track_matched: true,
             partition_count: Some(4),
@@ -4917,7 +5106,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: vec![key_collation(CollationSeq::Binary)],
             temp_store: crate::TempStore::Default,
             track_matched: true,
             partition_count: Some(16),

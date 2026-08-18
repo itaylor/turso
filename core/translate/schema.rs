@@ -754,12 +754,9 @@ fn validate(
                         validate_default_expr(&expr, col_i)?
                     }
                     ast::ColumnConstraint::Collate { collation_name } => {
-                        let collation = resolver.resolve_collation(collation_name.as_str())?;
-                        if collation.is_custom() {
-                            bail_parse_error!(
-                                "custom collations are not supported in schema definitions"
-                            );
-                        }
+                        // Like `sqlite3AddCollateType()`: CREATE TABLE rejects an unresolvable collation name, reading
+                        // the stored schema back later does not (`CollationSeq::from_schema_sql`).
+                        resolver.resolve_collation(collation_name.as_str())?;
                     }
                     _ => {}
                 }
@@ -775,8 +772,20 @@ fn validate(
             }
         }
         for constraint in constraints {
-            if let ast::TableConstraint::Check { ref expr, .. } = constraint.constraint {
-                validate_check_expr(expr, table_name, &column_names, resolver)?;
+            match &constraint.constraint {
+                ast::TableConstraint::Check { expr, .. } => {
+                    validate_check_expr(expr, table_name, &column_names, resolver)?;
+                }
+                // These build an index, so the name has to resolve now.
+                ast::TableConstraint::PrimaryKey { columns, .. }
+                | ast::TableConstraint::Unique { columns, .. } => {
+                    for column in columns {
+                        if let ast::Expr::Collate(_, collation_name) = column.expr.as_ref() {
+                            resolver.resolve_collation(collation_name.as_str())?;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 

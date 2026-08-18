@@ -395,11 +395,7 @@ impl VectorSparseInvertedIndexMethodCursor {
 }
 
 fn key_info() -> KeyInfo {
-    KeyInfo {
-        collation: CollationSeq::Binary,
-        sort_order: SortOrder::Asc,
-        nulls_order: None,
-    }
+    KeyInfo::new(SortOrder::Asc, CollationSeq::Binary, None)
 }
 
 impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {

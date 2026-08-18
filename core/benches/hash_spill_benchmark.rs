@@ -10,7 +10,7 @@ use codspeed_criterion_compat::{
 
 use std::sync::Arc;
 use turso_core::types::Value;
-use turso_core::vdbe::hash_table::{HashTable, HashTableConfig};
+use turso_core::vdbe::hash_table::{key_collation, HashTable, HashTableConfig};
 use turso_core::vdbe::CollationSeq;
 use turso_core::{IOResult, MemoryIO, Numeric};
 
@@ -25,7 +25,7 @@ fn create_hash_table(mem_budget: usize) -> HashTable {
         initial_buckets: 64,
         mem_budget,
         num_keys: 1,
-        collations: turso_core::alloc::vec![CollationSeq::Binary],
+        collations: turso_core::alloc::vec![key_collation(CollationSeq::Binary)],
         temp_store: turso_core::TempStore::Default,
         track_matched: false,
         partition_count: None,
@@ -247,7 +247,7 @@ fn bench_text_key_hashing(c: &mut Criterion) {
                         initial_buckets: 64,
                         mem_budget: 64 * 1024,
                         num_keys: 1,
-                        collations: turso_core::alloc::vec![CollationSeq::Binary],
+                        collations: turso_core::alloc::vec![key_collation(CollationSeq::Binary)],
                         temp_store: turso_core::TempStore::Default,
                         track_matched: false,
                         partition_count: None,
@@ -271,7 +271,7 @@ fn bench_text_key_hashing(c: &mut Criterion) {
                         initial_buckets: 64,
                         mem_budget: 64 * 1024,
                         num_keys: 1,
-                        collations: turso_core::alloc::vec![CollationSeq::NoCase],
+                        collations: turso_core::alloc::vec![key_collation(CollationSeq::NoCase)],
                         temp_store: turso_core::TempStore::Default,
                         track_matched: false,
                         partition_count: None,

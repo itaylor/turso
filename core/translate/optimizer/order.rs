@@ -713,7 +713,7 @@ fn expr_to_column_order(
                 ..
             } = expr.as_ref()
             {
-                let collation = CollationSeq::new(collation.as_str()).unwrap_or_default();
+                let collation = crate::translate::collate::collseq_for_planner(collation.as_str());
                 return Some(ColumnOrder {
                     table_id: *table_id,
                     target: ColumnTarget::Column(*column),

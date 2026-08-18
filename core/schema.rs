@@ -3647,6 +3647,13 @@ impl BTreeTable {
                     sql.push_str("[]");
                 }
             }
+            // Dropping the clause would silently change the column's collation on the next schema read, and
+            // with it the order of any index over it.
+            if let Some(collation) = column.collation_opt() {
+                sql.push_str(" COLLATE ");
+                sql.push_str(&quote_ident(&collation.name()));
+            }
+
             if column.notnull()
                 && (column.explicit_notnull() || !self.is_without_rowid_inline_pk(column))
             {
@@ -4431,12 +4438,7 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
 fn constraint_column_collation(expr: &Expr) -> Result<(&Expr, Option<CollationSeq>)> {
     match expr {
         Expr::Collate(inner, collation_name) => {
-            let collation_seq = CollationSeq::new(collation_name.as_str())?;
-            if collation_seq.is_custom() {
-                crate::bail_parse_error!(
-                    "custom collations are not supported in schema definitions"
-                );
-            }
+            let collation_seq = CollationSeq::from_schema_sql(collation_name.as_str());
             Ok((inner.as_ref(), Some(collation_seq)))
         }
         _ => Ok((expr, None)),
@@ -4767,13 +4769,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             })?;
                         }
                         ast::ColumnConstraint::Collate { ref collation_name } => {
-                            let collation_seq = CollationSeq::new(collation_name.as_str())?;
-                            if collation_seq.is_custom() {
-                                crate::bail_parse_error!(
-                                    "custom collations are not supported in schema definitions"
-                                );
-                            }
-                            collation = Some(collation_seq);
+                            collation =
+                                Some(CollationSeq::from_schema_sql(collation_name.as_str()));
                         }
                         ast::ColumnConstraint::ForeignKey {
                             clause,
@@ -5198,6 +5195,9 @@ pub struct Column {
     pub default: Option<Box<Expr>>,
     generated_type: GeneratedType,
     raw: u32,
+    /// `raw` packs a collation into 12 bits, which does not fit a custom collation's full `u32` id.
+    /// Takes precedence over the packed bits when set.
+    custom_collation: Option<std::num::NonZeroU32>,
     explicit_notnull: bool,
     /// ON CONFLICT clause for NOT NULL constraint on this column.
     pub notnull_conflict_clause: Option<ResolveType>,
@@ -5335,8 +5335,12 @@ impl Column {
         };
         let mut raw = 0u32;
         raw |= (ty as u32) << TYPE_SHIFT;
+        let mut custom_collation = None;
         if let Some(c) = col {
-            raw |= (u32::from(c.to_bits()) << COLL_SHIFT) & COLL_MASK;
+            match c {
+                CollationSeq::Custom(id) => custom_collation = std::num::NonZeroU32::new(id),
+                _ => raw |= (u32::from(c.to_bits()) << COLL_SHIFT) & COLL_MASK,
+            }
         }
         if coldef.primary_key {
             raw |= F_PRIMARY_KEY
@@ -5360,6 +5364,7 @@ impl Column {
             default,
             generated_type,
             raw,
+            custom_collation,
             explicit_notnull: coldef.explicit_notnull,
             notnull_conflict_clause: coldef.notnull_conflict_clause,
         }
@@ -5386,6 +5391,9 @@ impl Column {
 
     #[inline]
     pub const fn collation(&self) -> CollationSeq {
+        if let Some(id) = self.custom_collation {
+            return CollationSeq::Custom(id.get());
+        }
         let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u16;
         if v == CollationSeq::Unset.to_bits() {
             CollationSeq::Binary
@@ -5396,6 +5404,9 @@ impl Column {
 
     #[inline]
     pub const fn has_explicit_collation(&self) -> bool {
+        if self.custom_collation.is_some() {
+            return true;
+        }
         let v = ((self.raw & COLL_MASK) >> COLL_SHIFT) as u16;
         v != CollationSeq::Unset.to_bits()
     }
@@ -5403,8 +5414,12 @@ impl Column {
     #[inline]
     pub const fn set_collation(&mut self, c: Option<CollationSeq>) {
         self.raw &= !COLL_MASK;
+        self.custom_collation = None;
         if let Some(c) = c {
-            self.raw |= ((c.to_bits() as u32) << COLL_SHIFT) & COLL_MASK;
+            match c {
+                CollationSeq::Custom(id) => self.custom_collation = std::num::NonZeroU32::new(id),
+                _ => self.raw |= ((c.to_bits() as u32) << COLL_SHIFT) & COLL_MASK,
+            }
         }
     }
 
@@ -5565,13 +5580,7 @@ impl TryFrom<&ColumnDefinition> for Column {
                     );
                 }
                 ast::ColumnConstraint::Collate { collation_name } => {
-                    let collation_seq = CollationSeq::new(collation_name.as_str())?;
-                    if collation_seq.is_custom() {
-                        crate::bail_parse_error!(
-                            "custom collations are not supported in schema definitions"
-                        );
-                    }
-                    collation.replace(collation_seq);
+                    collation.replace(CollationSeq::from_schema_sql(collation_name.as_str()));
                 }
                 ast::ColumnConstraint::Generated { expr, .. } => {
                     generated = Some(expr.clone());

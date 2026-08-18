@@ -4,7 +4,9 @@ use crate::turso_assert;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, ResolveType, SubqueryType, TableInternalId, UnaryOperator};
 
-use super::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
+use super::collate::{
+    get_collseq_from_expr_with_symbols, get_expr_collation_ctx_with_symbols, CollationSeq,
+};
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
 use super::plan::TableReferences;

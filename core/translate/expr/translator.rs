@@ -89,6 +89,25 @@ pub fn resolve_expr(
     translate_expr(program, referenced_tables, expr, dest_reg, resolver)
 }
 
+/// The collation for SQLite's NEEDCOLL scalars (min/max/nullif): the first argument, left to right,
+/// with a defined collation -- explicit `COLLATE` or a column's declared one, BINARY included.
+fn min_max_nullif_collation(
+    args: &[Box<Expr>],
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Result<CollationSeq> {
+    let empty_tables = TableReferences::new_empty();
+    let tables = referenced_tables.unwrap_or(&empty_tables);
+    for arg in args {
+        if let Some((collation, _)) =
+            get_expr_collation_ctx_with_symbols(arg, tables, Some(resolver.symbol_table))?
+        {
+            return Ok(collation);
+        }
+    }
+    Ok(CollationSeq::Binary)
+}
+
 /// Translate an expression into bytecode.
 #[turso_macros::trace_stack]
 pub fn translate_expr(
@@ -1496,6 +1515,8 @@ pub fn translate_expr(
                             if args.is_empty() {
                                 crate::bail_parse_error!("min function with no arguments");
                             }
+                            let collation =
+                                min_max_nullif_collation(args, referenced_tables, resolver)?;
                             let start_reg = program.alloc_registers(args.len());
                             for (i, arg) in args.iter().enumerate() {
                                 translate_expr(
@@ -1507,6 +1528,7 @@ pub fn translate_expr(
                                 )?;
                             }
 
+                            program.emit_insn(Insn::CollSeq { collation });
                             program.emit_insn(Insn::Function {
                                 constant_mask: 0,
                                 start_reg,
@@ -1519,6 +1541,8 @@ pub fn translate_expr(
                             if args.is_empty() {
                                 crate::bail_parse_error!("min function with no arguments");
                             }
+                            let collation =
+                                min_max_nullif_collation(args, referenced_tables, resolver)?;
                             let start_reg = program.alloc_registers(args.len());
                             for (i, arg) in args.iter().enumerate() {
                                 translate_expr(
@@ -1530,6 +1554,7 @@ pub fn translate_expr(
                                 )?;
                             }
 
+                            program.emit_insn(Insn::CollSeq { collation });
                             program.emit_insn(Insn::Function {
                                 constant_mask: 0,
                                 start_reg,
@@ -1538,7 +1563,45 @@ pub fn translate_expr(
                             });
                             Ok(target_register)
                         }
-                        ScalarFunc::Nullif | ScalarFunc::Instr => {
+                        ScalarFunc::Nullif => {
+                            if args.len() != 2 {
+                                crate::bail_parse_error!(
+                                    "{} function must have two argument",
+                                    srf.to_string()
+                                );
+                            }
+                            let collation =
+                                min_max_nullif_collation(args, referenced_tables, resolver)?;
+
+                            // Allocate both registers first to ensure they're consecutive,
+                            // since translate_expr may allocate internal registers.
+                            let first_reg = program.alloc_register();
+                            let second_reg = program.alloc_register();
+                            translate_expr(
+                                program,
+                                referenced_tables,
+                                &args[0],
+                                first_reg,
+                                resolver,
+                            )?;
+                            translate_expr(
+                                program,
+                                referenced_tables,
+                                &args[1],
+                                second_reg,
+                                resolver,
+                            )?;
+                            program.emit_insn(Insn::CollSeq { collation });
+                            program.emit_insn(Insn::Function {
+                                constant_mask: 0,
+                                start_reg: first_reg,
+                                dest: target_register,
+                                func: func_ctx,
+                            });
+
+                            Ok(target_register)
+                        }
+                        ScalarFunc::Instr => {
                             if args.len() != 2 {
                                 crate::bail_parse_error!(
                                     "{} function must have two argument",
@@ -3111,9 +3174,32 @@ pub fn translate_expr(
         }
     }?;
 
+    // A column's implicit collation only travels through CAST, unary `+` and parentheses; a function
+    // call, CASE or subquery is not "a column name" to SQLite, so `lower(d) = 'X'` compares with BINARY.
+    // An explicit COLLATE inside still propagates out.
+    if breaks_implicit_column_collation(expr)
+        && !matches!(program.curr_collation_ctx(), Some((_, true)))
+    {
+        program.reset_collation();
+    }
+
     if let Some(span) = constant_span {
         program.constant_span_end(span);
     }
 
     Ok(target_register)
+}
+
+/// Whether translating `expr` leaves a stale implicit collation in the program's collation context.
+/// Only these wrappers are listed: an expression that never touches the context (a literal) must be
+/// left alone, because callers such as the IN-list emitter rely on the context a previous
+/// `translate_expr` set.
+fn breaks_implicit_column_collation(expr: &ast::Expr) -> bool {
+    matches!(
+        expr,
+        ast::Expr::FunctionCall { .. }
+            | ast::Expr::FunctionCallStar { .. }
+            | ast::Expr::Case { .. }
+            | ast::Expr::SubqueryResult { .. }
+    )
 }

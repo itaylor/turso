@@ -8866,18 +8866,24 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 .unwrap_or_else(|| i64::from(index_id))
         };
 
-        let find_index_info =
-            |schema: &Schema, root_page: i64| -> Result<Option<Arc<IndexInfo>>, TryReserveError> {
-                schema
-                    .indexes
-                    .values()
-                    .flatten()
-                    .find(|idx| idx.root_page == root_page)
-                    .map(|idx| {
-                        IndexInfo::new_from_index_in(idx.as_ref(), self.alloc.clone()).map(Arc::new)
-                    })
-                    .transpose()
-            };
+        // Log recovery replays index writes without a connection, so a custom collation cannot be resolved
+        // and rebuilding those keys under BINARY would leave the index mis-ordered.
+        let find_index_info = |schema: &Schema, root_page: i64| -> Result<Option<Arc<IndexInfo>>> {
+            schema
+                .indexes
+                .values()
+                .flatten()
+                .find(|idx| idx.root_page == root_page)
+                .map(|idx| {
+                    IndexInfo::new_from_index_in(
+                        idx.as_ref(),
+                        self.alloc.clone(),
+                        crate::types::KeyCollations::BuiltinOnly,
+                    )
+                    .map(Arc::new)
+                })
+                .transpose()
+        };
 
         let schema_has_index_root = |schema: &Schema, root_page: i64| -> bool {
             schema
