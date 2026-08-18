@@ -7627,7 +7627,6 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "turso_core",
- "turso_ext",
  "vcpkg",
 ]
 
