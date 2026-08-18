@@ -118,13 +118,75 @@ This function is currently not supported.
 
 This function is currently not supported.
 
-#### function(name, [options], function) ⇒ this
+#### function(name, [options], function) ⇒ promise
 
-This function is currently not supported.
+Registers a scalar user-defined function, callable from SQL on this
+connection. Returns a promise resolving to the database, so calls can be
+chained. Registration is asynchronous because it waits for the connection and
+for any statement currently in flight; the callback itself runs
+**synchronously** while a statement is stepping, so it cannot `await` and
+cannot use this `Database` (see the note below).
 
-#### aggregate(name, options) ⇒ this
+| Param    | Type                  | Description                                                                       |
+| -------- | --------------------- | --------------------------------------------------------------------------------- |
+| name     | <code>string</code>   | The name SQL calls the function by.                                               |
+| options  | <code>object</code>   | Optional. See below.                                                              |
+| function | <code>function</code> | The implementation.                                                               |
 
-This function is currently not supported.
+| Option        | Default              | Description                                                                                 |
+| ------------- | -------------------- | ------------------------------------------------------------------------------------------- |
+| deterministic | `false`              | The same arguments always produce the same result, so the engine may call it once and reuse the answer. |
+| varargs       | `false`              | Accept any number of arguments. Without it the arity is `function.length`, and a call with a different number of arguments fails with `wrong number of arguments`. |
+| directOnly    | `false`              | Mark the function as callable only from top-level SQL, never from a trigger, view, CHECK constraint, DEFAULT, generated column or index expression; calling it from there fails with `unsafe use of X()`. |
+| safeIntegers  | database default     | Pass INTEGER arguments as BigInt instead of Number. Follows `defaultSafeIntegers()` when omitted. |
+
+```js
+await db.function('add2', (a, b) => a + b);
+await (await db.prepare('SELECT add2(2, 3) AS v')).get(); // => { v: 5 }
+
+await db.function('sum_all', { varargs: true }, (...args) => args.reduce((a, b) => a + b, 0));
+```
+
+Arguments arrive as `null`, Number (or BigInt with `safeIntegers`), string or
+`Uint8Array`. The return value may be `null`/`undefined` (SQL NULL), a number,
+a BigInt, a string, a boolean (0 or 1) or a `Buffer`/`Uint8Array`; anything
+else fails the statement with a `TypeError`. An exception thrown by the
+callback aborts the statement and is rethrown to whoever ran it, unchanged.
+
+The callback cannot use the `Database` that called it: every method here is
+asynchronous, so calling one from inside the callback only queues work that
+runs after the statement has moved on. A function registered with the same
+name and argument count as a built-in shadows it.
+
+#### aggregate(name, options) ⇒ promise
+
+Registers an aggregate user-defined function. Returns a promise resolving to
+the database.
+
+| Option        | Default              | Description                                                                                  |
+| ------------- | -------------------- | ---------------------------------------------------------------------------------------------- |
+| start         | `null`               | The initial value of the accumulator, or a function returning a fresh one for every group.   |
+| step          | *required*           | `(total, ...args)`. Returns the new accumulator, or `undefined` to keep the current one.     |
+| inverse       | none                 | `(total, ...args)`. Removes a row that left the window frame. Providing it makes the aggregate usable as a window function. |
+| result        | none                 | `(total)`. Turns the final accumulator into the value SQL sees. Defaults to the accumulator itself. |
+| deterministic, varargs, directOnly, safeIntegers | | As for `function()`. The arity is `step.length - 1` (or `inverse.length - 1` if that is larger), since both also take the accumulator. |
+
+```js
+await db.aggregate('mysum', {
+  start: 0,
+  step: (total, x) => total + x,
+  inverse: (total, x) => total - x,
+});
+
+await (await db.prepare('SELECT mysum(x) AS v FROM t')).get();
+await (await db.prepare(
+  'SELECT x, mysum(x) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS v FROM t'
+)).all();
+```
+
+The accumulator can be any JavaScript value, including an object or array.
+Without an `inverse` callback the aggregate cannot be used with `OVER`, and
+such a query fails to compile with `X() may not be used as a window function`.
 
 #### table(name, definition) ⇒ this
 
