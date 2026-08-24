@@ -2548,3 +2548,292 @@ async fn test_udf_database_remove_function_only_affects_new_connections() {
     let after_removal = db.connect().unwrap();
     assert!(after_removal.query("SELECT db_three()", ()).await.is_err());
 }
+
+/// Change-journal triggers gated on zero-argument functions that read
+/// out-of-band state.
+mod oplog {
+    use std::cell::Cell;
+    use std::sync::{Arc, Mutex, RwLock};
+    use turso::udf::FunctionFlags;
+    use turso::{Connection, Value, ValueRef};
+
+    thread_local! {
+        pub static SUPPRESS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Every call returns a bigger stamp than the one before.
+    pub struct Clock {
+        pub device_id: RwLock<String>,
+        counter: Mutex<i64>,
+    }
+
+    impl Clock {
+        pub fn new() -> Arc<Self> {
+            Arc::new(Self {
+                device_id: RwLock::new(String::new()),
+                counter: Mutex::new(0),
+            })
+        }
+
+        pub fn now(&self) -> String {
+            let mut c = self.counter.lock().unwrap();
+            *c += 1;
+            format!("{:013}.{}", *c, self.device_id.read().unwrap())
+        }
+    }
+
+    pub fn register_functions(conn: &Connection, clock: &Arc<Clock>) {
+        let c = Arc::clone(clock);
+        conn.create_scalar_function(
+            "hlc_now",
+            0,
+            FunctionFlags::empty(),
+            move |_: &[ValueRef<'_>]| Ok(Value::Text(c.now())),
+        )
+        .unwrap();
+        let c = Arc::clone(clock);
+        conn.create_scalar_function(
+            "local_device_id",
+            0,
+            FunctionFlags::empty(),
+            move |_: &[ValueRef<'_>]| Ok(Value::Text(c.device_id.read().unwrap().clone())),
+        )
+        .unwrap();
+        conn.create_scalar_function(
+            "sync_suppressed",
+            0,
+            FunctionFlags::empty(),
+            |_: &[ValueRef<'_>]| Ok(Value::Integer(SUPPRESS.with(|s| s.get()) as i64)),
+        )
+        .unwrap();
+    }
+
+    pub async fn create_schema(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE photos (id TEXT PRIMARY KEY, state TEXT NOT NULL DEFAULT 'new');
+             CREATE TABLE sync_changes (
+               seq INTEGER PRIMARY KEY AUTOINCREMENT,
+               entity TEXT NOT NULL, entity_id TEXT NOT NULL, op TEXT NOT NULL,
+               hlc TEXT NOT NULL, origin_device TEXT NOT NULL
+             );
+             CREATE TRIGGER trg_ins AFTER INSERT ON photos
+               WHEN sync_suppressed() = 0
+               BEGIN
+                 INSERT OR IGNORE INTO sync_changes(entity, entity_id, op, hlc, origin_device)
+                 VALUES ('photo', NEW.id, 'upsert', hlc_now(), local_device_id());
+               END;
+             CREATE TRIGGER trg_upd AFTER UPDATE ON photos
+               WHEN sync_suppressed() = 0
+               BEGIN
+                 INSERT OR IGNORE INTO sync_changes(entity, entity_id, op, hlc, origin_device)
+                 VALUES ('photo', NEW.id, 'upsert', hlc_now(), local_device_id());
+               END;
+             CREATE TRIGGER trg_del AFTER DELETE ON photos
+               WHEN sync_suppressed() = 0
+               BEGIN
+                 INSERT OR IGNORE INTO sync_changes(entity, entity_id, op, hlc, origin_device)
+                 VALUES ('photo', OLD.id, 'delete', hlc_now(), local_device_id());
+               END;",
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Every journal row, in `seq` order: (entity_id, op, hlc, origin_device).
+    pub async fn journal(conn: &Connection) -> Vec<(String, String, String, String)> {
+        let mut rows = conn
+            .query(
+                "SELECT entity_id, op, hlc, origin_device FROM sync_changes ORDER BY seq",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            let text = |i: usize| match row.get_value(i).unwrap() {
+                Value::Text(s) => s,
+                other => panic!("expected text in column {i}, got {other:?}"),
+            };
+            out.push((text(0), text(1), text(2), text(3)));
+        }
+        out
+    }
+}
+
+#[tokio::test]
+async fn test_udf_zero_arg_function_in_trigger_when_clause_gates_the_trigger() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    let clock = oplog::Clock::new();
+    *clock.device_id.write().unwrap() = "dev-A".to_string();
+    oplog::register_functions(&conn, &clock);
+    oplog::create_schema(&conn).await;
+
+    conn.execute("INSERT INTO photos (id) VALUES ('p1')", ())
+        .await
+        .unwrap();
+
+    oplog::SUPPRESS.with(|s| s.set(true));
+    conn.execute("INSERT INTO photos (id) VALUES ('p2')", ())
+        .await
+        .unwrap();
+    conn.execute("UPDATE photos SET state = 'ready' WHERE id = 'p1'", ())
+        .await
+        .unwrap();
+    oplog::SUPPRESS.with(|s| s.set(false));
+
+    conn.execute("DELETE FROM photos WHERE id = 'p2'", ())
+        .await
+        .unwrap();
+
+    let journal = oplog::journal(&conn).await;
+    let ops: Vec<(&str, &str, &str)> = journal
+        .iter()
+        .map(|(id, op, _, dev)| (id.as_str(), op.as_str(), dev.as_str()))
+        .collect();
+    assert_eq!(
+        ops,
+        vec![("p1", "upsert", "dev-A"), ("p2", "delete", "dev-A")],
+        "the suppressed insert and update must not be journaled"
+    );
+    assert!(journal[0].2 < journal[1].2);
+}
+
+#[tokio::test]
+async fn test_udf_zero_arg_function_is_reevaluated_on_a_reused_prepared_statement() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    let clock = oplog::Clock::new();
+    oplog::register_functions(&conn, &clock);
+    oplog::create_schema(&conn).await;
+
+    let mut stmt = conn
+        .prepare("INSERT INTO photos (id) VALUES (?)")
+        .await
+        .unwrap();
+    stmt.execute(["a"]).await.unwrap();
+    oplog::SUPPRESS.with(|s| s.set(true));
+    stmt.execute(["b"]).await.unwrap();
+    oplog::SUPPRESS.with(|s| s.set(false));
+    stmt.execute(["c"]).await.unwrap();
+
+    let ids: Vec<String> = oplog::journal(&conn)
+        .await
+        .into_iter()
+        .map(|r| r.0)
+        .collect();
+    assert_eq!(ids, vec!["a", "c"]);
+
+    let mut probe = conn.prepare("SELECT sync_suppressed()").await.unwrap();
+    let first = probe.query_row(()).await.unwrap().get_value(0).unwrap();
+    oplog::SUPPRESS.with(|s| s.set(true));
+    let second = probe.query_row(()).await.unwrap().get_value(0).unwrap();
+    oplog::SUPPRESS.with(|s| s.set(false));
+    assert_eq!((first, second), (Value::Integer(0), Value::Integer(1)));
+}
+
+#[tokio::test]
+async fn test_udf_non_deterministic_zero_arg_function_runs_once_per_row_in_insert_select() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    let clock = oplog::Clock::new();
+    *clock.device_id.write().unwrap() = "dev-B".to_string();
+    oplog::register_functions(&conn, &clock);
+    oplog::create_schema(&conn).await;
+
+    oplog::SUPPRESS.with(|s| s.set(true));
+    conn.execute(
+        "INSERT INTO photos (id) VALUES ('p1'), ('p2'), ('p3'), ('p4')",
+        (),
+    )
+    .await
+    .unwrap();
+    oplog::SUPPRESS.with(|s| s.set(false));
+    assert!(oplog::journal(&conn).await.is_empty());
+
+    conn.execute(
+        "INSERT OR IGNORE INTO sync_changes(entity, entity_id, op, hlc, origin_device)
+         SELECT 'photo', id, 'upsert', hlc_now(), local_device_id() FROM photos",
+        (),
+    )
+    .await
+    .unwrap();
+
+    let journal = oplog::journal(&conn).await;
+    assert_eq!(journal.len(), 4);
+    let stamps: Vec<&str> = journal.iter().map(|r| r.2.as_str()).collect();
+    let mut sorted = stamps.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        4,
+        "hlc_now() must run for every row, not be folded to one value: {stamps:?}"
+    );
+    assert!(journal.iter().all(|r| r.3 == "dev-B"));
+
+    let mut rows = conn
+        .query("SELECT hlc_now() FROM photos", ())
+        .await
+        .unwrap();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        seen.insert(format!("{:?}", row.get_value(0).unwrap()));
+    }
+    assert_eq!(seen.len(), 4);
+}
+
+#[tokio::test]
+async fn test_udf_closure_reads_state_written_after_registration() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+    let clock = oplog::Clock::new();
+    oplog::register_functions(&conn, &clock);
+
+    let mut probe = conn.prepare("SELECT local_device_id()").await.unwrap();
+    let before = probe.query_row(()).await.unwrap().get_value(0).unwrap();
+    *clock.device_id.write().unwrap() = "late-id".to_string();
+    let after = probe.query_row(()).await.unwrap().get_value(0).unwrap();
+    assert_eq!(before, Value::Text(String::new()));
+    assert_eq!(after, Value::Text("late-id".to_string()));
+}
+
+#[tokio::test]
+async fn test_udf_triggers_fire_inside_a_transaction_on_a_pooled_connection() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let clock = oplog::Clock::new();
+    *clock.device_id.write().unwrap() = "dev-C".to_string();
+    let conn1 = db.connect().unwrap();
+    let conn2 = db.connect().unwrap();
+    oplog::register_functions(&conn1, &clock);
+    oplog::register_functions(&conn2, &clock);
+    oplog::create_schema(&conn1).await;
+
+    conn1.execute("BEGIN", ()).await.unwrap();
+    conn1
+        .execute("INSERT INTO photos (id) VALUES ('p1')", ())
+        .await
+        .unwrap();
+    conn1
+        .execute("UPDATE photos SET state = 'ready' WHERE id = 'p1'", ())
+        .await
+        .unwrap();
+    conn1.execute("COMMIT", ()).await.unwrap();
+
+    conn2.execute("BEGIN", ()).await.unwrap();
+    conn2
+        .execute("INSERT INTO photos (id) VALUES ('p2')", ())
+        .await
+        .unwrap();
+    conn2.execute("ROLLBACK", ()).await.unwrap();
+
+    let journal = oplog::journal(&conn2).await;
+    let ids: Vec<&str> = journal.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["p1", "p1"],
+        "rolled-back writes leave no journal row"
+    );
+    assert!(journal[0].2 < journal[1].2);
+    assert!(journal.iter().all(|r| r.3 == "dev-C"));
+}
