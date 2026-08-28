@@ -70,7 +70,9 @@ impl SqlBackend for JsBackend {
     }
 
     fn capabilities(&self) -> HashSet<Capability> {
-        HashSet::from_iter([Capability::Trigger])
+        // The runner script registers the `udf_*` test set on every
+        // connection it opens, so `@requires udf` files run here too.
+        HashSet::from_iter([Capability::Trigger, Capability::Udf])
     }
 
     async fn create_database(
@@ -287,10 +289,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn js_backend_reports_trigger_capability() {
+    fn js_backend_reports_trigger_and_udf_capabilities() {
         let backend = JsBackend::new("node", "bindings/javascript/turso-sql-runner.mjs");
         let capabilities = backend.capabilities();
         assert!(capabilities.contains(&Capability::Trigger));
+        assert!(capabilities.contains(&Capability::Udf));
     }
 
     #[test]

@@ -7,6 +7,8 @@ export interface FunctionOptions {
   varargs?: boolean;
   /** Refuse to run from a trigger, view, CHECK constraint or index expression. */
   directOnly?: boolean;
+  /** Safe to run from schema SQL (a view, trigger, CHECK, ...) even when `PRAGMA trusted_schema` is off. */
+  innocuous?: boolean;
   /** Pass INTEGER arguments as BigInt. Defaults to the database's `defaultSafeIntegers` setting. */
   safeIntegers?: boolean;
 }
@@ -53,6 +55,7 @@ function nativeOptions(options: FunctionOptions, argCount: number): NativeUdfOpt
     argCount,
     deterministic: !!options.deterministic,
     directOnly: !!options.directOnly,
+    innocuous: !!options.innocuous,
     // Left out, the native side follows the database's default.
     safeIntegers: "safeIntegers" in options ? !!options.safeIntegers : undefined,
   };

@@ -3,6 +3,7 @@ import type { NativeConnection, SQLiteValue } from './types';
 /** SQLite's flag bits, as the registration entry points take them. */
 const FLAG_DETERMINISTIC = 0x800;
 const FLAG_DIRECTONLY = 0x80000;
+const FLAG_INNOCUOUS = 0x200000;
 
 function flagsOf(options: any): number {
   let flags = 0;
@@ -11,6 +12,9 @@ function flagsOf(options: any): number {
   }
   if (options.directOnly) {
     flags |= FLAG_DIRECTONLY;
+  }
+  if (options.innocuous) {
+    flags |= FLAG_INNOCUOUS;
   }
   return flags;
 }
@@ -30,6 +34,8 @@ export interface FunctionOptions {
   varargs?: boolean;
   /** Refuse to run from a trigger, view, CHECK constraint or index expression. */
   directOnly?: boolean;
+  /** Safe to run from schema SQL (a view, trigger, CHECK, ...) even when `PRAGMA trusted_schema` is off. */
+  innocuous?: boolean;
 }
 
 export interface AggregateOptions extends FunctionOptions {

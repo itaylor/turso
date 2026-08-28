@@ -268,6 +268,14 @@ test('user-defined function options', () => {
     expect(db.prepare("SELECT direct() AS v").get()).toEqual({ v: 1 });
     db.exec("CREATE TABLE d(x CHECK (direct() = 1))");
     expect(() => db.exec("INSERT INTO d VALUES (1)")).toThrow(/unsafe use of direct\(\)/);
+
+    // innocuous: still allowed from schema SQL once trusted_schema is off; a plain function is not.
+    db.function('harmless', { innocuous: true }, (x) => x);
+    db.exec("CREATE VIEW vi AS SELECT harmless(x) AS v FROM t");
+    db.exec("CREATE VIEW vp AS SELECT plain(x) AS v FROM t");
+    db.exec("PRAGMA trusted_schema=OFF");
+    expect(db.prepare("SELECT v FROM vi ORDER BY v").all()).toEqual([{ v: 1 }, { v: 2 }, { v: 3 }]);
+    expect(() => db.prepare("SELECT v FROM vp").all()).toThrow(/unsafe use of plain\(\)/);
 })
 
 test('closing the database from inside a user-defined function fails cleanly', () => {

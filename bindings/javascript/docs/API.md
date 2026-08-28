@@ -135,6 +135,7 @@ while a statement is stepping, so it must be synchronous.
 | deterministic | `false`              | The same arguments always produce the same result, so the engine may call it once and reuse the answer. |
 | varargs       | `false`              | Accept any number of arguments. Without it the arity is `function.length`, and a call with a different number of arguments fails with `wrong number of arguments`. |
 | directOnly    | `false`              | Mark the function as callable only from top-level SQL, never from a trigger, view, CHECK constraint, DEFAULT, generated column or index expression; calling it from there fails with `unsafe use of X()`. |
+| innocuous     | `false`              | Mark the function as safe to run from schema SQL (a view, trigger, CHECK constraint, ...) even when `PRAGMA trusted_schema=OFF`; without it such a call fails with `unsafe use of X()` once trusted_schema is off. |
 | safeIntegers  | database default     | Pass INTEGER arguments as BigInt instead of Number. Follows `defaultSafeIntegers()` when omitted. |
 
 ```js
@@ -165,7 +166,7 @@ Registers an aggregate user-defined function. Returns the database.
 | step          | *required*           | `(total, ...args)`. Returns the new accumulator, or `undefined` to keep the current one.     |
 | inverse       | none                 | `(total, ...args)`. Removes a row that left the window frame. Providing it makes the aggregate usable as a window function. |
 | result        | none                 | `(total)`. Turns the final accumulator into the value SQL sees. Defaults to the accumulator itself. |
-| deterministic, varargs, directOnly, safeIntegers | | As for `function()`. The arity is `step.length - 1`, since `step` also takes the accumulator. |
+| deterministic, varargs, directOnly, innocuous, safeIntegers | | As for `function()`. The arity is `step.length - 1`, since `step` also takes the accumulator. |
 
 ```js
 db.aggregate('mysum', {

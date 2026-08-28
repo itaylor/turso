@@ -60,6 +60,47 @@ function formatValue(value) {
     return String(value);
 }
 
+/**
+ * The standard `udf_*` set a `.sqltest` file gets by asking for `@requires udf`.
+ * Mirrors `register_udf_functions` in testing/sqltest/src/backends/rust.rs,
+ * which describes each function; keep the two in step.
+ */
+async function registerUdfTestSet(db) {
+    // Anything that is not a number, NULL included, reads as 0. Integers
+    // arrive as BigInt because the runner turns on defaultSafeIntegers.
+    const asInt = (v) => {
+        if (typeof v === 'bigint') return v;
+        if (typeof v === 'number') return BigInt(Math.trunc(v));
+        return 0n;
+    };
+    const identity = (x) => x;
+
+    // udf_add(a, b): deterministic, NULL-propagating integer add.
+    await db.function('udf_add', { deterministic: true }, (a, b) =>
+        a === null || b === null ? null : asInt(a) + asInt(b));
+    // udf_concat(...): variadic text concat; NULL contributes nothing.
+    await db.function('udf_concat', { deterministic: true, varargs: true }, (...args) =>
+        args.map(formatValue).join(''));
+    // udf_nondet(x): x plus a call counter, so two calls with the same argument differ.
+    let nondetCalls = 0n;
+    await db.function('udf_nondet', (x) => asInt(x) + (++nondetCalls));
+    // udf_direct / udf_innocuous / udf_plain: identity with the matching flag.
+    await db.function('udf_direct', { directOnly: true }, identity);
+    await db.function('udf_innocuous', { innocuous: true }, identity);
+    await db.function('udf_plain', identity);
+    // udf_fail(x): always errors.
+    await db.function('udf_fail', (_x) => { throw new Error('udf_fail called'); });
+
+    // udf_sum(x): plain aggregate; udf_wsum(x): window-capable; udf_count0(): counts rows.
+    await db.aggregate('udf_sum', { start: 0n, step: (total, x) => total + asInt(x) });
+    await db.aggregate('udf_wsum', {
+        start: 0n,
+        step: (total, x) => total + asInt(x),
+        inverse: (total, x) => total - asInt(x),
+    });
+    await db.aggregate('udf_count0', { start: 0n, step: (total) => total + 1n });
+}
+
 function formatRow(row) {
     // Row is an array in raw mode
     return row.map(formatValue).join('|');
@@ -86,6 +127,7 @@ async function main() {
         db = await connect(dbPath, { readonly, experimental: ['triggers', 'attach', 'generated_columns', 'without_rowid'] });
         // Enable safe integers to preserve precision for large integers
         db.defaultSafeIntegers(true);
+        await registerUdfTestSet(db);
     } catch (err) {
         console.error(`Error: ${err.message}`);
         process.exit(1);

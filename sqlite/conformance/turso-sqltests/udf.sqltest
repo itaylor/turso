@@ -1,10 +1,11 @@
 @database :memory:
-@requires-file udf "exercises the standard udf_* test set registered on the connection by the rust backend"
+@requires-file udf "exercises the standard udf_* test set, which only an in-process backend (rust, js) can register on the connection"
 
 # The standard `udf_*` set, registered by `register_udf_functions` in
-# testing/sqltest/src/backends/rust.rs, which is where each function's
-# behavior is described. Only the rust backend advertises the `udf`
-# capability, so other backends skip this file.
+# testing/sqltest/src/backends/rust.rs (which is where each function's
+# behavior is described) and mirrored by `registerUdfTestSet` in
+# bindings/javascript/turso-sql-runner.mjs. The cli backend drives a tursodb
+# subprocess and has no way to register a function, so it skips this file.
 
 # --------------------------------------------------------------- scalars
 

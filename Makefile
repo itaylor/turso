@@ -59,12 +59,18 @@ uv-sync-test:
 	uv sync --all-extras --dev --package turso_test
 .PHONE: uv-sync
 
-test: build uv-sync-test test-compat test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-sqltest test-sqltest-js test-sqltest-cli
+test: build uv-sync-test test-compat test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-sqltest test-sqltest-rust test-sqltest-js test-sqltest-cli
 .PHONY: test
 
 test-sqltest:
 	@make -C sqlite/conformance run
 .PHONY: test-sqltest
+
+# The rust backend runs in-process, so it is the one that can register
+# user-defined functions and run the `@requires udf` files.
+test-sqltest-rust:
+	@make -C sqlite/conformance run-rust
+.PHONY: test-sqltest-rust
 
 test-sqltest-js:
 	@make -C sqlite/conformance run-js

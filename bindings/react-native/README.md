@@ -158,9 +158,9 @@ The callbacks run **synchronously on the JavaScript thread**, nested inside the
   `undefined` means SQL NULL, and `true`/`false` become 1/0. INTEGER values
   always arrive as JavaScript numbers — there is no `safeIntegers` option, and
   passing one throws.
-- `deterministic` and `directOnly` work for scalars and aggregates alike; they
-  are the same flags SQLite's `SQLITE_DETERMINISTIC` and `SQLITE_DIRECTONLY`
-  set.
+- `deterministic`, `directOnly` and `innocuous` work for scalars and
+  aggregates alike; they are the same flags SQLite's `SQLITE_DETERMINISTIC`,
+  `SQLITE_DIRECTONLY` and `SQLITE_INNOCUOUS` set.
 
 ### Transactions
 

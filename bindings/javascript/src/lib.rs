@@ -201,6 +201,8 @@ pub struct UdfOptions {
     pub deterministic: bool,
     /// Callable only from top-level SQL, not from triggers, views or CHECK.
     pub direct_only: bool,
+    /// Safe to run from schema SQL even when `PRAGMA trusted_schema` is off.
+    pub innocuous: bool,
     /// Pass INTEGER arguments as BigInt; omit to follow `defaultSafeIntegers`.
     pub safe_integers: Option<bool>,
 }
@@ -210,6 +212,7 @@ impl UdfOptions {
         let mut flags = turso_core::FunctionFlags::empty();
         flags.set(turso_core::FunctionFlags::DETERMINISTIC, self.deterministic);
         flags.set(turso_core::FunctionFlags::DIRECTONLY, self.direct_only);
+        flags.set(turso_core::FunctionFlags::INNOCUOUS, self.innocuous);
         flags
     }
 }

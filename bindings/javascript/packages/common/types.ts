@@ -33,6 +33,7 @@ export interface NativeUdfOptions {
     argCount: number;
     deterministic: boolean;
     directOnly: boolean;
+    innocuous: boolean;
     /** Omitted to follow the database's `defaultSafeIntegers` setting. */
     safeIntegers?: boolean;
 }

@@ -28,7 +28,7 @@ void udfInvalidate();
 
 /**
  * `argc` is the argument count, or -1 for any number; `flags` uses SQLite's bit
- * values (0x800 DETERMINISTIC, 0x80000 DIRECTONLY).
+ * values (0x800 DETERMINISTIC, 0x80000 DIRECTONLY, 0x200000 INNOCUOUS).
  */
 void udfRegisterScalar(
     jsi::Runtime &rt,

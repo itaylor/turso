@@ -217,6 +217,8 @@ export interface UdfOptions {
   deterministic: boolean
   /** Callable only from top-level SQL, not from triggers, views or CHECK. */
   directOnly: boolean
+  /** Safe to run from schema SQL even when `PRAGMA trusted_schema` is off. */
+  innocuous: boolean
   /** Pass INTEGER arguments as BigInt; omit to follow `defaultSafeIntegers`. */
   safeIntegers?: boolean
 }
